@@ -207,6 +207,11 @@ struct gc_extents {
 	struct list_head list;
 };
 
+struct zone_node {
+	unsigned int lzonenr;
+	struct list_head list;
+}
+
 struct mykref {
 	refcount_t refcount;
 };

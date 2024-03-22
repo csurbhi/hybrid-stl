@@ -1386,6 +1386,79 @@ static int read_gc_extents(struct ctx *ctx)
 	return 0;
 }
 
+/* 
+ * The extent that we are about to write will definitely fit into
+ * the gc write frontier. No one is writing to the gc frontier
+ * other than the gc process; only gc process executes at a time
+ * as we take a lock to prevent concurrent execution.
+ * We make sure that the length of the extent matches with free space
+ * in the zone. Also, since the extent corresponds to what is read
+ * from the disk, we are sure that the length is in terms of what is
+ * found on disk.
+ */
+static int write_metadata_extent(struct ctx *ctx, struct gc_extents *gc_extent, sector_t wp)
+{
+	struct bio *bio;
+	sector_t s8;
+	int ret;
+
+	setup_extent_bio_write(ctx, gc_extent);
+	bio = gc_extent->bio;
+	s8 = bio_sectors(bio);
+	bio->bi_iter.bi_sector = wp;
+	gc_extent->e.pba = wp;
+
+	//printk(KERN_ERR "\n %s gc_extent: (lba: %d pba: %d len: %d), s8: %d max_pba: %llu", __func__, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len, s8, ctx->sb->max_pba);
+#ifdef LSDM_DEBUG
+	BUG_ON(gc_extent->e.len != s8);
+	BUG_ON(gc_extent->e.pba == 0 );
+	BUG_ON(gc_extent->e.pba >= ctx->sb->max_pba);
+	BUG_ON(gc_extent->e.lba >= ctx->sb->max_pba);
+#endif
+	bio->bi_status = BLK_STS_OK;
+
+	/* Now reads will work! so we can complete the bio */
+	/* Do this before the RB tree is updated, as we need to remove the old translation entries and adjust the valid blks corresponding to the zone in cache if any */
+	find_and_remove_rev_tm(ctx, lba, len);
+	if (is_cached_write) {
+		add_rev_translation_entry(ctx, lba, pba, len);
+	} else {
+		pba = 0;
+	}
+	lsdm_rb_update_range(ctx, lba, pba, len);
+	return 0;
+}
+
+
+
+static int write_valid_gc_extents(struct ctx *ctx, unsigned int lzonenr)
+{
+	struct list_head *pos;
+	struct gc_extents *gc_extent;
+	int count = 0;
+	struct seq_zone_info *szi = &ctx->dzit[lzonenr];
+	unsigned int pzonenr;
+	
+	/* If list is empty we have nothing to do */
+	BUG_ON(list_empty(&ctx->gc_extents->list));
+	pzonenr = get_free_data_zone(ctx);
+	wp = 0;
+	/* setup the bio for the first gc_extent */
+	list_for_each(pos, &ctx->gc_extents->list) {
+		gc_extent = list_entry(pos, struct gc_extents, list);
+		write_metadata_extent(ctx, gc_extent, wp);
+		wp = wp + gc_extent->len;
+		submit_bio_wait(gc_extent->bio);
+	}
+	szi->pzonenr = pzonenr;
+	szi->wp = wp;
+	//printk(KERN_ERR "\n GC extents submitted for read: %d ", count);
+	return 0;
+}
+
+
+
+
 /*
  * We sort on the LBA
 static int cmp_list_nodes(void *priv, struct list_head *lha, struct list_head *lhb)
@@ -1826,180 +1899,6 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 	return total_extents;
 }
 
-
-
-int write_valid_gc_extents(struct ctx *ctx, unsigned int lzonenr)
-{
-	sector_t diff;
-	struct extent *e = NULL;
-	struct rev_extent *rev_e = NULL;
-	struct extent_entry temp;
-	long total_len = 0, total_extents = 0;
-	int count;
-	sector_t pba, last_pba, lba, last_lba;
-	struct seq_zone_info *szi = &ctx->dzit[lzonenr];
-	int vblks;
-
-	first_pba = get_first_pba_for_zone(ctx, szi->pzonenr);
-	last_pba = get_last_pba_for_zone(ctx, szi->pzonenr);
-
-	lba = szi->lzonenr << (sb->log_zone_size - sb->log_sector_size);
-	last_lba = lba + ctx->nr_lbas_in_zone;
-
-	INIT_LIST_HEAD(&ctx->gc_extents->list);
-
-	//print_memory_usage(ctx, "Before GC");
-	/* Lookup this pba in the reverse table to find the
-	 * corresponding LBA. 
-	 * TODO: If the valid blocks are sequential, we need to keep
-	 * this segment as an open segment that can append data. We do
-	 * not need to perform GC on this segment.
-	 */
-	temp.pba = 0;
-	temp.lba = 0;
-	temp.len = 0;
-
-	lock_zone(zonenr);
-	/* prevent any further changes in the data zone while you are merging cache contents and data zone contents */
-	list_for_each_entry_safe(gc_extent, next_ptr, &ctx->gc_extents->list, list) {
-		BUG_ON(lba > gc_extent->lba);
-		if (gc_extent->lba > lba) {
-			/* check if data corresponding to this lba is added after create_extent was called */
-			e = lsdm_rb_geq(ctx, lba, print);
-			if (e->lba < lba) {
-				/* overlapping e  found 
-				 * eeeeeeeeeeeeeee
-				 * 	llllllllllllllllll
-				 */
-				diff = lba - e->lba;
-				temp.lba = lba;
-				temp.len = e->len - diff;
-				if (temp.lba + temp.len > last_lba) {
-					temp.len = last_lba - temp.lba;
-					/* delete the remaining gc list */
-				}
-				/* Add this to the extent list, before this current extent.
-				 * read and then write this extent;
-				 */
-
-			} else {
-			 /* (e->lba > lba) 
-			  * LBA,   e->lba
-			  * 	gc_extent->lba
-			  *
-			  * OR
-			  *
-			  * LBA,   e->lba
-			  * 			gc_extent->lba
-			  *
-			  **/
-
-				diff = e->lba - lba;
-				pba = get_zone_pba(ctx->sb, szi->pzonenr) + lba % ctx->nr_lbas_in_zone;
-				if (pba < szi->wp) {
-					temp.pba = pba;
-					temp.lba = lba;
-					temp.len = diff;
-					/* Add this to the extent list, before this current extent.
-					 * read and then write this extent;
-					 */
-				}
-				if (e->lba < gc_extent->lba) {
-					temp.lba = e->lba;
-					temp.pba = e->pba;
-					temp.len = e->len;
-					if (temp.lba + temp.len > last_lba) {
-						temp.len = last_lba - temp.lba;
-						/* delete the remaining gc list */
-					}
-					if ((temp.lba + temp.len) > (gc_exent->lba + gc_extent->len)) {
-						/* delete gc extent */
-					}
-				}
-
-			}
-			lba = temp.lba + temp.len;
-			if (temp.lba + temp.len > gc_extent->lba) {
-				if ((temp.lba + temp.len) >= (gc_extent->lba + gc_extent->len)) {
-					/* delete gc_extent */
-				} else {
-					/* adjust gc_extent, snip at the beginning */
-					lba = lba + gc_extent->len;
-				}
-			}
-
-		}
-		// lba == gc_extent->lba
-		write_this_extent(ctx, gc_extent);
-		lba = gc_extent->lba + gc_extent->len;
-	}
-	/* after all the extents are exhausted, check if any valid data from the data zone or the cache exist */
-
-
-
-
-	while(lba <= last_lba) {
-
-
-
-		//printk(KERN_ERR "\n %s zonenr: %d first_pba: %llu last_pba: %llu #valid blks: %d", __func__, zonenr, pba, last_pba, vblks);
-		e = lsdm_rb_geq(ctx, lba, print);
-		if ((e == NULL) || (e->lba > last_lba) || ((e->lba + e->len) <= lba))  {
-			/* Not found in the cache. Now check if this can be seen in the actual data zone */
-			pba = get_zone_pba(ctx->sb, szi->pzonenr) + lba % ctx->nr_lbas_in_zone;
-			if (pba < szi->wp) {
-				temp.pba = pba;
-				temp.lba = lba;
-				temp.len = szi->wp - pba;
-				add_extent_to_gclist(ctx, &temp);
-			}
-			break;
-			/* add this temp to the list */
-		}
-		/* Case of Overlap, e always overlaps with bio */
-		if (e->lba > lba) {
-			/*               [eeeeeeeeeeee]
-			 *      [---------bio------]
-			 */
-			zerolen = e->lba - lba;
-			pba = get_zone_pba(ctx->sb, szi->pzonenr) + lba % ctx->nr_lbas_in_zone;
-			if (pba < szi->wp) {
-				temp.pba = pba;
-				temp.lba = lba;
-				temp.len = zerolen;
-				add_extent_to_gclist(ctx, &temp);
-			}
-			/* add this temp to the list */
-		}
-		//(e->lba <= lba)
-		overlap = e->lba + e->len - lba;
-		diff = lba - e->lba;
-		if (lba + overlap >= last_lba) {
-			temp.pba = e->pba + diff;
-			temp.lba = lba;
-			temp.len =  last_lba - lba;
-			add_extent_to_gclist(ctx, &temp);
-			break;
-			/* add this temp to the list */
-		} else {
-			temp.pba = e->pba + diff;
-			temp.lba = lba;
-			temp.len = overlap;
-			add_extent_to_gclist(ctx, &temp);
-		}
-		lba = e->lba + overlap;
-	}
-#ifdef LSDM_DEBUG
-	printk(KERN_ERR "\n %s Total extents: %llu, total_len: %llu vblks: %d \n", __func__, total_extents, total_len, vblks);
-	if ((total_len >> SECTOR_BLK_SHIFT) < vblks) {
-		print_gc_extents(ctx, zonenr);
-	}
-#endif
-	return total_extents;
-}
-
-
-
 /*
  * TODO: write code for FG_GC
  *
@@ -2018,6 +1917,7 @@ static int evict_cache_data(struct ctx *ctx, int gc_mode, int err_flag)
 	wait_queue_head_t *wq = &gc_th->lsdm_gc_wait_queue;
 	u64 start_t, end_t, interval = 0, gc_count = 0;
 	u64 gc_writes = 0;
+	struct seq_zone_info *szi;
 
 	//printk(KERN_ERR "\a %s * GC thread polling after every few seconds! gc_mode: %d \n", __func__, gc_mode);
 
@@ -2042,16 +1942,20 @@ again:
 			gc_count = -1;
 		}
 		goto failed;
-	}
+	
 	create_dzone_list(ctx, zonenr);
 	list_head = &ctx->gc_zones->list;
 	list_for_each_entry_safe(zone_node, next_zone_node, list_head, list) {
 		lzonenr = zone_node->lzonenr;
+		szi = &ctx->dzit[lzonenr];
+		mutex_lock(&szi->zone_lock);
+		down_write(&ctx->lsdm_rb_lock);
 		create_gc_extents(ctx, lzonenr);
 		read_gc_extents(ctx);
-		write_valid_gc_extents(ctx);
+		write_valid_gc_extents(ctx, lzonenr);
+		up_write(&ctx->lsdm_rb_lock);
+		mutex_unlock(&szi->zone_lock);
 	}
-
 	free_data_zone_list(ctx);
 	zones_cleaned++;
 	if (zones_cleaned < 3)
@@ -4273,20 +4177,16 @@ void sub_write_done(struct work_struct * w)
 	pba = subbioctx->extent.pba;
 	len = subbioctx->extent.len;
 	len = (len >> SECTOR_BLK_SHIFT) << SECTOR_BLK_SHIFT;
+	is_cached_write = subbioctx->cache_write;
 
-	//BUG_ON(pba == 0);
-	//BUG_ON(pba > ctx->sb->max_pba);
-	//BUG_ON(lba > ctx->sb->max_pba);
-	//BUG_ON(len % 8 != 0);
 	/* Now reads will work! so we can complete the bio */
-
-	if (!is_cached_write) {
-		pba = 0;
-	}
 	/* Do this before the RB tree is updated, as we need to remove the old translation entries and adjust the valid blks corresponding to the zone in cache if any */
 	find_and_remove_rev_tm(ctx, lba, len);
-	add_rev_translation_entry(ctx, lba, pba, len);
-
+	if (is_cached_write) {
+		add_rev_translation_entry(ctx, lba, pba, len);
+	} else {
+		pba = 0;
+	}
 	down_write(&ctx->lsdm_rb_lock);
 	lsdm_rb_update_range(ctx, lba, pba, len);
 	up_write(&ctx->lsdm_rb_lock);
