@@ -41,6 +41,14 @@
  */
 #define SMALL_NR_ZONES 1000 /* 250 GB */
 
+
+struct seq_zones_info {
+	u32 lzonenr;
+	u32 pzonenr;
+	u64 wp; /* PBA of the write pointer for this zone */
+	struct mutex zone_lock; /* only one write to a zone at a time */
+};
+
 struct gc_read_ctx {
 	struct ctx *ctx;
 	refcount_t *ref;
@@ -54,17 +62,6 @@ struct app_read_ctx {
 	sector_t lba;
 	sector_t pba;
 	sector_t nrsectors;
-};
-
-struct metadata_read_ctx {
-	struct ctx *ctx;
-	refcount_t ref;
-};
-
-struct revmap_bioctx {
-	struct ctx * ctx;
-	struct page *page;
-	struct work_struct process_tm_work;
 };
 
 struct tm_page {
@@ -110,6 +107,7 @@ struct lsdm_sub_bioctx {
 	struct extent_entry extent;
 	struct lsdm_bioctx * bioctx;
 	struct work_struct work;
+	int cache_write;
 };
 
 struct cur_zone_info {
@@ -234,7 +232,7 @@ struct ctx {
 
 	struct rb_root	  extent_tbl_root; /* in memory extent map */
 	struct rb_root	  rev_tbl_root; /* in memory reverse extent map */
-	struct rb_root    tm_rb_root;	          /* map RB tree */
+	struct rb_root    rev_tm_rb_root;	          /* map RB tree */
 	struct rb_root	  sit_rb_root;	  /* SIT RB tree */
 	struct rb_root	  gc_cost_root;	  /* GC tree */
 	struct rb_root	  gc_zone_root;
@@ -265,15 +263,20 @@ struct ctx {
 	struct lsdm_sb 	*sb;
 	struct page 	*ckpt_page;
 	struct lsdm_ckpt *ckpt;
-	char *freezone_bitmap;
+	struct seq_zones_info *dzit;
+	char *free_czone_bitmap;
+	char *free_dzone_bitmap;
 	int 	nr_freezones;
 	int 	higher_watermark;
 	int 	middle_watermark;
 	int	lower_watermark;
 	char *gc_zone_bitmap;
 	int nr_gc_zones;
-	int	bitmap_bytes;
-	int 	bitmap_bit;
+	int	czone_bitmap_bytes;
+	int 	czone_bitmap_bit;
+	int 	dzone_bitmap_bytes;
+	int	dzone_bitmap_bit;
+	sector_t cache_offset;
 	time64_t mounted_time;
 	time64_t elapsed_time;
 	time64_t min_mtime;
