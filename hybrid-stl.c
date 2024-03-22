@@ -1257,6 +1257,23 @@ static int add_extent_to_gclist(struct ctx *ctx, struct extent_entry *e)
 	return count;
 }
 
+static int add_zone_to_gclist(struct ctx *ctx, unsigned int zonenr)
+{
+	struct zone_node *znode;
+	int temp = 0;
+	
+	BUG_ON(zonenr > ctx->sb->zone_count_data);
+	znode = kmem_cache_alloc(ctx->zone_node_cache, GFP_KERNEL);
+	if (!znode) {
+		printk(KERN_ERR "\n Could not allocate memory to gc_extent! ");
+		BUG();
+		return -ENOMEM;
+	}
+	znode->lzonenr = zonenr;
+	list_add_tail(&znode->list, &ctx->gc_zones->list);
+	return 0;
+}
+
 void read_gcextent_done(struct bio * bio)
 {
 	struct gc_extents *gc_extent = (struct gc_extents *) bio->bi_private;
@@ -1623,7 +1640,7 @@ int print_gc_extents(struct ctx *ctx, int zonenr)
 }
 
 
-int create_data_zone_list(struct ctx *ctx, unsigned int zonenr)
+int create_dzone_list(struct ctx *ctx, unsigned int zonenr)
 {
 	sector_t diff;
 	struct extent *e = NULL;
@@ -1638,7 +1655,7 @@ int create_data_zone_list(struct ctx *ctx, unsigned int zonenr)
 	pba = get_first_pba_for_zone(ctx, zonenr);
 	last_pba = get_last_pba_for_zone(ctx, zonenr);
 	vblks = get_sit_ent_vblocks(ctx, zonenr);
-	INIT_LIST_HEAD(&ctx->gc_extents->list);
+	INIT_LIST_HEAD(&ctx->gc_zones->list);
 
 	//print_memory_usage(ctx, "Before GC");
 	/* Lookup this pba in the reverse table to find the
@@ -1688,7 +1705,7 @@ int create_data_zone_list(struct ctx *ctx, unsigned int zonenr)
 				BUG_ON(!temp.len);
 			}
 		} else {
-			/*
+			/* e->pba >= pba
 			 * 	e------
 			 * pba
 			 */
@@ -1713,14 +1730,16 @@ int create_data_zone_list(struct ctx *ctx, unsigned int zonenr)
 		total_len = total_len + temp.len;
 		pba = temp.pba + temp.len;
 		u32 zonenr = lba / ctx->nr_lbas_in_zone;
-		zonenr = ctx->dzit[zonenr].pzonenr;
-		count = add_zone_to_gclist(ctx, zonenr);
+		zonenr = ctx->dzit[zonenr].lzonenr;
+		if (!add_zone_to_gclist(ctx, zonenr)) {
+			return -ENOMEM;
+		}
 	}
 	return 0;
 }
 
 
-int create_gc_extents(struct ctx *ctx, struct seq_zone_info *szi)
+int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 {
 	sector_t diff;
 	struct extent *e = NULL;
@@ -1729,6 +1748,7 @@ int create_gc_extents(struct ctx *ctx, struct seq_zone_info *szi)
 	long total_len = 0, total_extents = 0;
 	int count;
 	sector_t pba, last_pba, lba, last_lba;
+	struct seq_zone_info *szi = &ctx->dzit[lzonenr];
 	int vblks;
 
 	first_pba = get_first_pba_for_zone(ctx, szi->pzonenr);
@@ -1759,6 +1779,7 @@ int create_gc_extents(struct ctx *ctx, struct seq_zone_info *szi)
 				temp.pba = pba;
 				temp.lba = lba;
 				temp.len = szi->wp - pba;
+				add_extent_to_gclist(ctx, &temp);
 			}
 			break;
 			/* add this temp to the list */
@@ -1774,6 +1795,7 @@ int create_gc_extents(struct ctx *ctx, struct seq_zone_info *szi)
 				temp.pba = pba;
 				temp.lba = lba;
 				temp.len = zerolen;
+				add_extent_to_gclist(ctx, &temp);
 			}
 			/* add this temp to the list */
 		}
@@ -1784,12 +1806,14 @@ int create_gc_extents(struct ctx *ctx, struct seq_zone_info *szi)
 			temp.pba = e->pba + diff;
 			temp.lba = lba;
 			temp.len =  last_lba - lba;
+			add_extent_to_gclist(ctx, &temp);
 			break;
 			/* add this temp to the list */
 		} else {
 			temp.pba = e->pba + diff;
 			temp.lba = lba;
 			temp.len = overlap;
+			add_extent_to_gclist(ctx, &temp);
 		}
 		lba = e->lba + overlap;
 	}
@@ -1801,6 +1825,180 @@ int create_gc_extents(struct ctx *ctx, struct seq_zone_info *szi)
 #endif
 	return total_extents;
 }
+
+
+
+int write_valid_gc_extents(struct ctx *ctx, unsigned int lzonenr)
+{
+	sector_t diff;
+	struct extent *e = NULL;
+	struct rev_extent *rev_e = NULL;
+	struct extent_entry temp;
+	long total_len = 0, total_extents = 0;
+	int count;
+	sector_t pba, last_pba, lba, last_lba;
+	struct seq_zone_info *szi = &ctx->dzit[lzonenr];
+	int vblks;
+
+	first_pba = get_first_pba_for_zone(ctx, szi->pzonenr);
+	last_pba = get_last_pba_for_zone(ctx, szi->pzonenr);
+
+	lba = szi->lzonenr << (sb->log_zone_size - sb->log_sector_size);
+	last_lba = lba + ctx->nr_lbas_in_zone;
+
+	INIT_LIST_HEAD(&ctx->gc_extents->list);
+
+	//print_memory_usage(ctx, "Before GC");
+	/* Lookup this pba in the reverse table to find the
+	 * corresponding LBA. 
+	 * TODO: If the valid blocks are sequential, we need to keep
+	 * this segment as an open segment that can append data. We do
+	 * not need to perform GC on this segment.
+	 */
+	temp.pba = 0;
+	temp.lba = 0;
+	temp.len = 0;
+
+	lock_zone(zonenr);
+	/* prevent any further changes in the data zone while you are merging cache contents and data zone contents */
+	list_for_each_entry_safe(gc_extent, next_ptr, &ctx->gc_extents->list, list) {
+		BUG_ON(lba > gc_extent->lba);
+		if (gc_extent->lba > lba) {
+			/* check if data corresponding to this lba is added after create_extent was called */
+			e = lsdm_rb_geq(ctx, lba, print);
+			if (e->lba < lba) {
+				/* overlapping e  found 
+				 * eeeeeeeeeeeeeee
+				 * 	llllllllllllllllll
+				 */
+				diff = lba - e->lba;
+				temp.lba = lba;
+				temp.len = e->len - diff;
+				if (temp.lba + temp.len > last_lba) {
+					temp.len = last_lba - temp.lba;
+					/* delete the remaining gc list */
+				}
+				/* Add this to the extent list, before this current extent.
+				 * read and then write this extent;
+				 */
+
+			} else {
+			 /* (e->lba > lba) 
+			  * LBA,   e->lba
+			  * 	gc_extent->lba
+			  *
+			  * OR
+			  *
+			  * LBA,   e->lba
+			  * 			gc_extent->lba
+			  *
+			  **/
+
+				diff = e->lba - lba;
+				pba = get_zone_pba(ctx->sb, szi->pzonenr) + lba % ctx->nr_lbas_in_zone;
+				if (pba < szi->wp) {
+					temp.pba = pba;
+					temp.lba = lba;
+					temp.len = diff;
+					/* Add this to the extent list, before this current extent.
+					 * read and then write this extent;
+					 */
+				}
+				if (e->lba < gc_extent->lba) {
+					temp.lba = e->lba;
+					temp.pba = e->pba;
+					temp.len = e->len;
+					if (temp.lba + temp.len > last_lba) {
+						temp.len = last_lba - temp.lba;
+						/* delete the remaining gc list */
+					}
+					if ((temp.lba + temp.len) > (gc_exent->lba + gc_extent->len)) {
+						/* delete gc extent */
+					}
+				}
+
+			}
+			lba = temp.lba + temp.len;
+			if (temp.lba + temp.len > gc_extent->lba) {
+				if ((temp.lba + temp.len) >= (gc_extent->lba + gc_extent->len)) {
+					/* delete gc_extent */
+				} else {
+					/* adjust gc_extent, snip at the beginning */
+					lba = lba + gc_extent->len;
+				}
+			}
+
+		}
+		// lba == gc_extent->lba
+		write_this_extent(ctx, gc_extent);
+		lba = gc_extent->lba + gc_extent->len;
+	}
+	/* after all the extents are exhausted, check if any valid data from the data zone or the cache exist */
+
+
+
+
+	while(lba <= last_lba) {
+
+
+
+		//printk(KERN_ERR "\n %s zonenr: %d first_pba: %llu last_pba: %llu #valid blks: %d", __func__, zonenr, pba, last_pba, vblks);
+		e = lsdm_rb_geq(ctx, lba, print);
+		if ((e == NULL) || (e->lba > last_lba) || ((e->lba + e->len) <= lba))  {
+			/* Not found in the cache. Now check if this can be seen in the actual data zone */
+			pba = get_zone_pba(ctx->sb, szi->pzonenr) + lba % ctx->nr_lbas_in_zone;
+			if (pba < szi->wp) {
+				temp.pba = pba;
+				temp.lba = lba;
+				temp.len = szi->wp - pba;
+				add_extent_to_gclist(ctx, &temp);
+			}
+			break;
+			/* add this temp to the list */
+		}
+		/* Case of Overlap, e always overlaps with bio */
+		if (e->lba > lba) {
+			/*               [eeeeeeeeeeee]
+			 *      [---------bio------]
+			 */
+			zerolen = e->lba - lba;
+			pba = get_zone_pba(ctx->sb, szi->pzonenr) + lba % ctx->nr_lbas_in_zone;
+			if (pba < szi->wp) {
+				temp.pba = pba;
+				temp.lba = lba;
+				temp.len = zerolen;
+				add_extent_to_gclist(ctx, &temp);
+			}
+			/* add this temp to the list */
+		}
+		//(e->lba <= lba)
+		overlap = e->lba + e->len - lba;
+		diff = lba - e->lba;
+		if (lba + overlap >= last_lba) {
+			temp.pba = e->pba + diff;
+			temp.lba = lba;
+			temp.len =  last_lba - lba;
+			add_extent_to_gclist(ctx, &temp);
+			break;
+			/* add this temp to the list */
+		} else {
+			temp.pba = e->pba + diff;
+			temp.lba = lba;
+			temp.len = overlap;
+			add_extent_to_gclist(ctx, &temp);
+		}
+		lba = e->lba + overlap;
+	}
+#ifdef LSDM_DEBUG
+	printk(KERN_ERR "\n %s Total extents: %llu, total_len: %llu vblks: %d \n", __func__, total_extents, total_len, vblks);
+	if ((total_len >> SECTOR_BLK_SHIFT) < vblks) {
+		print_gc_extents(ctx, zonenr);
+	}
+#endif
+	return total_extents;
+}
+
+
 
 /*
  * TODO: write code for FG_GC
@@ -1845,12 +2043,14 @@ again:
 		}
 		goto failed;
 	}
-	create_data_zone_list(ctx, zonenr);
-	for_zones_in_zone_list:
-		read_data_zone(ctx, zonenr);
-		read_zone_data_from_cache(ctx, zonenr);
-		merge_data_from_cache_with_dzone(ctx, zonenr);
-		write_to_new_data_zone(ctx, zonenr);
+	create_dzone_list(ctx, zonenr);
+	list_head = &ctx->gc_zones->list;
+	list_for_each_entry_safe(zone_node, next_zone_node, list_head, list) {
+		lzonenr = zone_node->lzonenr;
+		create_gc_extents(ctx, lzonenr);
+		read_gc_extents(ctx);
+		write_valid_gc_extents(ctx);
+	}
 
 	free_data_zone_list(ctx);
 	zones_cleaned++;
