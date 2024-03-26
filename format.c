@@ -206,7 +206,7 @@ __le32 get_sit_blk_count(struct lsdm_sb *sb)
 
 __le32 get_seqz_blk_count(struct lsdm_sb *sb)
 {
-	unsigned int nr_seq_zns = sb->zone_count_main;
+	unsigned int nr_seq_zns = sb->zone_count_data;
 	unsigned int one_seqz_sz = sizeof(struct stl_dzones_info);
 	unsigned int nr_seqz_in_blk = BLK_SZ/one_seqz_sz;
 	unsigned int blks_for_dzit = nr_seq_zns / nr_seqz_in_blk;
@@ -239,11 +239,11 @@ __le32 get_metadata_zone_count(struct lsdm_sb *sb)
 	return metadata_zone_count;
 }
 
-__le32 get_main_zone_count(struct lsdm_sb *sb)
+__le32 get_data_zone_count(struct lsdm_sb *sb)
 {
-	__le32 main_zone_count = 0;
-	main_zone_count = sb->zone_count - sb->nr_cmr_zones;
-	return main_zone_count;
+	__le32 data_zone_count = 0;
+	data_zone_count = sb->zone_count - sb->nr_cmr_zones;
+	return data_zone_count;
 }
 
 __le32 get_cache_zone_count(struct lsdm_sb *sb)
@@ -506,8 +506,8 @@ struct lsdm_sb * write_sb(int fd, unsigned long sb_pba, unsigned long cmr)
 	printf("\n sb->czone0_pba: %d", sb->czone0_pba);
 	sb->dzone0_pba = get_data_zone_pba(sb);
 	printf("\n sb->dzone0_pba: %d", sb->dzone0_pba);
-	sb->zone_count_main = get_main_zone_count(sb);
-	printf("\n sb->zone_count_main: %d", sb->zone_count_main);
+	sb->zone_count_data = get_data_zone_count(sb);
+	printf("\n sb->zone_count_data: %d", sb->zone_count_data);
 	sb->zone_count_cache = get_cache_zone_count(sb);
 	printf("\n sb->zone_count_cache: %d", sb->zone_count_cache);
 	sb->crc = 0;
@@ -609,10 +609,10 @@ void write_ckpt(int fd, struct lsdm_sb * sb, unsigned long ckpt_pba)
 	memset(ckpt, 0, BLK_SZ);
 	ckpt->magic = STL_CKPT_MAGIC;
 	ckpt->version = 0;
-	ckpt->user_block_count = sb->zone_count_main << (sb->log_zone_size - sb->log_block_size);
+	ckpt->user_block_count = sb->zone_count_data << (sb->log_zone_size - sb->log_block_size);
 	ckpt->nr_invalid_zones = 0;
 	ckpt->hot_frontier_pba = sb->dzone0_pba;
-	ckpt->nr_free_zones = sb->zone_count_main - 2; //1 for the current frontier and gc frontier
+	ckpt->nr_free_cache_zones = sb->zone_count_cache - 1; /* one frontier */
 	ckpt->elapsed_time = 0;
 	ckpt->clean = 1;  /* 1 indicates clean datastructures */
 	ckpt->crc = 0;
@@ -652,7 +652,7 @@ void write_ckpt(int fd, struct lsdm_sb * sb, unsigned long ckpt_pba)
 		exit(errno);
 	}
 
-	printf("\n 1) ckpt->nr_free_zones: %llu", ckpt->nr_free_zones);
+	printf("\n 1) ckpt->nr_free_cache_zones: %llu", ckpt->nr_free_cache_zones);
 	printf("\n Checkpoint written at pba: %llu", ckpt_pba);
 	printf("\n ckpt->magic: %d ckpt->hot_frontier_pba: %lld", ckpt->magic, ckpt->hot_frontier_pba);
 	printf("\n sb->dzone0_pba: %llu", sb->dzone0_pba);
@@ -678,7 +678,7 @@ void write_ckpt(int fd, struct lsdm_sb * sb, unsigned long ckpt_pba)
 
 	printf("\n Read ckpt, ckpt->magic: %d", ckpt1->magic);
 	printf("\n hot_frontier_pba: %llu" , ckpt1->hot_frontier_pba);
-	printf("\n ckpt->nr_free_zones: %llu", ckpt1->nr_free_zones);
+	printf("\n ckpt->nr_free_cache_zones: %llu", ckpt1->nr_free_cache_zones);
 	printf("\n-----------------------------------------------------------\n");
 
 	if (memcmp(ckpt, ckpt1, sizeof(struct lsdm_ckpt))) {
@@ -689,8 +689,8 @@ void write_ckpt(int fd, struct lsdm_sb * sb, unsigned long ckpt_pba)
 		if (ckpt->hot_frontier_pba != ckpt1->hot_frontier_pba) {
 			printf("\n frontier mismatch!");
 		}
-		if (ckpt->nr_free_zones != ckpt1->nr_free_zones) {
-			printf("\n nr_free_zones mismatch!");
+		if (ckpt->nr_free_cache_zones != ckpt1->nr_free_cache_zones) {
+			printf("\n nr_free_cache_zones mismatch!");
 
 		}
 		printf("\n");
@@ -888,7 +888,7 @@ int main(int argc, char * argv[])
 	zone_lbas = 524288;
 	printf("\n # lbas in ZONE: %llu", zone_lbas);
 	close(fd);
-	unsigned long data_zones = sb1->zone_count_main;
+	unsigned long data_zones = sb1->zone_count_data;
 	printf("\n sb1->zone_count_main: %d ", data_zones);
 	char * tgtname = "TL1";
 	//volume_size = data_zones * zone_lbas;
