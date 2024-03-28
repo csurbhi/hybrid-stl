@@ -207,10 +207,10 @@ struct gc_extents {
 	struct list_head list;
 };
 
-struct zone_node {
+struct cseg_zone_node {
 	unsigned int lzonenr;
 	struct list_head list;
-}
+};
 
 struct mykref {
 	refcount_t refcount;
@@ -271,7 +271,8 @@ struct ctx {
 	struct seq_zones_info *dzit;
 	char *free_czone_bitmap;
 	char *free_dzone_bitmap;
-	int 	nr_freezones;
+	int 	nr_free_cache_zones;
+	int 	nr_free_data_zones;
 	int 	higher_watermark;
 	int 	middle_watermark;
 	int	lower_watermark;
@@ -308,6 +309,7 @@ struct ctx {
 	struct kmem_cache *gc_extents_cache;
 	struct kmem_cache *app_read_ctx_cache;
 	struct kmem_cache *bio_cache;
+	struct kmem_cache *zones_in_cseg_cache;
 	spinlock_t tm_ref_lock;
 	spinlock_t tm_flush_lock;
 	spinlock_t rev_flush_lock;
@@ -345,6 +347,7 @@ struct ctx {
 	unsigned int 	user_block_count;
 	struct crypto_shash *s_chksum_driver;
 	struct gc_extents * gc_extents;
+	struct cseg_zone_node *cseg_znodes;
 	struct mykref	ongoing_iocount;
 	atomic_t ioidle;
 	//struct timer_list timer_list;
