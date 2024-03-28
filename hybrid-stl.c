@@ -2751,7 +2751,7 @@ int get_next_freezone_nr(struct ctx *ctx, char *bitmap, u32 bitmap_byte, u32 bit
 		}
 	}
 	zonenr = (bytenr * BITS_IN_BYTE) + bitnr;
-	if (mark_zone_occupied(ctx, zonenr, ctx->free_czone_bitmap, ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit, &ctx->nr_free_cache_zones))
+	if (mark_zone_occupied(ctx, zonenr, bitmap, bitmap_byte, bitmap_bit, nrfreezones))
 		BUG();
 
 	return zonenr;
@@ -4330,12 +4330,13 @@ u64 get_free_sectors_in_zone(struct ctx *ctx, unsigned int zonenr)
 
 void advance_zone_wp(struct ctx *ctx, sector_t lba, sector_t s8)
 {
-	unsigned int zonenr = lba / ctx->nr_lbas_in_zone;
-	struct seq_zones_info * szone = &ctx->dzit[zonenr];
-	unsigned int zoneend = (zonenr + 1) * ctx->nr_lbas_in_zone - 1;
+	unsigned int lzonenr = lba / ctx->nr_lbas_in_zone;
+	struct seq_zones_info * szone = &ctx->dzit[lzonenr];
+	unsigned int pzonenr = szone->pzonenr;
+	sector_t end_pba = get_first_pba_for_dzone(ctx, pzonenr) + ctx->nr_lbas_in_zone;
 
 	szone->wp = szone->wp + s8;
-	BUG_ON(szone->wp > zoneend);
+	BUG_ON(szone->wp > end_pba);
 }
 
 
@@ -4381,8 +4382,8 @@ int stl_write_io(struct ctx *ctx, struct bio *bio)
 	struct lsdm_bioctx * bioctx;
 	struct lsdm_ckpt *ckpt;
 	int ret, dosplit, nr_sectors;
-	sector_t lba, wp;
-	unsigned int zonenr, free_sectors_in_zone, s8, maxlen;
+	sector_t lba, wp, pba;
+	unsigned int lzonenr, pzonenr, free_sectors_in_zone, s8, maxlen;
 
 	maxlen = (BIO_MAX_PAGES >> 1) << SECTOR_BLK_SHIFT;
 
@@ -4426,11 +4427,24 @@ int stl_write_io(struct ctx *ctx, struct bio *bio)
 			dosplit = 1;
 		}
 		lba = bio->bi_iter.bi_sector;
-		zonenr = lba / ctx->nr_lbas_in_zone;
-		zonenr = ctx->dzit[zonenr].pzonenr;
-		get_zone_lock(ctx, zonenr);
-		wp = get_wp(ctx, zonenr);
-		free_sectors_in_zone = get_free_sectors_in_zone(ctx, zonenr);
+		lzonenr = lba / ctx->nr_lbas_in_zone;
+		pzonenr = ctx->dzit[lzonenr].pzonenr;
+		/* if this is not set - we need to set it here */
+		if (!pzonenr) {
+			pzonenr = get_next_freezone_nr(ctx, ctx->free_dzone_bitmap, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit, &ctx->nr_free_data_zones);
+			if (pzonenr < 0) {
+				printk(KERN_ERR "\n Cannot accept write, no free zone? ");
+				ctx->dzit[lzonenr].pzonenr = pzonenr;
+				ctx->dzit[lzonenr].lzonenr = lzonenr;
+				ctx->dzit[lzonenr].wp = 0;
+				mutex_init(&ctx->dzit[lzonenr].zone_lock);
+				return -1;
+			}
+		}
+		get_zone_lock(ctx, lzonenr);
+		wp = get_wp(ctx, lzonenr);
+		pba = get_first_pba_for_dzone(ctx, pzonenr) + (lba % ctx->nr_lbas_in_zone);
+		free_sectors_in_zone = get_free_sectors_in_zone(ctx, pzonenr);
 		if (s8 > free_sectors_in_zone) {
 			s8 = free_sectors_in_zone;
 			dosplit = 1;
@@ -4444,11 +4458,11 @@ int stl_write_io(struct ctx *ctx, struct bio *bio)
 			split = clone;
 		}
 		/* LBA starts from 0, but PBA starts after the cache */
-		if (lba + ctx->cache_offset  == wp) {
+		if (pba  == wp) {
 			seq_zone_write(ctx, split, s8);
-			free_zone_lock(ctx, zonenr);
+			free_zone_lock(ctx, lzonenr);
 		} else {
-			free_zone_lock(ctx, zonenr);
+			free_zone_lock(ctx, lzonenr);
 			if (ctx->nr_free_cache_zones <= ctx->higher_watermark) {
 				/* start fg gc but dont wait here unless less than lower_watermark*/
 				/* setting gc_wake=1 and the next wakeup will trigger lsdm_gc(ctx, FG_GC, 0) by waking up a sleeping gc thread */
@@ -5298,6 +5312,7 @@ int read_dzone_info_table(struct ctx * ctx)
 			szi[i].wp = dzi_entry->wp;
 			szi[i].lzonenr = i;
 			mutex_init(&szi[i].zone_lock);
+			/* 1 indicates free, by default the bit is 0 ie occupied, format writes all zeroes initially, so wp is zero for unmapped zones */
 			if (!dzi_entry->wp) {
 				mark_zone_free(ctx, dzi_entry->pzonenr, ctx->free_dzone_bitmap, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit, &ctx->nr_free_data_zones, 0);
 			}
