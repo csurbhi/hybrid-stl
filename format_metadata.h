@@ -130,6 +130,7 @@ struct lsdm_sb {
 	__le64 zone_count;		/* total # of segments */
 	__le64 zone_count_data;		/* # of segments for data area */
 	__le64 zone_count_cache;
+	__le64 zone_count_metadata;
 	__le64 rtm_pba;			/* start block address of translation map */
 	__le64 ckpt1_pba;		/* start address of checkpoint 1 */
         __le64 ckpt2_pba;		/* start address of checkpoint 2 */

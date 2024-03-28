@@ -29,6 +29,19 @@
 #define SECTORS_SHIFT 3
 #define BITS_IN_BYTE 8
 
+/* We want the cache to be 0.05 percent of the data zones.
+ * Nr of data zones is 29808 for this HA-SMR drive.
+ * TODO: Add the nr of zones in cache as a command line argument.
+ */
+
+#define NR_CACHE_ZONES 140
+
+int get_total_cache_zones()
+{
+	return NR_CACHE_ZONES;
+}
+
+
 unsigned int crc32(int d, unsigned char *buf, unsigned int size)
 {
 	return 0;
@@ -161,9 +174,9 @@ __le64 get_nr_blks(struct lsdm_sb *sb)
 	return nr_blks;
 }
 
-__le64 get_max_cache_pba(struct lsdm_sb *sb, unsigned int cmr)
+__le64 get_max_cache_pba(struct lsdm_sb *sb, unsigned int cache_zones)
 {
-	return (cmr << (sb->log_zone_size - sb->log_block_size));
+	return (cache_zones << (sb->log_zone_size - sb->log_sector_size));
 }
 /* We store a tm entry for every 4096 block
  *
@@ -195,7 +208,7 @@ __le32 get_sit_blk_count(struct lsdm_sb *sb)
 {
 	unsigned int one_sit_sz = 80; /* in bytes */
 	unsigned int nr_sits_in_blk = BLK_SZ / one_sit_sz;
-	__le32 nr_sits = get_nr_cache_zones(sb);
+	__le32 nr_sits = get_total_cache_zones();
 	unsigned int blks_for_sit = nr_sits / nr_sits_in_blk;
 	if (nr_sits % nr_sits_in_blk > 0)
 		blks_for_sit = blks_for_sit + 1;
@@ -206,12 +219,14 @@ __le32 get_sit_blk_count(struct lsdm_sb *sb)
 
 __le32 get_seqz_blk_count(struct lsdm_sb *sb)
 {
-	unsigned int nr_seq_zns = sb->zone_count_data;
+	unsigned int nr_seq_zns = sb->zone_count - get_total_cache_zones();
 	unsigned int one_seqz_sz = sizeof(struct stl_dzones_info);
 	unsigned int nr_seqz_in_blk = BLK_SZ/one_seqz_sz;
 	unsigned int blks_for_dzit = nr_seq_zns / nr_seqz_in_blk;
        if (nr_seq_zns % nr_seqz_in_blk	> 0)
 	       blks_for_dzit = blks_for_dzit + 1;
+
+       return blks_for_dzit;
 }
 
 /* We write all the metadata blks sequentially in the CMR zones
@@ -242,14 +257,14 @@ __le32 get_metadata_zone_count(struct lsdm_sb *sb)
 __le32 get_data_zone_count(struct lsdm_sb *sb)
 {
 	__le32 data_zone_count = 0;
-	data_zone_count = sb->zone_count - sb->nr_cmr_zones;
+	data_zone_count = sb->zone_count - sb->zone_count_metadata - sb->zone_count_cache;
 	return data_zone_count;
 }
 
 __le32 get_cache_zone_count(struct lsdm_sb *sb)
 {
 	__le32 cache_zone_count = 0;
-	cache_zone_count = sb->nr_cmr_zones - get_metadata_zone_count(sb);
+	cache_zone_count = get_total_cache_zones() - sb->zone_count_metadata;
 	return cache_zone_count;
 }
 
@@ -280,7 +295,7 @@ __le64 get_rtm_pba(struct lsdm_sb *sb)
 
 __le64 get_seqz_pba(struct lsdm_sb *sb)
 {
-	u64 seqz_pba = sb->ckpt2_pba + + NR_SECTORS_IN_BLK;
+	u64 seqz_pba = sb->ckpt2_pba + NR_SECTORS_IN_BLK;
 	return seqz_pba;
 }
 
@@ -422,9 +437,9 @@ unsigned long long get_current_frontier(struct lsdm_sb *sb)
 
 unsigned long get_data_zone_pba(struct lsdm_sb *sb)
 {
-	u64 dzone_pba = (sb->nr_cmr_zones) << (sb->log_zone_size- sb->log_sector_size);
+	u64 dzone_pba = (sb->zone_count_cache + sb->zone_count_metadata) << (sb->log_zone_size- sb->log_sector_size);
 	printf("\n Data zone pba: %llu", dzone_pba);
-
+	return dzone_pba;
 }
 
 struct lsdm_sb * write_sb(int fd, unsigned long sb_pba, unsigned long cmr)
@@ -433,6 +448,7 @@ struct lsdm_sb * write_sb(int fd, unsigned long sb_pba, unsigned long cmr)
 	int ret = 0;
 	unsigned int zonesz, logzonesz, zone_count;
 	char str[SECTOR_SIZE];
+	int total_cache_zones = get_total_cache_zones();
 
 	sb = (struct lsdm_sb *)malloc(BLK_SZ);
 	if (!sb)
@@ -480,7 +496,7 @@ struct lsdm_sb * write_sb(int fd, unsigned long sb_pba, unsigned long cmr)
 	printf("\n sb->zone_count: %d", sb->zone_count);
 	sb->max_pba = get_max_pba(sb);
 	printf("\n ******* sb->max_pba: %llu", sb->max_pba);
-	sb->max_cache_pba = get_max_cache_pba(sb, cmr);
+	sb->max_cache_pba = get_max_cache_pba(sb, total_cache_zones);
 	sb->blk_count_rtm = get_rtm_blk_count(sb);
 	printf("\n sb->blk_count_rtm: %d", sb->blk_count_rtm);
 	sb->blk_count_ckpt = NR_CKPT_COPIES;
@@ -493,23 +509,27 @@ struct lsdm_sb * write_sb(int fd, unsigned long sb_pba, unsigned long cmr)
 	printf("\n sb->ckpt1_pba: %u", sb->ckpt1_pba);
 	sb->ckpt2_pba = sb->ckpt1_pba + NR_SECTORS_IN_BLK;
 	printf("\n sb->ckpt2_pba: %u", sb->ckpt2_pba);
+	sb->dzit_pba = get_seqz_pba(sb);
+	printf("\n sb->dzit_pba: %u ", sb->dzit_pba);
 	sb->sit_pba = get_sit_pba(sb);
 	printf("\n sb->sit_pba: %u", sb->sit_pba);
 	sb->rtm_pba = get_rtm_pba(sb);
 	printf("\n sb->rtm_pba: %u", sb->rtm_pba);
-	sb->dzit_pba = get_seqz_pba(sb);
 	sb->nr_lbas_in_zone = (1 << (sb->log_zone_size - sb->log_sector_size));
 	printf("\n nr_lbas_in_zone: %llu ", sb->nr_lbas_in_zone);
 	sb->nr_cmr_zones = cmr;
 	printf("\n sb->nr_cmr_zones: %llu", sb->nr_cmr_zones);
+	sb->zone_count_metadata = get_metadata_zone_count(sb);
+	printf("\n sb->zone_count_metadata: %d ", sb->zone_count_metadata);
+	sb->zone_count_cache = get_cache_zone_count(sb);
+	printf("\n sb->zone_count_cache: %d", sb->zone_count_cache);
+	sb->zone_count_data = get_data_zone_count(sb);
+	printf("\n sb->zone_count_data: %d", sb->zone_count_data);
 	sb->czone0_pba = get_current_frontier(sb);
 	printf("\n sb->czone0_pba: %d", sb->czone0_pba);
 	sb->dzone0_pba = get_data_zone_pba(sb);
 	printf("\n sb->dzone0_pba: %d", sb->dzone0_pba);
-	sb->zone_count_data = get_data_zone_count(sb);
-	printf("\n sb->zone_count_data: %d", sb->zone_count_data);
-	sb->zone_count_cache = get_cache_zone_count(sb);
-	printf("\n sb->zone_count_cache: %d", sb->zone_count_cache);
+
 	sb->crc = 0;
 	//sb->crc = crc32(-1, (unsigned char *)sb, STL_SB_SIZE);
 	ret = write_to_disk(fd, (char *)sb, 0); 
@@ -611,7 +631,7 @@ void write_ckpt(int fd, struct lsdm_sb * sb, unsigned long ckpt_pba)
 	ckpt->version = 0;
 	ckpt->user_block_count = sb->zone_count_data << (sb->log_zone_size - sb->log_block_size);
 	ckpt->nr_invalid_zones = 0;
-	ckpt->hot_frontier_pba = sb->dzone0_pba;
+	ckpt->hot_frontier_pba = sb->czone0_pba;
 	ckpt->nr_free_cache_zones = sb->zone_count_cache - 1; /* one frontier */
 	ckpt->elapsed_time = 0;
 	ckpt->clean = 1;  /* 1 indicates clean datastructures */
@@ -858,19 +878,18 @@ int main(int argc, char * argv[])
 	read_sb(fd, 8);
 	printf("\n Superblock written at pba: %d", pba + NR_SECTORS_IN_BLK);
 	write_ckpt(fd, sb1, sb1->ckpt1_pba);
-	write_dzone_info_table(fd, sb1->blk_count_dzit, sb1->dzit_pba);
-	write_seg_info_table(fd, sb1->zone_count, sb1->sit_pba);
-	read_seg_info_table(fd, sb1->zone_count, sb1->sit_pba);
-	write_rtm(fd, sb1->rtm_pba, sb1->blk_count_rtm);
-	nrblks = get_nr_blks(sb1);
-	printf("\n nrblks: %lu", nrblks);
-	//write_zeroed_blks(fd, 0, nrblks);
-	printf("\n nrblks: %lu", nrblks);
 	printf("\n Checkpoint written at offset: %d", sb1->ckpt1_pba);
 	printf("\n Second Checkpoint written at offset: %d", sb1->ckpt2_pba);
-	printf("\n Extent map written");
-	printf("\n sb1->zone_count: %d", sb1->zone_count);
+	write_dzone_info_table(fd, sb1->blk_count_dzit, sb1->dzit_pba);
+	printf("\n Data zone information written ");
+	write_seg_info_table(fd, sb1->zone_count_cache, sb1->sit_pba);
+	read_seg_info_table(fd, sb1->zone_count_cache, sb1->sit_pba);
 	printf("\n Segment Information Table written");
+	write_rtm(fd, sb1->rtm_pba, sb1->blk_count_rtm);
+	printf("\n Reverse Translation map written");
+	nrblks = get_nr_blks(sb1);
+	printf("\n Total nr of blks in disk: %lu", nrblks);
+	printf("\n sb1->zone_count: %d", sb1->zone_count);
 	pba = 0;
 	free(sb1);
 	/* 0 volume_size: 39321600  lsdm  blkdev: /dev/vdb tgtname: TL1 zone_lbas: 524288 data_end: 41418752 */
@@ -894,7 +913,7 @@ int main(int argc, char * argv[])
 	//volume_size = data_zones * zone_lbas;
 	unsigned long volume_size = data_zones * zone_lbas;
 	unsigned long data_end = volume_size;
-	sprintf(cmd, "/sbin/dmsetup create TL1 --table '0 %ld lsdm %s %s %ld %ld'",
+	sprintf(cmd, "/sbin/dmsetup create TL1 --table '0 %ld hybrid-stl %s %s %ld %ld'",
             volume_size, blkdev, tgtname, zone_lbas, 
 	    data_end);
 	printf("\n cmd: %s", cmd);

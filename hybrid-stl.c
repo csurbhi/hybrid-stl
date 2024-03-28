@@ -176,6 +176,7 @@ static void destroy_caches(struct ctx *ctx);
 static int create_caches(struct ctx *ctx);
 static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **argv);
 static void hybrid_stl_dtr(struct dm_target *dm_target);
+int get_new_data_zone(struct ctx *ctx);
 
 long nrpages;
 int _lsdm_verbose;
@@ -1464,7 +1465,11 @@ static int write_valid_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 	
 	/* If list is empty we have nothing to do */
 	BUG_ON(list_empty(&ctx->gc_extents->list));
-	pzonenr = get_next_freezone_nr(ctx, ctx->free_dzone_bitmap, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit, &ctx->nr_free_data_zones);
+	pzonenr = szi->pzonenr;
+	/* Allocate a new one only if this sequential data zone actually has any data */
+	if (!pzonenr || szi->wp) {
+		pzonenr = get_new_data_zone(ctx);
+	}
 	wp = 0;
 	/* setup the bio for the first gc_extent */
 	list_for_each(pos, &ctx->gc_extents->list) {
@@ -1473,7 +1478,7 @@ static int write_valid_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 		wp = wp + gc_extent->e.len;
 		submit_bio_wait(gc_extent->bio);
 	}
-	mark_zone_free(ctx, szi->pzonenr, ctx->free_dzone_bitmap, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit, &ctx->nr_free_data_zones, 0);
+	mark_zone_free(ctx, szi->pzonenr, ctx->free_dzone_bitmap, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit, &ctx->nr_free_data_zones, 1);
 	szi->pzonenr = pzonenr;
 	szi->wp = wp;
 	//printk(KERN_ERR "\n GC extents submitted for read: %d ", count);
@@ -2757,6 +2762,15 @@ int get_next_freezone_nr(struct ctx *ctx, char *bitmap, u32 bitmap_byte, u32 bit
 	return zonenr;
 }
 
+
+int get_new_data_zone(struct ctx *ctx)
+{
+	u64 pzonenr;
+	pzonenr = get_next_freezone_nr(ctx, ctx->free_dzone_bitmap, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit, &ctx->nr_free_data_zones);
+	pzonenr = (ctx->sb->dzone0_pba/ctx->nr_lbas_in_zone) + pzonenr;
+	return pzonenr;
+}
+
 /* moves the write frontier, returns the LBA of the packet trailer
  * Always called with the ctx->wf_lock held.
 */
@@ -3251,7 +3265,7 @@ void sit_ent_vblocks_decr(struct ctx *ctx, sector_t pba)
 		update_gc_tree(ctx, zonenr, ptr->vblocks, ptr->mtime, __func__);
 		if (!ptr->vblocks) {
 			//printk(KERN_ERR "\n %s Freeing zone: %llu \n", __func__, zonenr);
-			mark_zone_free(ctx, zonenr, ctx->free_czone_bitmap, ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit, &ctx->nr_free_cache_zones, 0);
+			mark_zone_free(ctx, zonenr, ctx->free_czone_bitmap, ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit, &ctx->nr_free_cache_zones, 1);
 		}
 	}
 	//mutex_unlock(&ctx->sit_kv_store_lock);
@@ -4431,15 +4445,15 @@ int stl_write_io(struct ctx *ctx, struct bio *bio)
 		pzonenr = ctx->dzit[lzonenr].pzonenr;
 		/* if this is not set - we need to set it here */
 		if (!pzonenr) {
-			pzonenr = get_next_freezone_nr(ctx, ctx->free_dzone_bitmap, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit, &ctx->nr_free_data_zones);
+			pzonenr = get_new_data_zone(ctx);
 			if (pzonenr < 0) {
-				printk(KERN_ERR "\n Cannot accept write, no free zone? ");
-				ctx->dzit[lzonenr].pzonenr = pzonenr;
-				ctx->dzit[lzonenr].lzonenr = lzonenr;
-				ctx->dzit[lzonenr].wp = 0;
-				mutex_init(&ctx->dzit[lzonenr].zone_lock);
+				panic("\n Cannot accept write, no free zone? ");
 				return -1;
 			}
+			ctx->dzit[lzonenr].pzonenr = pzonenr;
+			ctx->dzit[lzonenr].lzonenr = lzonenr;
+			ctx->dzit[lzonenr].wp = 0;
+			mutex_init(&ctx->dzit[lzonenr].zone_lock);
 		}
 		get_zone_lock(ctx, lzonenr);
 		wp = get_wp(ctx, lzonenr);
@@ -4452,7 +4466,8 @@ int stl_write_io(struct ctx *ctx, struct bio *bio)
 		if (dosplit) {
 			split = bio_split(clone, s8, GFP_NOIO, &fs_bio_set);
 			if (!split) {
-				/* call lsdm_clone_endio with an error */
+				/* TODO: call lsdm_clone_endio with an error */
+				panic("\n bio_split() failed! \n");
 			}
 		} else {
 			split = clone;
@@ -6011,6 +6026,6 @@ void __exit hybrid_stl_exit(void)
 module_init(hybrid_stl_init);
 module_exit(hybrid_stl_exit);
 
-MODULE_DESCRIPTION(DM_NAME " Log Structured SMR Translation Layer");
+MODULE_DESCRIPTION(DM_NAME "Hybrid Cache architecture based SMR Translation Layer");
 MODULE_AUTHOR("Surbhi Palande <csurbhi@gmail.com>");
 MODULE_LICENSE("GPL");
