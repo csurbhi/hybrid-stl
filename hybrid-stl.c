@@ -105,7 +105,7 @@ int prepare_bio(struct bio * clone, sector_t s8, sector_t wf, unsigned int is_ca
 struct bio * split_submit(struct bio *clone, sector_t s8, sector_t wf);
 int ls_cache_write(struct ctx *ctx, struct bio *clone);
 void lsdm_handle_write(struct ctx *ctx);
-int stl_write_io(struct ctx *ctx, struct bio *bio);
+int hybrid_stl_write_io(struct ctx *ctx, struct bio *bio);
 void put_free_zone(struct ctx *ctx, u64 pba);
 struct lsdm_ckpt * read_checkpoint(struct ctx *ctx, unsigned long pba);
 int do_recovery(struct ctx *ctx);
@@ -181,6 +181,8 @@ int get_new_data_zone(struct ctx *ctx);
 long nrpages;
 int _lsdm_verbose;
 struct dentry * debug_dir;
+
+#define LSDM_DEBUG 1
 
 
 static inline void mykref_init(struct mykref *kref)
@@ -377,7 +379,7 @@ static struct extent *lsdm_rb_prev(struct extent *e)
 static int check_node_contents(struct rb_node *node)
 {
 	int ret = 0;
-	struct extent *e, *next, *prev;
+	struct extent *e;
 	struct rev_extent *re;
 
 	if (!node)
@@ -777,7 +779,10 @@ static struct extent * lsdm_rb_insert(struct ctx *ctx, struct extent *new)
 		parent = *link;
 		e = rb_entry(parent, struct extent, rb);
 		r_e = e->ptr_to_rev;
-		BUG_ON(!r_e);
+		if (!r_e) {
+			printk(KERN_ERR "\n %s parent->lba: %llu, parent->pba: %llu, parent->len: %llu (No r_e found!) ", __func__, e->lba, e->pba, e->len);
+			BUG_ON(!r_e);
+		}
 		if (e->pba != r_e->pba) {
 			printk(KERN_ERR "\n %s parent->lba: %llu, parent->pba: %llu, parent->len: %llu r_e->pba: %llu", __func__, e->lba, e->pba, e->len, r_e->pba);
 			BUG();
@@ -793,12 +798,13 @@ static struct extent * lsdm_rb_insert(struct ctx *ctx, struct extent *new)
 			return e;
 		}
 	}
-	//printk( KERN_ERR "\n %s Inserting (lba: %llu pba: %llu len: %u) ", __func__, new->lba, new->pba, new->len);
 	if (new->pba == 0) {
 		/* we do not have to insert this here. Just free and return */
 		kmem_cache_free(ctx->extent_cache, new);
+		printk( KERN_ERR "\n %s NOT Inserting (lba: %llu pba: %llu len: %llu) ", __func__, new->lba, new->pba, new->len);
 		return NULL;
 	}
+	printk( KERN_ERR "\n %s Inserting (lba: %llu pba: %llu len: %llu) ", __func__, new->lba, new->pba, new->len);
 	/* Put the new node there */
 	rb_link_node(&new->rb, parent, link);
 	rb_insert_color(&new->rb, root);
@@ -807,13 +813,13 @@ static struct extent * lsdm_rb_insert(struct ctx *ctx, struct extent *new)
 	r_insert = lsdm_rb_revmap_insert(ctx, new);
 	r_find = lsdm_rb_revmap_find(ctx, new->pba, new->len, ctx->sb->max_pba, __func__);
 	if (r_insert != r_find) {
-		printk(KERN_ERR "\n %s inserted revmap address is different than found one! ");
+		printk(KERN_ERR "\n %s inserted revmap address is different than found one! ", __func__);
 		printk(KERN_ERR "\n revmap_find(): %p, revmap_insert(): %p", r_find, r_insert);
 		printk(KERN_ERR "\n revmap_find()::pba: %llu, revmap_insert()::pba: %llu", r_find->pba, r_insert->pba);
 		BUG();
 	}
 	if (r_insert->pba != r_find->pba) {
-		printk(KERN_ERR "\n %s inserted revmap pba is different than found one! ");
+		printk(KERN_ERR "\n %s inserted revmap pba is different than found one! ", __func__);
 		printk(KERN_ERR "\n revmap_find()::pba: %llu, revmap_insert()::pba: %llu", r_find->pba, r_insert->pba);
 		BUG();
 	}
@@ -892,7 +898,7 @@ static int lsdm_rb_update_range(struct ctx *ctx, sector_t lba, sector_t pba, siz
 	struct extent *tmp = NULL;
 	sector_t diff = 0;
 
-	//printk(KERN_ERR "\n Entering %s lba: %llu, pba: %llu, len:%ld ", __func__, lba, pba, len);
+	printk(KERN_ERR "\n Entering %s lba: %llu, pba: %llu, len:%ld ", __func__, lba, pba, len);
 	
 	BUG_ON(len <= 0);
 	BUG_ON(pba > ctx->sb->max_pba);
@@ -1436,8 +1442,7 @@ static int write_metadata_extent(struct ctx *ctx, struct gc_extents *gc_extent, 
 
 	//printk(KERN_ERR "\n %s gc_extent: (lba: %d pba: %d len: %d), s8: %d max_pba: %llu", __func__, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len, s8, ctx->sb->max_pba);
 #ifdef LSDM_DEBUG
-	BUG_ON(gc_extent->e.len != s8);
-	BUG_ON(gc_extent->e.pba == 0 );
+	BUG_ON(gc_extent->e.pba == 0);
 	BUG_ON(gc_extent->e.pba >= ctx->sb->max_pba);
 	BUG_ON(gc_extent->e.lba >= ctx->sb->max_pba);
 #endif
@@ -2015,9 +2020,9 @@ int lsdm_gc_thread_start(struct ctx *ctx)
 
 int lsdm_gc_thread_stop(struct ctx *ctx)
 {
+	wake_up_all(&ctx->gc_th->fggc_wq);
 	kthread_stop(ctx->gc_th->lsdm_gc_task);
 	printk(KERN_ERR "\n GC thread stopped! ");
-	wake_up_all(&ctx->gc_th->fggc_wq);
 	kvfree(ctx->gc_th);
 	return 0;
 }
@@ -4010,7 +4015,7 @@ void sub_write_done(struct work_struct * w)
 	struct lsdm_bioctx * bioctx;
 	struct ctx *ctx;
 	sector_t lba, pba;
-	unsigned int len;
+	sector_t len;
 	uint is_cached_write;
 
 	subbioctx = container_of(w, struct lsdm_sub_bioctx, work);
@@ -4022,12 +4027,13 @@ void sub_write_done(struct work_struct * w)
 	len = subbioctx->extent.len;
 	len = (len >> SECTOR_BLK_SHIFT) << SECTOR_BLK_SHIFT;
 	is_cached_write = subbioctx->cache_write;
+	printk(KERN_ERR "\n %s lba: %llu, pba: %llu, len: %llu is_cached_write: %d ", __func__, lba, pba, len, is_cached_write);
 
 	/* Now reads will work! so we can complete the bio */
 	/* Do this before the RB tree is updated, as we need to remove the old translation entries and adjust the valid blks corresponding to the zone in cache if any */
 	find_and_remove_rev_tm(ctx, lba, len);
 	if (is_cached_write) {
-		add_rev_translation_entry(ctx, lba, pba, len);
+		//add_rev_translation_entry(ctx, lba, pba, len);
 	} else {
 		pba = 0;
 	}
@@ -4157,6 +4163,7 @@ void fill_subbioctx(struct lsdm_sub_bioctx * subbio_ctx, struct lsdm_bioctx *bio
 	subbio_ctx->extent.pba = pba;
 	subbio_ctx->extent.len = len;
 	subbio_ctx->cache_write = is_cached_write;
+	printk(KERN_ERR "\n %s lba: %llu, pba: %llu, len: %llu is_cached_write: %d ", __func__, lba, pba, len, is_cached_write);
 }
 
 int prepare_bio(struct bio * clone, sector_t s8, sector_t wf, unsigned int is_cache_write)
@@ -4300,7 +4307,7 @@ u64 get_wp(struct ctx *ctx, unsigned int zonenr)
 u64 get_free_sectors_in_zone(struct ctx *ctx, unsigned int zonenr)
 {
 	struct seq_zones_info * szone = &ctx->dzit[zonenr];
-	return (ctx->nr_lbas_in_zone - szone->wp);
+	return (ctx->nr_lbas_in_zone - (szone->wp % ctx->nr_lbas_in_zone));
 }
 
 void advance_zone_wp(struct ctx *ctx, sector_t lba, sector_t s8)
@@ -4320,12 +4327,13 @@ void seq_zone_write(struct ctx *ctx, struct bio * bio, u32 s8)
 {
 	sector_t lba = bio->bi_iter.bi_sector;
 	sector_t pba, wp;
+	u32 lzonenr, pzonenr;
 
 	ctx->nr_app_writes += s8;
-	u32 zonenr = lba / ctx->nr_lbas_in_zone;
-	zonenr = ctx->dzit[zonenr].pzonenr;
-	pba = get_zone_pba(ctx->sb, zonenr) + lba % ctx->nr_lbas_in_zone;
-	wp = ctx->dzit[zonenr].wp;
+	lzonenr = lba / ctx->nr_lbas_in_zone;
+	pzonenr = ctx->dzit[lzonenr].pzonenr;
+	pba = get_zone_pba(ctx->sb, pzonenr) + lba % ctx->nr_lbas_in_zone;
+	wp = ctx->dzit[lzonenr].wp;
 	prepare_bio(bio, s8, wp, 0);
 	submit_bio(bio);
 	advance_zone_wp(ctx, lba, s8);
@@ -4354,7 +4362,7 @@ void seq_zone_write(struct ctx *ctx, struct bio * bio, u32 s8)
  * to read anyway.
  *
 */
-int stl_write_io(struct ctx *ctx, struct bio *bio)
+int hybrid_stl_write_io(struct ctx *ctx, struct bio *bio)
 {
 	struct bio * clone, *split;
 	struct lsdm_bioctx * bioctx;
@@ -4426,7 +4434,7 @@ int stl_write_io(struct ctx *ctx, struct bio *bio)
 		get_zone_lock(ctx, lzonenr);
 		wp = get_wp(ctx, lzonenr);
 		pba = get_first_pba_for_dzone(ctx, pzonenr) + (lba % ctx->nr_lbas_in_zone);
-		free_sectors_in_zone = get_free_sectors_in_zone(ctx, pzonenr);
+		free_sectors_in_zone = get_free_sectors_in_zone(ctx, lzonenr);
 		if (s8 > free_sectors_in_zone) {
 			s8 = free_sectors_in_zone;
 			dosplit = 1;
@@ -5832,8 +5840,8 @@ static void hybrid_stl_dtr(struct dm_target *dm_target)
 {
 	struct ctx *ctx = dm_target->private;
 
-	lsdm_flush_thread_stop(ctx);
 	lsdm_gc_thread_stop(ctx);
+	lsdm_flush_thread_stop(ctx);
 	flush_workqueue(ctx->writes_wq);
 	flush_workqueue(ctx->tm_wq);
 	printk(KERN_ERR "\n nr_app_writes: %llu", ctx->nr_app_writes);
@@ -5923,7 +5931,7 @@ static int hybrid_stl_map_io(struct dm_target *dm_target, struct bio *bio)
 			ret = lsdm_read_io(ctx, bio);
 			break;
 		case REQ_OP_WRITE:
-			ret = stl_write_io(ctx, bio);
+			ret = hybrid_stl_write_io(ctx, bio);
 			break;
 		default:
 			printk(KERN_ERR "\n %s Received bio, op: %d ! doing nothing with it", __func__, bio_op(bio));
