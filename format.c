@@ -34,7 +34,8 @@
  * TODO: Add the nr of zones in cache as a command line argument.
  */
 
-#define NR_CACHE_ZONES 140
+#define NR_CACHE_ZONES 10
+//#define NR_CACHE_ZONES 10
 
 int get_total_cache_zones()
 {
@@ -411,11 +412,34 @@ void read_block(int fd, sector_t pba, unsigned nr_blks)
 
 }
 
-void write_rtm(int fd, sector_t rtm_pba, unsigned nr_blks)
+void write_rtm(int fd, struct lsdm_sb *sb, sector_t rtm_pba, unsigned nr_blks)
 {
+	int i, j, ret;
+	char buff[4096];
+	struct rev_tm_entry *entry;
+	sector_t offset = rtm_pba * SECTOR_SIZE;
 	printf("\n ** %s Writing rtm blocks at pba: %llu, nrblks: %u", __func__, rtm_pba, nr_blks);
-	write_zeroed_blks(fd, rtm_pba, nr_blks);
-	read_block(fd, rtm_pba, nr_blks);
+
+	ret = lseek64(fd, offset, SEEK_SET);
+	if (ret == -1) {
+		perror("!! (before write) Error in lseek64: \n");
+		printf("\n write to disk offset: %u, sectornr: %d ret: %d", offset, rtm_pba, ret);
+		exit(errno);
+	}
+
+	entry = (struct rev_tm_entry *) buff;
+	for (j=0; j<REV_TM_ENTRIES_BLK; j++) {
+		entry->lba = sb->max_pba + 1;
+		entry = entry + 1;
+	}
+	for (i=0; i<nr_blks; i++) {
+		/* This is an invalid LBA, and it indicates an empty entry */
+		ret = write(fd, buff, BLK_SZ);
+		if (ret < 0) {
+			perror("Error while writing: ");
+			exit(errno);
+		}
+	}
 }
 
 unsigned long long get_current_frontier(struct lsdm_sb *sb)
@@ -885,7 +909,7 @@ int main(int argc, char * argv[])
 	write_seg_info_table(fd, sb1->zone_count_cache, sb1->sit_pba);
 	read_seg_info_table(fd, sb1->zone_count_cache, sb1->sit_pba);
 	printf("\n Segment Information Table written");
-	write_rtm(fd, sb1->rtm_pba, sb1->blk_count_rtm);
+	write_rtm(fd, sb1, sb1->rtm_pba, sb1->blk_count_rtm);
 	printf("\n Reverse Translation map written");
 	nrblks = get_nr_blks(sb1);
 	printf("\n Total nr of blks in disk: %lu", nrblks);
