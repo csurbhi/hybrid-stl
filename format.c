@@ -33,7 +33,7 @@
  * Nr of data zones is 29808 for this HA-SMR drive.
  * TODO: Add the nr of zones in cache as a command line argument.
  */
-#define NR_CACHE_ZONES 117
+#define NR_CACHE_ZONES 115
 
 int get_total_cache_zones()
 {
