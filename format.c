@@ -742,11 +742,46 @@ void write_ckpt(int fd, struct lsdm_sb * sb, unsigned long ckpt_pba)
 	free(ckpt1);
 }
 
-
-void write_dzone_info_table(int fd, u64 dzit_blk_count, u32 dzit_pba)
+void write_dzone_info_table(int fd, struct lsdm_sb *sb)
 {
-	write_zeroed_blks(fd, dzit_pba, dzit_blk_count);
+	struct stl_dzones_info * entry;
+	char buffer[4096];
+	int i, j, dzit_entries_per_blk, entries_in_last_blk, ret;
+	u64 offset, wp;
+
+	dzit_entries_per_blk = BLK_SZ/sizeof(struct stl_dzones_info);
+	entries_in_last_blk = sb->zone_count % dzit_entries_per_blk;
+	offset = sb->dzit_pba * SECTOR_SIZE;
+	ret = lseek(fd, offset, SEEK_SET);
+	if ( ret == -1) {
+		perror("!! (before write) Error in lseek64: \n");
+		printf("\n write to disk offset: %u, sectornr: %lld ret: %d\n", offset, sb->dzit_pba, ret);
+		exit(errno);
+	}
+	printf("\n !!!!!  dzit entries in a blk: %d ", dzit_entries_per_blk);
+	printf("\n !!!!!  sb->blk_count_dzit: %d ", sb->blk_count_dzit);
+	for(i=0; i < sb->blk_count_dzit-1; i++) {
+		entry = buffer;
+		memset(buffer, 0, BLK_SZ);
+		for(j=0; j<dzit_entries_per_blk; j++) {
+			entry->pzonenr = sb->zone_count + 1;
+			entry->wp = 0;
+			entry++;
+		}
+		ret = write(fd, buffer, BLK_SZ);
+	}
+	entry = buffer;
+	/* last blk has fewer entries - we leave all of them free - so that data zones can be found during cache eviction */
+	memset(buffer, 0, BLK_SZ);
+	for(j=0; j<entries_in_last_blk; j++) {
+		entry->pzonenr = sb->zone_count + 1;
+		entry->wp = 0;
+		wp = wp + sb->nr_lbas_in_zone;
+		entry++;
+	}
+	ret = write(fd, buffer, BLK_SZ);
 }
+
 
 void write_seg_info_table(int fd, u64 nr_seg_entries, unsigned long seg_entries_pba)
 {
@@ -902,7 +937,7 @@ int main(int argc, char * argv[])
 	write_ckpt(fd, sb1, sb1->ckpt1_pba);
 	printf("\n Checkpoint written at offset: %d", sb1->ckpt1_pba);
 	printf("\n Second Checkpoint written at offset: %d", sb1->ckpt2_pba);
-	write_dzone_info_table(fd, sb1->blk_count_dzit, sb1->dzit_pba);
+	write_dzone_info_table(fd, sb1);
 	printf("\n Data zone information written ");
 	write_seg_info_table(fd, sb1->zone_count_cache, sb1->sit_pba);
 	read_seg_info_table(fd, sb1->zone_count_cache, sb1->sit_pba);

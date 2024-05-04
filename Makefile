@@ -12,7 +12,9 @@ CC += ${MY_CFLAGS}
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules EXTRA_CFLAGS="$(MY_CFLAGS)"
 	gcc format.c -o format
+	gcc populate_disk.c -o populate
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 	rm format
+	rm populate

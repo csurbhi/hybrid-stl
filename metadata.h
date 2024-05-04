@@ -60,7 +60,6 @@ struct app_read_ctx {
 	struct bio * clone;
 	char * data;
 	sector_t lba;
-	sector_t pba;
 	sector_t nrsectors;
 };
 
