@@ -1683,12 +1683,6 @@ int create_dzone_list(struct ctx *ctx, unsigned int zonenr)
 		}
 		BUG_ON(!temp.len);
 		u32 zonenr = temp.lba / ctx->nr_lbas_in_zone;
-		e = _lsdm_rb_geq(&ctx->extent_tbl_root, temp.lba, 0);
-		if ((!e) || (e->lba + e->len < temp.lba) || (e->lba > temp.lba)) {
-			printk(KERN_ERR "\n Some erorr!!!! -------------------------------------");
-		}
-		//printk(KERN_ERR "\n %s zonenr: %d START: %llu temp.lba: %llu e->lba: %llu e->pba: %llu e->len: %llu" ,  __func__, zonenr, (zonenr * ctx->nr_lbas_in_zone), temp.lba, e->lba, e->pba, e->len);
-		//zonenr = ctx->dzit[zonenr].lzonenr;
 		count = count + 1;
 		if (add_zone_to_gclist(ctx, zonenr)) {
 			return -ENOMEM;
@@ -1736,7 +1730,7 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 		 else
 			printk(KERN_ERR "\n Searching for LBA: %llu, found LBA: %llu len: %llu LAST LBA: %llu", lba, e->lba, e->len, last_lba);
 		*/
-		if ((e == NULL) || (e->lba > last_lba)) {  /* this will never happen:  (e->lba + e->len) <= lba) */
+		if ((e == NULL) || (e->lba >= last_lba)) {  /* this will never happen:  (e->lba + e->len) <= lba) */
 			/* Not found in the cache. Now check if this can be seen in the actual data zone */
 			if (pzonenr < sb->zone_count) {
 				pba = get_first_pba_for_dzone(ctx, pzonenr) + lba % ctx->nr_lbas_in_zone;
@@ -1773,7 +1767,7 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 				}
 			}
 			lba = lba + zerolen;
-			if (lba == last_lba)
+			if (lba >= last_lba)
 				break;
 			/* when we fall through to the next case, lba = e->lba */
 		}
@@ -1789,7 +1783,7 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 			temp.len = overlap;
 		}
 		add_extent_to_gclist(ctx, &temp);
-		lba = e->lba + overlap;
+		lba = lba + overlap;
 	}
 	//printk(KERN_ERR "\n %s number of sectors from the data zone(%d): %d ", __func__, szi->pzonenr, count);
 	//printk(KERN_ERR "\n Returning from : %s ", __func__);
@@ -1915,8 +1909,13 @@ again:
         }
 	return zones_cleaned;
 stop:
+	if (gc_th->gc_wake) {
+                gc_th->gc_wake = 0;
+                wake_up_all(&ctx->gc_th->fggc_wq);
+        }
 	up_write(&ctx->lsdm_rb_lock);
 	free_zone_lock(ctx, lzonenr);
+	//up_write(&ctx->wf_lock);
 	mutex_unlock(&ctx->gc_lock);
 	free_gc_extents(ctx);
 	free_data_zone_list(ctx);
@@ -2132,7 +2131,7 @@ void lsdm_subread_done(struct bio *clone)
 
 int zero_fill_clone(struct ctx *ctx, struct bio *clone) 
 {
-	//printk(KERN_ERR "\n %s Zero filling the entire bio", __func__);
+	printk(KERN_ERR "\n %s Zero filling the entire bio", __func__);
 	zero_fill_bio(clone);
 	/* This bio could be the parent of other chained bios. Its necessary to call
 	 * bio_endio and not the endio function directly
@@ -2412,7 +2411,7 @@ int hybrid_stl_read_io(struct ctx *ctx, struct bio *bio)
 		bio_endio(bio);
 		return -ENOMEM;
 	}
-	//printk(KERN_ERR "\n %s Read bio::lba: %llu bio::nrsectors: %d", __func__, clone->bi_iter.bi_sector, bio_sectors(clone));
+	printk(KERN_ERR "\n %s Read bio::lba: %llu bio::nrsectors: %d", __func__, clone->bi_iter.bi_sector, bio_sectors(clone));
 
 	bio_set_dev(clone, ctx->dev->bdev);
 	split = NULL;
