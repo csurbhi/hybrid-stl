@@ -2284,12 +2284,15 @@ int handle_full_overlap(struct ctx *ctx, struct bio * bio, struct bio *clone, se
 		if (print)
 			printk(KERN_ERR "\n %s aligned read \n", __func__);
 		ctx->nr_reads += s8;
+		read_ctx->clone = clone;
 		clone->bi_end_io = lsdm_subread_done;
 		clone->bi_iter.bi_sector = pba;
+		clone->bi_private = read_ctx;
 		bio_set_dev(clone, ctx->dev->bdev);
 		if (print)
-			printk(KERN_ERR "\n %s aligned read submitting....\n", __func__);
+			printk(KERN_ERR "\n %s aligned read submitting....pba: %llu s8: %llu \n", __func__, pba, s8);
 		submit_bio_noacct(clone);
+		printk(KERN_ERR "\n %s done ! \n", __func__);
 	} else {
 		if (print)
 			printk(KERN_ERR "\n %s Unaligned read \n", __func__);
@@ -2330,7 +2333,7 @@ int handle_full_overlap(struct ctx *ctx, struct bio * bio, struct bio *clone, se
 	return 0;
 }
 
-int read_from_zone(struct ctx *ctx, struct bio * clone)
+int read_from_zone(struct ctx *ctx, struct bio * clone, struct app_read_ctx *readctx, int end)
 {
 	struct bio *split = clone;
 	unsigned nr_sectors, validSectors;
@@ -2364,6 +2367,10 @@ int read_from_zone(struct ctx *ctx, struct bio * clone)
 	submit_bio_noacct(split);
 	//printk(KERN_ERR "\n %s submitted split! ", __func__);
 	if (split != clone) {
+		if (end) {
+			clone->bi_private = readctx;
+			clone->bi_end_io = lsdm_subread_done;
+		}
 		zero_fill_clone(ctx, clone);
 	}
 	return 0;
@@ -2417,7 +2424,7 @@ int hybrid_stl_read_io(struct ctx *ctx, struct bio *bio)
 	split = NULL;
 	lba = clone->bi_iter.bi_sector;
 	read_ctx->lba = lba;
-	while(split != clone) {
+	while(1) {
 		clone->bi_private = read_ctx;
 		clone->bi_end_io = lsdm_subread_done;
 		nr_sectors = bio_sectors(clone);
@@ -2428,14 +2435,18 @@ int hybrid_stl_read_io(struct ctx *ctx, struct bio *bio)
 			pba = get_first_pba_for_dzone(ctx, pzonenr) + lba % ctx->nr_lbas_in_zone;
 			wp = ctx->dzit[lzonenr].wp;
 		}
+		printk(KERN_ERR "\n %s searching lba: %llu ", __func__, lba);
 		e = lsdm_rb_geq(ctx, lba, print);
 		/* case of no overlap */
 		if ((e == NULL) || (e->lba >= (lba + nr_sectors)) || ((e->lba + e->len) <= lba))  {
+			read_ctx->bio = bio;
+			clone->bi_private = read_ctx;
+			clone->bi_end_io = lsdm_subread_done;
 			if ((pzonenr > ctx->sb->zone_count) || (wp <= pba) ) {
 				zero_fill_clone(ctx, clone);
 				break;
 			}
-			ret = read_from_zone(ctx, clone);
+			ret = read_from_zone(ctx, clone, read_ctx, 1);
 			break;
 		}
 		if (e->lba > lba) {
@@ -2457,7 +2468,7 @@ int hybrid_stl_read_io(struct ctx *ctx, struct bio *bio)
 				ctx->nr_reads += zerolen;
 				zero_fill_clone(ctx, split);
 			} else {
-				ret = read_from_zone(ctx, split);
+				ret = read_from_zone(ctx, split, read_ctx, 0);
 				if (!ret)
 					return ret;
 			}
@@ -2483,8 +2494,8 @@ int hybrid_stl_read_io(struct ctx *ctx, struct bio *bio)
 			 * splitting is required. Previous splits if any, are chained
 			 * to the last one as 'clone' is their parent.
 			 */
+			printk(KERN_ERR "\n %s 1) diff: %d \n", __func__, diff);
 			ret = handle_full_overlap(ctx, bio, clone, nr_sectors, pba, read_ctx, 1);
-			//printk(KERN_ERR "\n 1) ret: %d \n", ret);
 			if (ret)
 				return ret;
 			break;
@@ -3355,6 +3366,8 @@ void sit_ent_vblocks_incr(struct ctx *ctx, sector_t pba)
 		ptr->mtime = get_elapsed_time(ctx);
 		if (ctx->max_mtime < ptr->mtime)
 			ctx->max_mtime = ptr->mtime;
+		/* TODO: Add the zone to the GC tree if the vblocks < 65536 */
+		update_gc_tree(ctx, zonenr, ptr->vblocks, ptr->mtime, __func__);
 	}
 	//mutex_unlock(&ctx->sit_kv_store_lock);
 	if(vblocks > (1 << (sb->log_zone_size - sb->log_block_size))) {
@@ -4083,8 +4096,6 @@ void sub_write_done(struct work_struct * w)
 	len = (len >> SECTOR_BLK_SHIFT) << SECTOR_BLK_SHIFT;
 	is_cached_write = subbioctx->cache_write;
 
-	kref_put(&bioctx->ref, write_done);
-	kmem_cache_free(ctx->subbio_ctx_cache, subbioctx);
 	//printk(KERN_ERR "\n %s() COMPLETED: lba: %llu, pba: %llu, len: %llu is_cached_write: %d ", __func__, lba, pba, len, is_cached_write);
 
 	/* Now reads will work! so we can complete the bio */
@@ -4098,16 +4109,12 @@ void sub_write_done(struct work_struct * w)
 	}
 	lsdm_rb_update_range(ctx, lba, pba, len);
 	up_write(&ctx->lsdm_rb_lock);
+	kref_put(&bioctx->ref, write_done);
+	kmem_cache_free(ctx->subbio_ctx_cache, subbioctx);
+
 	if (is_cached_write) {
 		add_rev_translation_entry(ctx, lba, pba, len);
 	}
-
-	/*
-	int zonenr = get_czone_nr(ctx, pba);
-	printk("\n %s zone: %d #valid blks: %d ", __func__, zonenr, get_sit_ent_vblocks(ctx, zonenr));
-	create_dzone_list(ctx, zonenr);
-	free_data_zone_list(ctx);
-	*/
 	return;
 }
 
