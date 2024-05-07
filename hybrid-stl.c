@@ -2392,7 +2392,7 @@ struct bio *handle_initial_zerolen(struct ctx *ctx, struct bio *clone, int zerol
 		wp = ctx->dzit[lzonenr].wp;
 	}
 
-	BUG_ON(zerolen > nr_sectors); /* this case should be covered in the above if */
+	BUG_ON(zerolen >= nr_sectors); /* this case should be covered in the above if */
 	split = bio_split(clone, zerolen, GFP_NOIO, &fs_bio_set);
 	if (!split) {
 		printk(KERN_ERR "\n Could not split the clone! ERR ");
@@ -2402,8 +2402,8 @@ struct bio *handle_initial_zerolen(struct ctx *ctx, struct bio *clone, int zerol
 		return NULL;
 	}
 	bio_chain(split, clone);
+	ctx->nr_reads += zerolen;
 	if ((pzonenr > ctx->sb->zone_count) || (wp <= pba) ) {
-		ctx->nr_reads += zerolen;
 		zero_fill_clone(split);
 	} else {
 		ret = read_from_zone(ctx, split);
