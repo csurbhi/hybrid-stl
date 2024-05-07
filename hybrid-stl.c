@@ -74,8 +74,8 @@ void no_op(struct kref *kref);
 void complete_small_reads(struct bio *clone);
 struct bio * construct_smaller_bios(struct ctx * ctx, sector_t pba, struct app_read_ctx * readctx);
 void request_start_unaligned(struct ctx *ctx, struct bio *clone, struct app_read_ctx *read_ctx, sector_t pba, sector_t zerolen);
-int handle_partial_overlap(struct ctx *ctx, struct bio * bio, struct bio *clone, sector_t overlap, struct app_read_ctx *read_ctx, sector_t pba);
-int handle_full_overlap(struct ctx *ctx, struct bio * bio, struct bio *clone, sector_t nr_sectors, sector_t pba, struct app_read_ctx *read_ctx, int print);
+struct bio * handle_partial_overlap(struct ctx *ctx, struct bio *clone, sector_t overlap, struct app_read_ctx *read_ctx, sector_t pba);
+int handle_full_overlap(struct ctx *ctx, struct bio *clone, sector_t nr_sectors, sector_t pba, struct app_read_ctx *read_ctx, int print);
 void remove_partial_entries(struct ctx *ctx, struct bio * bio);
 int is_disk_full(struct ctx *ctx);
 struct sit_page * search_sit_kv_store(struct ctx *ctx, sector_t pba, struct rb_node **parent);
@@ -163,7 +163,7 @@ void lsdm_ioidle(struct mykref *kref);
 static int get_next_freezone_nr(struct ctx *ctx, char *bitmap, u32 bitmap_byte, u32 bitmap_bit, uint * nrfreezones);
 static int free_data_zone_list(struct ctx *ctx);
 static int gc_thread_fn(void * data);
-static int zero_fill_clone(struct ctx *ctx, struct bio *clone);
+static int zero_fill_clone(struct bio *clone);
 static int hybrid_stl_read_io(struct ctx *ctx, struct bio *bio);
 static int get_new_cache_zone(struct ctx *ctx);
 void remove_gc_nodes(struct ctx *ctx);
@@ -2129,9 +2129,9 @@ void lsdm_subread_done(struct bio *clone)
 	kmem_cache_free(ctx->app_read_ctx_cache, read_ctx);
 }
 
-int zero_fill_clone(struct ctx *ctx, struct bio *clone) 
+int zero_fill_clone(struct bio *clone) 
 {
-	printk(KERN_ERR "\n %s Zero filling the entire bio", __func__);
+	//printk(KERN_ERR "\n %s Zero filling the entire bio", __func__);
 	zero_fill_bio(clone);
 	/* This bio could be the parent of other chained bios. Its necessary to call
 	 * bio_endio and not the endio function directly
@@ -2245,9 +2245,10 @@ void request_start_unaligned(struct ctx *ctx, struct bio *clone, struct app_read
 	/* We have to make sure that complete_smaller_bio() gets called */
 }
 
-int handle_partial_overlap(struct ctx *ctx, struct bio * bio, struct bio *clone, sector_t overlap, struct app_read_ctx *read_ctx, sector_t pba)
+struct bio * handle_partial_overlap(struct ctx *ctx, struct bio *clone, sector_t overlap, struct app_read_ctx *read_ctx, sector_t pba)
 {
 	struct bio * split;
+	struct bio *bio = read_ctx->bio;
 
 	//printk(KERN_ERR "\n clone: %p clone::nr_sectors: %d len: %llu ", clone, bio_sectors(clone), overlap);
 	split = bio_split(clone, overlap, GFP_KERNEL, &fs_bio_set);
@@ -2255,27 +2256,26 @@ int handle_partial_overlap(struct ctx *ctx, struct bio * bio, struct bio *clone,
 		printk(KERN_INFO "\n Could not split the clone! ERR ");
 		bio->bi_status = -ENOMEM;
 		clone->bi_status = BLK_STS_RESOURCE;
-		zero_fill_clone(ctx, clone);
-		return -ENOMEM;
+		zero_fill_clone(clone);
+		return NULL;
 	}
 	ctx->nr_reads += overlap;
-	printk(KERN_ERR "\n 2. (SPLIT) %s lba: %llu, pba: %llu nr_sectors: %d ", __func__, split->bi_iter.bi_sector, pba, bio_sectors(split));
 	bio_chain(split, clone);
 	split->bi_iter.bi_sector = pba;
 	bio_set_dev(split, ctx->dev->bdev);
 	BUG_ON(pba > ctx->sb->max_pba);
-	//printk(KERN_ERR "\n %s submitted split! ", __func__);
 	submit_bio_noacct(split);
-	return 0;
+	return clone;
 }
 
 
-int handle_full_overlap(struct ctx *ctx, struct bio * bio, struct bio *clone, sector_t nr_sectors, sector_t pba, struct app_read_ctx *read_ctx, int print)
+int handle_full_overlap(struct ctx *ctx, struct bio *clone, sector_t nr_sectors, sector_t pba, struct app_read_ctx *read_ctx, int print)
 {
 	sector_t s8;
-	struct bio *split;
+	struct bio *split, *bio;
 	BUG_ON(pba > ctx->sb->max_pba);
 
+	bio = read_ctx->bio;
 	if (print)
 		printk(KERN_ERR "\n %s pba: %llu len: %llu \n", __func__, pba, nr_sectors);
 
@@ -2292,7 +2292,7 @@ int handle_full_overlap(struct ctx *ctx, struct bio * bio, struct bio *clone, se
 		if (print)
 			printk(KERN_ERR "\n %s aligned read submitting....pba: %llu s8: %llu \n", __func__, pba, s8);
 		submit_bio_noacct(clone);
-		printk(KERN_ERR "\n %s done ! \n", __func__);
+	//	printk(KERN_ERR "\n %s done ! \n", __func__);
 	} else {
 		if (print)
 			printk(KERN_ERR "\n %s Unaligned read \n", __func__);
@@ -2304,7 +2304,7 @@ int handle_full_overlap(struct ctx *ctx, struct bio * bio, struct bio *clone, se
 				printk(KERN_INFO "\n Could not split the clone! ERR ");
 				bio->bi_status = -ENOMEM;
 				clone->bi_status = BLK_STS_RESOURCE;
-				zero_fill_clone(ctx, clone);
+				zero_fill_clone(clone);
 				return -ENOMEM;
 			}
 			bio_chain(split, clone);
@@ -2333,7 +2333,7 @@ int handle_full_overlap(struct ctx *ctx, struct bio * bio, struct bio *clone, se
 	return 0;
 }
 
-int read_from_zone(struct ctx *ctx, struct bio * clone, struct app_read_ctx *readctx, int end)
+int read_from_zone(struct ctx *ctx, struct bio * clone)
 {
 	struct bio *split = clone;
 	unsigned nr_sectors, validSectors;
@@ -2346,11 +2346,13 @@ int read_from_zone(struct ctx *ctx, struct bio * clone, struct app_read_ctx *rea
 	BUG_ON(pzonenr > ctx->sb->zone_count);
 	pba = get_first_pba_for_dzone(ctx, pzonenr) + lba % ctx->nr_lbas_in_zone;
 	wp = ctx->dzit[lzonenr].wp;
+	BUG_ON(wp == 0);
 	BUG_ON(wp <= pba);
 	validSectors = wp - pba;
 	BUG_ON(validSectors > 524288);
 
 	nr_sectors = bio_sectors(clone);
+	BUG_ON(nr_sectors > 2048);
 
 	printk(KERN_ERR "\n %s origlba: %llu pba: %llu wp: %llu validSectors: %d, nr_sectors: %d", __func__, lba, pba, wp, validSectors, nr_sectors);
 	if (validSectors < nr_sectors) {
@@ -2360,20 +2362,128 @@ int read_from_zone(struct ctx *ctx, struct bio * clone, struct app_read_ctx *rea
 		}
 		bio_chain(split, clone);
 	}
-
 	split->bi_iter.bi_sector = pba;
 	bio_set_dev(split, ctx->dev->bdev);
 	BUG_ON(pba > ctx->sb->max_pba);
 	submit_bio_noacct(split);
 	//printk(KERN_ERR "\n %s submitted split! ", __func__);
 	if (split != clone) {
-		if (end) {
-			clone->bi_private = readctx;
-			clone->bi_end_io = lsdm_subread_done;
-		}
-		zero_fill_clone(ctx, clone);
+		zero_fill_clone(clone);
 	}
 	return 0;
+}
+
+
+struct bio *handle_initial_zerolen(struct ctx *ctx, struct bio *clone, int zerolen, struct app_read_ctx *read_ctx)
+{
+	struct bio *split, *bio;
+	unsigned int lzonenr, pzonenr, nr_sectors;
+	sector_t lba, pba, wp;
+	int ret;
+
+	bio = read_ctx->bio;
+	nr_sectors = bio_sectors(clone);
+	lba = clone->bi_iter.bi_sector;
+	pba = lba;
+	lzonenr = lba / ctx->nr_lbas_in_zone;
+	pzonenr = ctx->dzit[lzonenr].pzonenr;
+	if (pzonenr < ctx->sb->zone_count) {
+		pba = get_first_pba_for_dzone(ctx, pzonenr) + lba % ctx->nr_lbas_in_zone;
+		wp = ctx->dzit[lzonenr].wp;
+	}
+
+	BUG_ON(zerolen > nr_sectors); /* this case should be covered in the above if */
+	split = bio_split(clone, zerolen, GFP_NOIO, &fs_bio_set);
+	if (!split) {
+		printk(KERN_ERR "\n Could not split the clone! ERR ");
+		bio->bi_status = -ENOMEM;
+		clone->bi_status = BLK_STS_RESOURCE;
+		zero_fill_clone(clone);
+		return NULL;
+	}
+	bio_chain(split, clone);
+	if ((pzonenr > ctx->sb->zone_count) || (wp <= pba) ) {
+		ctx->nr_reads += zerolen;
+		zero_fill_clone(split);
+	} else {
+		ret = read_from_zone(ctx, split);
+		if (!ret)
+			return NULL;
+	}
+	return clone;
+
+}
+
+int handle_read(struct ctx *ctx, struct bio *clone, struct app_read_ctx *read_ctx)
+{
+	sector_t lba, pba, wp;
+	struct extent *e;
+	unsigned nr_sectors, overlap, diff, zerolen, lzonenr, pzonenr;
+	int print = 0, ret = 0;
+
+	while(1) {
+		nr_sectors = bio_sectors(clone);
+		clone->bi_private = read_ctx;
+		clone->bi_end_io = lsdm_subread_done;
+		read_ctx->clone = clone;
+		lba = clone->bi_iter.bi_sector;
+		pba = lba;
+		wp = 0;
+		lzonenr = lba / ctx->nr_lbas_in_zone;
+		pzonenr = ctx->dzit[lzonenr].pzonenr;
+		if (pzonenr < ctx->sb->zone_count) {
+			pba = get_first_pba_for_dzone(ctx, pzonenr) + lba % ctx->nr_lbas_in_zone;
+			wp = ctx->dzit[lzonenr].wp;
+		}
+		e = lsdm_rb_geq(ctx, lba, print);
+		/* case of no overlap */
+		if ((e == NULL) || (e->lba >= (lba + nr_sectors)) || ((e->lba + e->len) <= lba))  {
+			if ((pzonenr > ctx->sb->zone_count) || (wp <= pba) ) {
+				zero_fill_clone(clone);
+				break;
+			}
+			ret = read_from_zone(ctx, clone);
+			break;
+		}
+		if (e->lba > lba) {
+		/*   	        [eeeeeeeeeeee]
+		 *[---------bio------] 
+		 */
+			zerolen = e->lba - lba;
+			clone = handle_initial_zerolen(ctx, clone, zerolen, read_ctx);
+			if (!clone) {
+				return -ENOMEM;
+			}
+			lba = clone->bi_iter.bi_sector;
+			nr_sectors = bio_sectors(clone);
+			BUG_ON(lba != e->lba);
+			/* we fall through as e->lba == lba now */
+		} 
+		/* Case of Overlap, e always overlaps with bio */
+		//(e->lba <= lba) 
+		/* [eeeeeeeeeeee] eeeeeeeeeeeee]<- could be shorter or longer
+		 *
+		 * [---------bio------] */
+		overlap = e->lba + e->len - lba;
+		diff = lba - e->lba;
+		BUG_ON(diff < 0);
+		pba = e->pba + diff;
+		if (overlap >= nr_sectors) { 
+		/* e is bigger than bio, so overlap >= nr_sectors, no further splitting is required. */
+			ret = handle_full_overlap(ctx, clone, nr_sectors, pba, read_ctx, 1);
+			if (ret)
+				return ret;
+			break;
+
+		}
+		/* overlap is smaller than nr_sectors remaining. */
+		clone = handle_partial_overlap(ctx, clone, overlap, read_ctx, pba);
+		if (!clone)
+			return ret;
+		/* Since e was smaller, we want to search for the next e */
+	}
+	return 0;
+
 }
 
 
@@ -2389,13 +2499,12 @@ int read_from_zone(struct ctx *ctx, struct bio * clone, struct app_read_ctx *rea
 int hybrid_stl_read_io(struct ctx *ctx, struct bio *bio)
 {
 	struct bio *split = NULL;
-	sector_t lba, pba, wp;
-	struct extent *e;
-	unsigned nr_sectors, overlap, diff, zerolen, lzonenr, pzonenr;
+	sector_t lba;
+	unsigned nr_sectors;
 
 	struct app_read_ctx *read_ctx;
 	struct bio *clone;
-	int print = 0, ret = 0;
+	int maxlen = 2048;
 
 	read_ctx = kmem_cache_alloc(ctx->app_read_ctx_cache, GFP_KERNEL);
 	if (!read_ctx) {
@@ -2424,90 +2533,27 @@ int hybrid_stl_read_io(struct ctx *ctx, struct bio *bio)
 	split = NULL;
 	lba = clone->bi_iter.bi_sector;
 	read_ctx->lba = lba;
+	read_ctx->clone = clone;
 	while(1) {
+		nr_sectors = bio_sectors(clone);
 		clone->bi_private = read_ctx;
 		clone->bi_end_io = lsdm_subread_done;
-		nr_sectors = bio_sectors(clone);
-		lba = clone->bi_iter.bi_sector;
-		lzonenr = lba / ctx->nr_lbas_in_zone;
-		pzonenr = ctx->dzit[lzonenr].pzonenr;
-		if (pzonenr < ctx->sb->zone_count) {
-			pba = get_first_pba_for_dzone(ctx, pzonenr) + lba % ctx->nr_lbas_in_zone;
-			wp = ctx->dzit[lzonenr].wp;
-		}
-		printk(KERN_ERR "\n %s searching lba: %llu ", __func__, lba);
-		e = lsdm_rb_geq(ctx, lba, print);
-		/* case of no overlap */
-		if ((e == NULL) || (e->lba >= (lba + nr_sectors)) || ((e->lba + e->len) <= lba))  {
-			read_ctx->bio = bio;
-			clone->bi_private = read_ctx;
-			clone->bi_end_io = lsdm_subread_done;
-			if ((pzonenr > ctx->sb->zone_count) || (wp <= pba) ) {
-				zero_fill_clone(ctx, clone);
-				break;
-			}
-			ret = read_from_zone(ctx, clone, read_ctx, 1);
-			break;
-		}
-		if (e->lba > lba) {
-		/*   	        [eeeeeeeeeeee]
-		 *[---------bio------] 
-		 */
-			zerolen = e->lba - lba;
-			BUG_ON(zerolen > nr_sectors); /* this case should be covered in the above if */
-			split = bio_split(clone, zerolen, GFP_NOIO, &fs_bio_set);
+		split = clone;
+		if (nr_sectors > maxlen) {
+			split = bio_split(clone, maxlen, GFP_NOIO, &fs_bio_set);
 			if (!split) {
-				printk(KERN_ERR "\n Could not split the clone! ERR ");
-				bio->bi_status = -ENOMEM;
-				clone->bi_status = BLK_STS_RESOURCE;
-				zero_fill_clone(ctx, clone);
+				bio->bi_status = BLK_STS_RESOURCE;
+				zero_fill_clone(clone);
 				return -ENOMEM;
 			}
+			printk(KERN_ERR "\b %s LARGE Read requested (%d), splitting!", __func__, nr_sectors);
+			nr_sectors = maxlen;
 			bio_chain(split, clone);
-			if ((pzonenr > ctx->sb->zone_count) || (wp <= pba) ) {
-				ctx->nr_reads += zerolen;
-				zero_fill_clone(ctx, split);
-			} else {
-				ret = read_from_zone(ctx, split, read_ctx, 0);
-				if (!ret)
-					return ret;
-			}
-			/* bio is front filled with zeroes, but we need to compare 'clone' now with
-			 * the same e
-			 */
-			lba = e->lba;
-			nr_sectors = bio_sectors(clone);
-			BUG_ON(lba != e->lba);
-			/* we fall through as e->lba == lba now */
-		} 
-		/* Case of Overlap, e always overlaps with bio */
-		//(e->lba <= lba) 
-		/* [eeeeeeeeeeee] eeeeeeeeeeeee]<- could be shorter or longer
-		 */
-		/*  [---------bio------] */
-		overlap = e->lba + e->len - lba;
-		diff = lba - e->lba;
-		BUG_ON(diff < 0);
-		pba = e->pba + diff;
-		if (overlap >= nr_sectors) { 
-			/* e is bigger than bio, so overlap >= nr_sectors, no further
-			 * splitting is required. Previous splits if any, are chained
-			 * to the last one as 'clone' is their parent.
-			 */
-			printk(KERN_ERR "\n %s 1) diff: %d \n", __func__, diff);
-			ret = handle_full_overlap(ctx, bio, clone, nr_sectors, pba, read_ctx, 1);
-			if (ret)
-				return ret;
-			break;
 
-		} else {
-			/* overlap is smaller than nr_sectors remaining. */
-			//printk(KERN_ERR "\n clone: %p clone::nr_sectors: %d e->len: %d overlap: %d", clone, bio_sectors(clone), e->len, overlap);
-			ret = handle_partial_overlap(ctx, bio, clone, overlap, read_ctx, pba);
-			//printk(KERN_ERR "\n 2) ret: %d clone::lba: %llu", ret, clone->bi_iter.bi_sector);
-			if (ret)
-				return ret;
-			/* Since e was smaller, we want to search for the next e */
+		}
+		handle_read(ctx, split, read_ctx);
+		if (clone == split) {
+			break;
 		}
 	}
 	//printk(KERN_INFO "\t %s end \n", __func__);
@@ -4490,7 +4536,7 @@ int hybrid_stl_write_io(struct ctx *ctx, struct bio *bio)
 			ctx->dzit[lzonenr].wp += s8;
 			free_zone_lock(ctx, lzonenr);
 			sector_t end_pba = get_first_pba_for_dzone(ctx, pzonenr) + ctx->nr_lbas_in_zone;
-			printk(KERN_ERR "\n %s ctx->dzit[lzonenr].wp: %llu pzonenr: %d s8: %d lzonenr: %d", __func__, ctx->dzit[lzonenr].wp, pzonenr, s8, lzonenr);
+			//printk(KERN_ERR "\n %s ctx->dzit[lzonenr].wp: %llu pzonenr: %d s8: %d lzonenr: %d", __func__, ctx->dzit[lzonenr].wp, pzonenr, s8, lzonenr);
 			BUG_ON( ctx->dzit[lzonenr].wp > end_pba);
 		} else {
 			free_zone_lock(ctx, lzonenr);
