@@ -40,7 +40,7 @@
  * clean in a FG GC run
  */
 #define SMALL_NR_ZONES 1000 /* 250 GB */
-
+#define FREE_BLKS_WATERMARK 2560 /* 10 MB */
 
 struct seq_zones_info {
 	u32 lzonenr;
@@ -272,9 +272,8 @@ struct ctx {
 	char *free_dzone_bitmap;
 	int 	nr_free_cache_zones;
 	int 	nr_free_data_zones;
-	int 	higher_watermark;
-	int 	middle_watermark;
 	int	lower_watermark;
+	int 	free_blks_cache;
 	char *gc_zone_bitmap;
 	int nr_gc_zones;
 	int	czone_bitmap_bytes;
