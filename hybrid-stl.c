@@ -1259,7 +1259,7 @@ static int add_extent_to_gclist(struct ctx *ctx, struct extent_entry *e)
 			printk(KERN_ERR "\n %s could not allocate memory for gc_extent->bio_pages", __func__);
 			return -ENOMEM;
 		}
-		printk(KERN_ERR "\n %s (lba: %llu, pba: %llu e->len: %llu) maxlen: %d temp: %d", __func__, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len, (maxlen), temp);
+		//printk(KERN_ERR "\n %s (lba: %llu, pba: %llu e->len: %llu) maxlen: %d temp: %d", __func__, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len, (maxlen), temp);
 		/* 
 		 * We always want to add the extents in a PBA increasing order
 		 */
@@ -1314,7 +1314,7 @@ static int read_extent_bio(struct ctx *ctx, struct gc_extents *gc_extent)
 	unsigned int s8, pagecount;
 	int i;
 
-	printk(KERN_ERR "\n %s (lba: %llu, pba: %llu e->len: %llu)", __func__, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len);
+	//printk(KERN_ERR "\n %s (lba: %llu, pba: %llu e->len: %llu)", __func__, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len);
 	//refcount_inc(&gc_extent->ref);
 	s8 = gc_extent->e.len;
 	BUG_ON(s8 > (BIO_MAX_PAGES << SECTOR_BLK_SHIFT));
@@ -1461,7 +1461,7 @@ static int write_valid_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 		gc_extent->bio = NULL;
 		/* next function will set up the bio */
 		setup_extent_bio_write(ctx, gc_extent);
-		printk(KERN_ERR "\n %s (lba: %llu, pba: %llu e->len: %llu)", __func__, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len);
+		//printk(KERN_ERR "\n %s (lba: %llu, pba: %llu e->len: %llu)", __func__, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len);
 		bio = gc_extent->bio;
 		bio->bi_iter.bi_sector = wp;
 		submit_bio_wait(gc_extent->bio);
@@ -2271,7 +2271,7 @@ struct bio * handle_partial_overlap(struct ctx *ctx, struct bio *clone, sector_t
 	struct bio *bio = read_ctx->bio;
 
 	BUG_ON(pba > ctx->sb->max_pba);
-	printk(KERN_ERR "\n %s lba: %llu pba: %llu, clone::nr_sectors: %d len:%llu", __func__, clone->bi_iter.bi_sector, pba, bio_sectors(clone), overlap);
+	//printk(KERN_ERR "\n %s lba: %llu pba: %llu, clone::nr_sectors: %d len:%llu", __func__, clone->bi_iter.bi_sector, pba, bio_sectors(clone), overlap);
 	split = bio_split(clone, overlap, GFP_KERNEL, &fs_bio_set);
 	if (!split) {
 		printk(KERN_INFO "\n Could not split the clone! ERR ");
@@ -2374,7 +2374,7 @@ int read_from_zone(struct ctx *ctx, struct bio * clone)
 	nr_sectors = bio_sectors(clone);
 	BUG_ON(nr_sectors > 2048);
 
-	printk(KERN_ERR "\n %s origlba: %llu pba: %llu wp: %llu validSectors: %d, nr_sectors: %d", __func__, lba, pba, wp, validSectors, nr_sectors);
+	//printk(KERN_ERR "\n %s origlba: %llu pba: %llu wp: %llu validSectors: %d, nr_sectors: %d", __func__, lba, pba, wp, validSectors, nr_sectors);
 	if (validSectors < nr_sectors) {
 		if (!(split = bio_split(clone, validSectors, GFP_NOIO, &fs_bio_set))){
 			printk("\n %s failed at bio_split! ", __func__);
@@ -2415,7 +2415,7 @@ struct bio *handle_initial_zerolen(struct ctx *ctx, struct bio *clone, int zerol
 
 	BUG_ON(zerolen >= nr_sectors); /* this case should be covered in the above if */
 	BUG_ON(!zerolen);
-	printk(KERN_ERR "\n %s origlba: %llu pzonenr: %d pba: %llu wp: %llu zerolen: %d, nr_sectors: %d", __func__, lba, pzonenr, pba, wp, zerolen, nr_sectors);
+	//printk(KERN_ERR "\n %s origlba: %llu pzonenr: %d pba: %llu wp: %llu zerolen: %d, nr_sectors: %d", __func__, lba, pzonenr, pba, wp, zerolen, nr_sectors);
 	split = bio_split(clone, zerolen, GFP_NOIO, &fs_bio_set);
 	if (!split) {
 		printk(KERN_ERR "\n Could not split the clone! ERR ");
@@ -2493,7 +2493,7 @@ int handle_read(struct ctx *ctx, struct bio *clone, struct app_read_ctx *read_ct
 		pba = e->pba + diff;
 		if (overlap >= nr_sectors) { 
 		/* e is bigger than bio, so overlap >= nr_sectors, no further splitting is required. */
-			ret = handle_full_overlap(ctx, clone, nr_sectors, pba, read_ctx, 1);
+			ret = handle_full_overlap(ctx, clone, nr_sectors, pba, read_ctx, 0);
 			if (ret < 0)
 				return ret;
 			break;
@@ -2550,8 +2550,7 @@ int hybrid_stl_read_io(struct ctx *ctx, struct bio *bio)
 		bio_endio(bio);
 		return -ENOMEM;
 	}
-	zero_fill_bio(clone);
-	printk(KERN_ERR "\n %s Read bio::lba: %llu bio::nrsectors: %d", __func__, clone->bi_iter.bi_sector, bio_sectors(clone));
+	//printk(KERN_ERR "\n %s Read bio::lba: %llu bio::nrsectors: %d", __func__, clone->bi_iter.bi_sector, bio_sectors(clone));
 
 	bio_set_dev(clone, ctx->dev->bdev);
 	split = NULL;
@@ -2570,7 +2569,7 @@ int hybrid_stl_read_io(struct ctx *ctx, struct bio *bio)
 				zero_fill_clone(clone);
 				return -ENOMEM;
 			}
-			printk(KERN_ERR "\b %s LARGE Read requested (%d), splitting!", __func__, nr_sectors);
+			//printk(KERN_ERR "\b %s LARGE Read requested (%d), splitting!", __func__, nr_sectors);
 			nr_sectors = maxlen;
 			bio_chain(split, clone);
 
@@ -2939,7 +2938,7 @@ try_again:
 	ctx->hot_wf_pba = get_first_pba_for_czone(ctx, zone_nr);
 	ctx->hot_wf_end = get_last_pba_for_czone(ctx, zone_nr);
 	ctx->free_sectors_in_wf = ctx->nr_lbas_in_zone; 
-	printk(KERN_ERR "\n %s() NEW CACHE ZONE: zone_nr: %d  ctx->free_sectors_in_wf: %llu", __func__, zone_nr, ctx->free_sectors_in_wf);
+	//printk(KERN_ERR "\n %s() NEW CACHE ZONE: zone_nr: %d  ctx->free_sectors_in_wf: %llu", __func__, zone_nr, ctx->free_sectors_in_wf);
 	add_ckpt_new_wf(ctx, ctx->hot_wf_pba);
 	return 0;
 }
@@ -3438,7 +3437,7 @@ void sit_ent_vblocks_incr(struct ctx *ctx, sector_t pba)
 		if (ctx->max_mtime < ptr->mtime)
 			ctx->max_mtime = ptr->mtime;
 		/* TODO: Add the zone to the GC tree if the vblocks < 65536 */
-		printk(KERN_ERR "\n %s Adding zone: %llu to GC tree \n", __func__, zonenr);
+		//printk(KERN_ERR "\n %s Adding zone: %llu to GC tree \n", __func__, zonenr);
 		update_gc_tree(ctx, zonenr, ptr->vblocks, ptr->mtime, __func__);
 	}
 	//mutex_unlock(&ctx->sit_kv_store_lock);
@@ -3517,7 +3516,7 @@ int add_rev_translation_entry(struct ctx * ctx, sector_t lba, sector_t pba, size
 	index = blknr %  REV_TM_ENTRIES_BLK;
 	ptr = ptr + index;
 
-	printk(KERN_ERR "\n %s Cache write!! COMPLETED: lba: %llu, pba: %llu, len: %lu nrblks: %d ", __func__, lba, pba, len, nrblks);
+	//printk(KERN_ERR "\n %s Cache write!! COMPLETED: lba: %llu, pba: %llu, len: %lu nrblks: %d ", __func__, lba, pba, len, nrblks);
 	for(i=0; i<nrblks; i++) {
 		if (lba > ctx->sb->max_pba) {
 			printk(KERN_ERR "\n %s lba: %llu pba: %llu max_pba: %llu len: %zu i: %d", __func__, lba, pba, ctx->sb->max_pba, len, i);
@@ -4385,7 +4384,7 @@ int ls_cache_write(struct ctx *ctx, struct bio *clone)
 	/* Keep the next line - for actually finding out how many zones there are in a cache worth 112 zones
 	 * This will be used to clean the cache entirely in background mode
 	 */
-	printk(KERN_ERR "\n CACHE: LBA: %llu zonenr: %llu ", lba, lba/ctx->nr_lbas_in_zone);
+	//printk(KERN_ERR "\n CACHE: LBA: %llu zonenr: %llu ", lba, lba/ctx->nr_lbas_in_zone);
 
 	do {
 		nr_sectors = bio_sectors(clone);
@@ -4559,7 +4558,7 @@ int hybrid_stl_write_io(struct ctx *ctx, struct bio *bio)
 			}
 			prepare_bio(clone, s8, wp, 0);
 			submit_bio(clone);
-			printk(KERN_ERR "\n %s() (SEQ write):: lba: %llu pba: %llu len: %u", __func__, lba, wp, s8);
+			//printk(KERN_ERR "\n %s() (SEQ write):: lba: %llu pba: %llu len: %u", __func__, lba, wp, s8);
 			ctx->dzit[lzonenr].wp += s8;
 			free_zone_lock(ctx, lzonenr);
 			sector_t end_pba = get_first_pba_for_dzone(ctx, pzonenr) + ctx->nr_lbas_in_zone;
