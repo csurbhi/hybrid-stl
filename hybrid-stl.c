@@ -2011,7 +2011,6 @@ again:
 		list_del(&zone_nodep->list);
 		kmem_cache_free(ctx->zones_in_cseg_cache, zone_nodep);
 	}
-	wake_up_all(&ctx->gc_th->fggc_wq);
 	//up_write(&ctx->wf_lock);
 	free_data_zone_list(ctx);
 	//do_checkpoint(ctx);
@@ -2019,6 +2018,7 @@ again:
 	if ((gc_mode == FG_GC) && (ctx->nr_free_cache_zones <= ctx->middle_watermark)) {
 		goto again;
 	}
+	wake_up_all(&ctx->gc_th->fggc_wq);
 	mutex_unlock(&ctx->gc_lock);
 	return zones_cleaned;
 stop:
