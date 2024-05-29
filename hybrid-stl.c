@@ -287,23 +287,25 @@ static sector_t get_last_pba_for_czone(struct ctx *ctx, unsigned int zonenr)
 /* zone numbers begin from 0.
  * The freebit map is marked with bit 0 representing zone 0
  */
-
+/*
 static unsigned get_dzone_nr(struct ctx *ctx, sector_t sector)
 {
 	sector_t zone_begins = zone_start(ctx, sector);
 	//trace_printk("\n %s zone_begins: %llu sb->czone0_pba: %u ctx->nr_lbas_in_zone: %llu", __func__, zone_begins, ctx->sb->czone0_pba, ctx->nr_lbas_in_zone);
 	return ( (zone_begins - ctx->sb->dzone0_pba) / ctx->nr_lbas_in_zone);
 }
+*/
 
 static sector_t get_first_pba_for_dzone(struct ctx *ctx, unsigned int zonenr)
 {
 	return (ctx->sb->dzone0_pba + (zonenr * ctx->nr_lbas_in_zone));
 }
-
+/*
 static sector_t get_last_pba_for_dzone(struct ctx *ctx, unsigned int zonenr)
 {
 	return ((ctx->sb->dzone0_pba + (zonenr * ctx->nr_lbas_in_zone) + ctx->nr_lbas_in_zone) - 1);
 }
+*/
 
 /************** Extent map management *****************/
 
@@ -1293,7 +1295,7 @@ static int add_zone_to_gclist(struct ctx *ctx, unsigned int zonenr)
 	}
 	cseg_znode->lzonenr = zonenr;
 	list_add_tail(&cseg_znode->list, &ctx->cseg_znodes->list);
-	return 0;
+	return 1;
 }
 
 void read_gcextent_done(struct bio * bio)
@@ -1546,7 +1548,7 @@ static int write_valid_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 	 */
 	szi->pzonenr = pzonenr;
 	szi->wp = wp;
-	printk(KERN_ERR "\n GC extents submitted for write: %d zonenr: %d", count, lzonenr);
+	//printk(KERN_ERR "\n GC extents submitted for write: %d zonenr: %d", count, lzonenr);
 	return 0;
 }
 
@@ -1606,7 +1608,6 @@ void free_gc_extent(struct ctx * ctx, struct gc_extents * gc_extent)
 	unsigned int pagecount = 0;
 	int i;
 
-	list_del(&gc_extent->list);
 	pagecount = gc_extent->nrpages;
 	if (gc_extent->bio_pages) {
 		for (i=0; i<pagecount; i++) {
@@ -1638,11 +1639,11 @@ static int free_gc_extents(struct ctx *ctx)
 	int count = 0;
 	
 	list_for_each_entry_safe(gc_extent, next_ptr, &ctx->gc_extents->list, list) {
-		gc_extent->bio = NULL;
+		list_del(&gc_extent->list);
 		free_gc_extent(ctx, gc_extent);
 		count = count + 1;
 	}
-	//printk(KERN_ERR "\n gc extents freed %d", count);
+	printk(KERN_ERR "\n gc extents freed %d", count);
 	return 0;
 }
 
@@ -1705,13 +1706,13 @@ int create_dzone_list(struct ctx *ctx, unsigned int zonenr)
 	struct extent *e = NULL, temp;
 	struct rev_extent *rev_e = NULL;
 	sector_t pba, last_pba; 
-	int count = 0;
+	int count = 0, ret = 0;
 
 	pba = get_first_pba_for_czone(ctx, zonenr);
 	last_pba = get_last_pba_for_czone(ctx, zonenr);
 	INIT_LIST_HEAD(&ctx->cseg_znodes->list);
 
-	printk(KERN_ERR "\n %s zonenr: %u first_pba: %llu, last_pba: %llu", __func__, zonenr, pba, last_pba);
+	//printk(KERN_ERR "\n %s zonenr: %u first_pba: %llu, last_pba: %llu", __func__, zonenr, pba, last_pba);
 
 	//print_memory_usage(ctx, "Before GC");
 	/* Lookup this pba in the reverse table to find the
@@ -1771,10 +1772,11 @@ int create_dzone_list(struct ctx *ctx, unsigned int zonenr)
 		}
 		BUG_ON(!temp.len);
 		u32 zonenr = temp.lba / ctx->nr_lbas_in_zone;
-		count = count + 1;
-		if (add_zone_to_gclist(ctx, zonenr)) {
+		ret = add_zone_to_gclist(ctx, zonenr);
+		if (ret < 0) {
 			return -ENOMEM;
 		}
+		count = count + ret;
 		pba = temp.pba + temp.len;
 	}
 	printk(KERN_ERR "\n Number of data zones in this cache zone: %d  is: %d", zonenr, count);
@@ -1795,11 +1797,14 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 
 	/* TODO: ensure wp belongs to the same pzonenr */
 	if (szi->pzonenr < sb->zone_count) {
+		pzonenr = szi->pzonenr;
+		/*
 		pzonenr = get_dzone_nr(ctx, szi->wp);
 		if (pzonenr != szi->pzonenr) {
 			printk(KERN_ERR "\n %s pzonenr: %d, szi->pzonenr: %d, szi->wp: %llu", __func__, pzonenr, szi->pzonenr, szi->wp);
 		}
 		BUG_ON(szi->wp > get_last_pba_for_dzone(ctx, pzonenr));
+		*/
 	}
 	lba = lzonenr * ctx->nr_lbas_in_zone;
 	last_lba = lba + ctx->nr_lbas_in_zone;
@@ -1914,6 +1919,7 @@ static int evict_cache_data(struct ctx *ctx, int gc_mode, int err_flag)
 {
 	int zonenr;
 	u64 gc_count = 0;
+	int count;
 	struct cseg_zone_node *zone_nodep, *next_zone_nodep;
 	u32 lzonenr, zones_cleaned = 0;
 	struct lsdm_gc_thread *gc_th = ctx->gc_th;
@@ -1927,6 +1933,7 @@ static int evict_cache_data(struct ctx *ctx, int gc_mode, int err_flag)
 		//printk(KERN_ERR "\n 1. GC is already running! \n");
 		return -1;
 	}
+again:
 	if (kthread_should_stop()) {
 		printk(KERN_ERR "\n kthread needs to stop ");
 		mutex_unlock(&ctx->gc_lock);
@@ -1940,12 +1947,24 @@ static int evict_cache_data(struct ctx *ctx, int gc_mode, int err_flag)
 			gc_th->gc_wake = 0;
 			wake_up_all(&ctx->gc_th->fggc_wq);
 		}
+		if (gc_count)
+			printk(KERN_ERR "\n Cleaned cache zones, resuming writes!!");
 		return gc_count;
 	}
 
 	//down_write(&ctx->wf_lock);
-	printk(KERN_ERR "\n %s Cleaning cache zonenr: %d #valid blks: %d \n", __func__, zonenr, get_sit_ent_vblocks(ctx, zonenr));	
-	create_dzone_list(ctx, zonenr);
+	count = create_dzone_list(ctx, zonenr);
+	if (count <= 0) {
+		goto stop;
+	}
+	printk(KERN_ERR "\n %s Cleaning cache zonenr: %d #valid blks: %d nr_data_zones: %d \n", __func__, zonenr, get_sit_ent_vblocks(ctx, zonenr), count);	
+	int test_count = 0;
+	list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
+		lzonenr = zone_nodep->lzonenr;
+		printk(KERN_ERR "\n Checking data zonenr zonenr: %d ", lzonenr);
+		test_count = test_count + 1;
+	}
+	BUG_ON(test_count != count);
 	list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
 		lzonenr = zone_nodep->lzonenr;
 		printk(KERN_ERR "\n Merging data zonenr zonenr: %d ", lzonenr);
@@ -1986,17 +2005,21 @@ static int evict_cache_data(struct ctx *ctx, int gc_mode, int err_flag)
 		free_zone_lock(ctx, lzonenr);
 		//printk(KERN_ERR "\n GC extents written!, about to free them! ");
 		free_gc_extents(ctx);
+		//wake_up_nr(&ctx->gc_th->fggc_wq, count);
+		if (ctx->nr_free_cache_zones > ctx->lower_watermark)
+			wake_up(&ctx->gc_th->fggc_wq);
+		list_del(&zone_nodep->list);
+		kmem_cache_free(ctx->zones_in_cseg_cache, zone_nodep);
 	}
+	wake_up_all(&ctx->gc_th->fggc_wq);
 	//up_write(&ctx->wf_lock);
 	free_data_zone_list(ctx);
 	//do_checkpoint(ctx);
 	zones_cleaned++;
+	if ((gc_mode == FG_GC) && (ctx->nr_free_cache_zones <= ctx->middle_watermark)) {
+		goto again;
+	}
 	mutex_unlock(&ctx->gc_lock);
-	printk(KERN_ERR "\n Cleaned cache zones, resuming writes!!");
-	if (gc_th->gc_wake) {
-                gc_th->gc_wake = 0;
-                wake_up_all(&ctx->gc_th->fggc_wq);
-        }
 	return zones_cleaned;
 stop:
 	if (gc_th->gc_wake) {
@@ -2057,8 +2080,8 @@ int gc_thread_fn(void * data)
 	struct task_struct *tsk = gc_th->lsdm_gc_task;
 	u64 start_t, end_t, interval = 0;
 
-	//wait_ms = gc_th->min_sleep_time;
-	wait_ms = gc_th->no_gc_sleep_time;
+	wait_ms = gc_th->min_sleep_time;
+	//wait_ms = gc_th->no_gc_sleep_time;
 	mutex_init(&ctx->gc_lock);
 	printk(KERN_ERR "\n %s executing! pid: %d", __func__, tsk->pid);
 	set_freezable();
@@ -2080,13 +2103,7 @@ int gc_thread_fn(void * data)
 		//print_extents(ctx);
 		 /* give it a try one time */
                 if (gc_th->gc_wake) {
-			if (ctx->nr_free_cache_zones < ctx->lower_watermark) {
-				/* concurrent GC, no pauses */
 				mode = FG_GC;
-			} else {
-				/* concurrent, intermittent GC */
-				mode = CONC_GC;
-			}
 		}
 		else if(mode == BG_GC) {
 			if (!is_lsdm_ioidle(ctx)) {
@@ -2620,7 +2637,7 @@ int hybrid_stl_read_io(struct ctx *ctx, struct bio *bio)
 		bio_endio(bio);
 		return -ENOMEM;
 	}
-	printk(KERN_ERR "\n %s Read bio::lba: %llu bio::nrsectors: %d", __func__, clone->bi_iter.bi_sector, bio_sectors(clone));
+	//printk(KERN_ERR "\n %s Read bio::lba: %llu bio::nrsectors: %d", __func__, clone->bi_iter.bi_sector, bio_sectors(clone));
 
 	bio_set_dev(clone, ctx->dev->bdev);
 	split = NULL;
@@ -2982,7 +2999,7 @@ try_again:
 	zone_nr = get_next_freezone_nr(ctx, ctx->free_czone_bitmap, ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit, &ctx->nr_free_cache_zones);
 	if (zone_nr < 0) {
 		printk(KERN_ERR "\n Could not find a clean cache zone for writing. Calling lsdm_gc \n");
-		printk(KERN_ERR "\n 1. ctx->nr_free_cache_zones: %d, ctx->lower_watermark: %d. Starting GC.....\n", ctx->nr_free_cache_zones, ctx->lower_watermark);
+		printk(KERN_ERR "\n 1. ctx->nr_free_cache_zones: %d, ctx->middle_watermark: %d. Starting GC.....\n", ctx->nr_free_cache_zones, ctx->middle_watermark);
 		ctx->gc_th->gc_wake = 1;
 		wake_up(&ctx->gc_th->lsdm_gc_wait_queue);
 		DEFINE_WAIT(wait);
@@ -4454,7 +4471,7 @@ int ls_cache_write(struct ctx *ctx, struct bio *clone)
 	/* Keep the next line - for actually finding out how many zones there are in a cache worth 112 zones
 	 * This will be used to clean the cache entirely in background mode
 	 */
-	printk(KERN_ERR "\n CACHE: LBA: %llu zonenr: %llu ", lba, lba/ctx->nr_lbas_in_zone);
+	//printk(KERN_ERR "\n CACHE: LBA: %llu zonenr: %llu ", lba, lba/ctx->nr_lbas_in_zone);
 
 	do {
 		nr_sectors = bio_sectors(clone);
@@ -4628,7 +4645,7 @@ int hybrid_stl_write_io(struct ctx *ctx, struct bio *bio)
 			}
 			prepare_bio(clone, s8, wp, 0);
 			submit_bio(clone);
-			printk(KERN_ERR "\n %s() (SEQ write):: lba: %llu pba: %llu len: %u", __func__, lba, wp, s8);
+			//printk(KERN_ERR "\n %s() (SEQ write):: lba: %llu pba: %llu len: %u", __func__, lba, wp, s8);
 			ctx->dzit[lzonenr].wp += s8;
 			free_zone_lock(ctx, lzonenr);
 			sector_t end_pba = get_first_pba_for_dzone(ctx, pzonenr) + ctx->nr_lbas_in_zone;
@@ -4636,7 +4653,7 @@ int hybrid_stl_write_io(struct ctx *ctx, struct bio *bio)
 			BUG_ON( ctx->dzit[lzonenr].wp >= end_pba);
 		} else {
 			free_zone_lock(ctx, lzonenr);
-			if (ctx->nr_free_cache_zones <= ctx->lower_watermark) {
+			if (ctx->nr_free_cache_zones <= ctx->middle_watermark) {
 				ctx->gc_th->gc_wake = 1;
 				wake_up(&ctx->gc_th->lsdm_gc_wait_queue);
 				DEFINE_WAIT(wait);
@@ -4645,7 +4662,7 @@ int hybrid_stl_write_io(struct ctx *ctx, struct bio *bio)
 				/* setting gc_wake=1 and the next wakeup will trigger lsdm_gc(ctx, FG_GC, 0) by waking up a sleeping gc thread */
 				io_schedule();
 				finish_wait(&ctx->gc_th->fggc_wq, &wait);
-				printk(KERN_ERR "\n %s %d woken up lba: %llu, nrsectors: %d ", __func__,  __LINE__, lba, nr_sectors);
+				//printk(KERN_ERR "\n %s %d woken up lba: %llu, nrsectors: %d ", __func__,  __LINE__, lba, nr_sectors);
 			}
 			ls_cache_write(ctx, split);
 		}
@@ -5931,7 +5948,8 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
 		goto destroy_gc_page_pool;
 	}
 
-	ctx->lower_watermark = 2;
+	ctx->middle_watermark = 3;
+	ctx->lower_watermark = 1;
 	printk(KERN_ERR "\n Initializing gc_extents list, ctx->gc_extents_cache: %p ", ctx->gc_extents_cache);
 	ctx->gc_extents = kmem_cache_alloc(ctx->gc_extents_cache, GFP_KERNEL);
 	if (!ctx->gc_extents) {

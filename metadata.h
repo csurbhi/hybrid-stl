@@ -272,6 +272,7 @@ struct ctx {
 	char *free_dzone_bitmap;
 	int 	nr_free_cache_zones;
 	int 	nr_free_data_zones;
+	int	middle_watermark;
 	int	lower_watermark;
 	int 	free_blks_cache;
 	char *gc_zone_bitmap;
