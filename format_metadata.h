@@ -75,6 +75,8 @@ typedef u64 sector_t;
 __u8 valid_map[VBLK_MAP_SIZE];
  */
 
+#define NR_CACHE_ZONES 64
+
 #define SIT_ENTRIES_BLK 	(BLK_SIZE/sizeof(struct lsdm_seg_entry))
 #define REV_TM_ENTRIES_BLK 		(BLK_SIZE/sizeof(struct rev_tm_entry))
 
