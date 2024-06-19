@@ -115,7 +115,7 @@ sector_t get_zone_end(struct lsdm_sb *sb, sector_t pba_start);
 char * allocate_freebitmap(struct ctx *ctx, unsigned int bitmap_bytes);
 struct tm_page *add_rev_tm_page_kv_store(struct ctx *ctx, sector_t lba);
 unsigned int get_cb_cost(struct ctx *ctx , u32 nrblks, u64 mtime);
-unsigned int get_cost(struct ctx *ctx, u32 nrblks, u64 age, char gc_mode);
+unsigned int get_cost(struct ctx *ctx, u32 zonenr, u32 nrblks, u64 age, char gc_mode);
 struct gc_zone_node * add_zonenr_gc_zone_tree(struct ctx *ctx, unsigned int zonenr, u32 nrblks);
 int add_sit_page_kv_store_by_blknr(struct ctx *ctx, struct page *page, sector_t sector_nr);
 int read_seg_info_table(struct ctx *ctx);
@@ -175,6 +175,7 @@ static int create_caches(struct ctx *ctx);
 static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **argv);
 static void hybrid_stl_dtr(struct dm_target *dm_target);
 int get_new_data_zone(struct ctx *ctx);
+int remove_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len);
 
 long nrpages;
 int _lsdm_verbose;
@@ -851,11 +852,13 @@ static void find_and_remove_rev_tm(struct ctx *ctx, sector_t lba, unsigned int l
 		 * splitting is required. Previous splits if any, are chained
 		 * to the last one as 'clone' is their parent.
 		 */
+			remove_czone_info(ctx, lba, pba, len);
 			remove_rev_translation_entry(ctx, pba, len);
 			break;
 
 		} else {
 			/* overlap is smaller than nr_sectors remaining. */
+			remove_czone_info(ctx, lba, pba, overlap);
 			remove_rev_translation_entry(ctx, pba, overlap);
 			/* Since e was smaller, we want to search for the next e */
 			len = len - overlap;
@@ -3572,6 +3575,117 @@ void sit_ent_add_mtime(struct ctx *ctx, sector_t pba)
 	//mutex_unlock(&ctx->sit_kv_store_lock);
 }
 
+/* The pba - len is in the same zone.
+ * We are trying to find out the number of dzones in a czone
+ */
+int add_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len)
+{
+	int czonenr = get_czone_nr(ctx, pba);
+	struct czone_info *czinfo = ctx->czonenr_list[czonenr], *next_node, *new;
+	struct list_head *list_head;
+	int lzonenr = lba / ctx->nr_lbas_in_zone;
+	struct lsdm_seg_entry *ptr;
+	struct sit_page *sit_page;
+	int index;
+
+	sit_page = add_sit_page_kv_store(ctx, pba, __func__);
+	if (!sit_page) {
+		/* TODO: do something, low memory */
+		print_memory_usage(ctx, "During sit_ent_vblocks_incr");
+		BUG_ON(1);
+		//panic("Low memory, could not allocate sit_entry");
+	}
+
+	index = czonenr % SIT_ENTRIES_BLK; 
+	ptr = (struct lsdm_seg_entry *) page_address(sit_page->page);
+	ptr = ptr + index;
+
+	if (!czinfo) {
+		czinfo = kmem_cache_alloc(ctx->czinfo_cache, GFP_KERNEL);
+		if (!czinfo) {
+			return -1;
+		}
+		czinfo->lzone = lzonenr;
+		czinfo->count = 1;
+		INIT_LIST_HEAD(&czinfo->list);
+		ptr->lzones = 1;
+		return 0;
+	}
+	list_head = &czinfo->list;
+	list_for_each_entry_safe(czinfo, next_node, list_head, list) {
+		if (czinfo->lzone < lzonenr) {
+			continue;
+		}
+		if(czinfo->lzone == lzonenr) {
+			czinfo->count += 1;
+			if (lzonenr <= ((lba + len) / ctx->nr_lbas_in_zone)) {
+				lzonenr = lzonenr + 1;
+				continue;
+			}
+			return 0;
+		}
+		break;
+	}
+	new = kmem_cache_alloc(ctx->czinfo_cache, GFP_KERNEL);
+	if (!new) {
+		return -1;
+	}
+	new->lzone = lzonenr;
+	new->count = 1;
+	INIT_LIST_HEAD(&new->list);
+	list_add_tail(&new->list, &czinfo->list);
+	/* New lzone added to this cache zone */
+	ptr->lzones += 1;
+	return 0;
+}
+
+
+int remove_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len)
+{
+	int czonenr = get_czone_nr(ctx, pba);
+	struct czone_info *czinfo = ctx->czonenr_list[czonenr], *next_node;
+	struct list_head *list_head;
+	int lzonenr = lba / ctx->nr_lbas_in_zone;
+	struct sit_page *sit_page;
+	struct lsdm_seg_entry *ptr;
+	int index;
+
+	sit_page = add_sit_page_kv_store(ctx, pba, __func__);
+	if (!sit_page) {
+		/* TODO: do something, low memory */
+		print_memory_usage(ctx, "During sit_ent_vblocks_incr");
+		BUG_ON(1);
+		//panic("Low memory, could not allocate sit_entry");
+	}
+
+	index = czonenr % SIT_ENTRIES_BLK; 
+	ptr = (struct lsdm_seg_entry *) page_address(sit_page->page);
+	ptr = ptr + index;
+
+	BUG_ON(!czinfo);
+	list_head = &czinfo->list;
+	list_for_each_entry_safe(czinfo, next_node, list_head, list) {
+		if (czinfo->lzone < lzonenr) {
+			continue;
+		}
+		if(czinfo->lzone == lzonenr) {
+			czinfo->count -= 1;
+			if (!czinfo->count) {
+				ptr->lzones = 0;
+				/* Remove this lzone */
+				list_del(&czinfo->list);
+			}
+			if (lzonenr <= ((lba + len) / ctx->nr_lbas_in_zone)) {
+				lzonenr = lzonenr + 1;
+				continue;
+			}
+			return 0;
+		}
+		BUG_ON(1);
+	}
+	return 0;
+}
+
 int add_rev_translation_entry(struct ctx * ctx, sector_t lba, sector_t pba, size_t len) 
 {
 	struct rev_tm_entry * ptr;
@@ -4273,6 +4387,7 @@ void sub_write_done(struct work_struct * w)
 	kmem_cache_free(ctx->subbio_ctx_cache, subbioctx);
 
 	if (is_cached_write) {
+		add_czone_info(ctx, lba, pba, len);
 		add_rev_translation_entry(ctx, lba, pba, len);
 	}
 	return;
@@ -5022,13 +5137,39 @@ unsigned int get_cb_cost(struct ctx *ctx , u32 nrblks, u64 mtime)
 	return ((100 * (100 - u) * age)/ (100 + u));
 }
 
-
-unsigned int get_cost(struct ctx *ctx, u32 nrblks, u64 age, char gc_mode)
+unsigned int get_lzones(struct ctx *ctx, u32 czonenr)
 {
-	if (gc_mode == GC_GREEDY) {
-		return nrblks;
+	struct lsdm_seg_entry *ptr;
+	struct sit_page *sit_page;
+	int index;
+	sector_t pba;
+
+	pba = get_first_pba_for_czone(ctx, czonenr);
+	sit_page = add_sit_page_kv_store(ctx, pba, __func__);
+	if (!sit_page) {
+		/* TODO: do something, low memory */
+		print_memory_usage(ctx, "During sit_ent_vblocks_incr");
+		BUG_ON(1);
+		//panic("Low memory, could not allocate sit_entry");
 	}
-	return get_cb_cost(ctx, nrblks, age);
+
+	index = czonenr % SIT_ENTRIES_BLK; 
+	ptr = (struct lsdm_seg_entry *) page_address(sit_page->page);
+	ptr = ptr + index;
+	return ptr->lzones;
+}
+
+
+unsigned int get_cost(struct ctx *ctx, u32 zonenr, u32 nrblks, u64 age, char gc_mode)
+{
+	u32 nrzones = get_lzones(ctx, zonenr);
+
+	BUG_ON(nrzones <= nrblks);
+
+	if (gc_mode == GC_GREEDY) {
+		return nrzones;
+	}
+	return get_cb_cost(ctx, nrzones, age);
 }
 
 int remove_zone_from_gc_tree(struct ctx *ctx, unsigned int zonenr)
@@ -5164,7 +5305,7 @@ int update_gc_tree(struct ctx *ctx, unsigned int zonenr, u32 nrblks, u64 mtime, 
 		return 0;
 	}
 	//cost = get_cost(ctx, nrblks, mtime, GC_CB);
-	cost = get_cost(ctx, nrblks, mtime, GC_GREEDY);
+	cost = get_cost(ctx, zonenr, nrblks, mtime, GC_GREEDY);
 	znode = add_zonenr_gc_zone_tree(ctx, zonenr, nrblks);
 	if (!znode) {
 		printk(KERN_ERR "\n %s gc data structure allocation failed!! \n", __func__);
@@ -5700,6 +5841,7 @@ err:
 
 void destroy_caches(struct ctx *ctx)
 {
+	kmem_cache_destroy(ctx->czinfo_cache);
 	kmem_cache_destroy(ctx->zones_in_cseg_cache);
 	kmem_cache_destroy(ctx->bio_cache);
 	kmem_cache_destroy(ctx->extent_cache);
@@ -5767,9 +5909,14 @@ int create_caches(struct ctx *ctx)
 	if (!ctx->zones_in_cseg_cache) {
 		goto destroy_bio_cache;
 	}
-
+	ctx->czinfo_cache  = kmem_cache_create("czinfo_cache", sizeof(struct czone_info), 0, SLAB_RED_ZONE|SLAB_ACCOUNT, NULL);
+	if (!ctx->czinfo_cache) {
+		goto destroy_zones_in_cseg_cache;
+	}
 	return 0;
 /* failed case */
+destroy_zones_in_cseg_cache:
+	kmem_cache_destroy(ctx->zones_in_cseg_cache);
 destroy_bio_cache:
 	kmem_cache_destroy(ctx->bio_cache);
 destroy_rev_extent_cache:

@@ -83,6 +83,7 @@ __u8 valid_map[VBLK_MAP_SIZE];
 struct lsdm_seg_entry {
 	unsigned int vblocks;  /* maximum vblocks currently are 65536 */
 	unsigned long mtime;
+	unsigned int lzones;
 	/* We do not store any valid map here
 	 * as an extent map is stored separately
 	 * as a part of the translation map

@@ -309,6 +309,7 @@ struct ctx {
 	struct kmem_cache *app_read_ctx_cache;
 	struct kmem_cache *bio_cache;
 	struct kmem_cache *zones_in_cseg_cache;
+	struct kmem_cache *czinfo_cache;
 	spinlock_t tm_ref_lock;
 	spinlock_t tm_flush_lock;
 	spinlock_t rev_flush_lock;
@@ -354,6 +355,7 @@ struct ctx {
 	struct workqueue_struct *tm_wq;
 	struct work_struct sit_work;
 	struct work_struct tb_work;
+	struct czone_info * czonenr_list[NR_CACHE_ZONES];
 	unsigned int err;
 };
 
@@ -386,4 +388,8 @@ struct gc_zone_node {
 	struct list_head list; /* we add this node to the list maintained on gc_cost_node */
 };
 
-
+struct czone_info {
+	struct list_head list;
+	int lzone;
+	int count;
+};
