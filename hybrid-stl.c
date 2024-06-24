@@ -847,6 +847,7 @@ static void find_and_remove_rev_tm(struct ctx *ctx, sector_t lba, unsigned int l
 		diff = lba - e->lba;
 		BUG_ON(diff < 0);
 		pba = e->pba + diff;
+		printk(KERN_ERR "\n lba: %llu, pba: %llu, overlap: %d, len: %d", lba, pba, overlap, len);
 		if (overlap >= len) { 
 		/* e is bigger than bio, so overlap >= nr_sectors, no further
 		 * splitting is required. Previous splits if any, are chained
@@ -1206,7 +1207,7 @@ static int select_zone_to_clean(struct ctx *ctx, int mode, const char *func)
 	struct gc_cost_node * cnode = NULL;
 	struct gc_zone_node * znode = NULL;
 
-	//if (mode == BG_GC) {
+	//if (mode == FG_GC) {
 		node = rb_first(&ctx->gc_cost_root);
 		if (!node)
 			return -1;
@@ -1218,7 +1219,7 @@ static int select_zone_to_clean(struct ctx *ctx, int mode, const char *func)
 		}
 
 	//}
-	/* TODO: Mode: FG_GC */
+	/* TODO: Mode: BG_GC */
 	return -1;
 }
 
@@ -1926,6 +1927,7 @@ static int evict_cache_data(struct ctx *ctx, int gc_mode, int err_flag)
 	struct cseg_zone_node *zone_nodep, *next_zone_nodep;
 	u32 lzonenr, zones_cleaned = 0;
 	struct lsdm_gc_thread *gc_th = ctx->gc_th;
+	u64 start_t, end_t, interval = 0;
 
 	//printk(KERN_ERR "\a %s * GC thread polling after every few seconds! gc_mode: %d \n", __func__, gc_mode);
 	
@@ -1970,9 +1972,10 @@ again:
 	BUG_ON(test_count != count);
 	list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
 		lzonenr = zone_nodep->lzonenr;
-		printk(KERN_ERR "\n Merging data zonenr zonenr: %d ", lzonenr);
+		//printk(KERN_ERR "\n Merging data zonenr zonenr: %d ", lzonenr);
 		get_zone_lock(ctx, lzonenr);
 		down_write(&ctx->lsdm_rb_lock);
+		start_t = ktime_get_ns();
 		/* Collect all the extents - either from the cache zone or the data zone, a block can only exist in either of them */
 		create_gc_extents(ctx, lzonenr);
 		if (list_empty(&ctx->gc_extents->list)) {
@@ -2005,8 +2008,10 @@ again:
 			goto stop;
 		}
 		up_write(&ctx->lsdm_rb_lock);
+		end_t = ktime_get_ns();
+		interval = (end_t - start_t) / 1000000;
 		free_zone_lock(ctx, lzonenr);
-		//printk(KERN_ERR "\n GC extents written!, about to free them! ");
+		printk(KERN_ERR "\n Data zone: %u merged in %llu milliseconds ", lzonenr, interval);
 		free_gc_extents(ctx);
 		//wake_up_nr(&ctx->gc_th->fggc_wq, count);
 		if (ctx->nr_free_cache_zones > ctx->lower_watermark)
@@ -3477,7 +3482,7 @@ void sit_ent_vblocks_decr(struct ctx *ctx, sector_t pba)
 		ptr->mtime = get_elapsed_time(ctx);
 		if (ctx->max_mtime < ptr->mtime)
 			ctx->max_mtime = ptr->mtime;
-		update_gc_tree(ctx, zonenr, ptr->vblocks, ptr->mtime, __func__);
+		update_gc_tree(ctx, zonenr, ptr->lzones, ptr->mtime, __func__);
 		if (!ptr->vblocks) {
 			printk(KERN_ERR "\n %s Freeing zone: %llu \n", __func__, zonenr);
 			mark_zone_free(ctx, zonenr, ctx->free_czone_bitmap, ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit, &ctx->nr_free_cache_zones, 0);
@@ -3528,7 +3533,7 @@ void sit_ent_vblocks_incr(struct ctx *ctx, sector_t pba)
 			ctx->max_mtime = ptr->mtime;
 		/* TODO: Add the zone to the GC tree if the vblocks < 65536 */
 		//printk(KERN_ERR "\n %s Adding zone: %llu to GC tree \n", __func__, zonenr);
-		update_gc_tree(ctx, zonenr, ptr->vblocks, ptr->mtime, __func__);
+		update_gc_tree(ctx, zonenr, ptr->lzones, ptr->mtime, __func__);
 	}
 	//mutex_unlock(&ctx->sit_kv_store_lock);
 	if(vblocks > (1 << (sb->log_zone_size - sb->log_block_size))) {
@@ -3581,7 +3586,7 @@ void sit_ent_add_mtime(struct ctx *ctx, sector_t pba)
 int add_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len)
 {
 	int czonenr = get_czone_nr(ctx, pba);
-	struct czone_info *czinfo = ctx->czonenr_list[czonenr], *next_node, *new;
+	struct czone_info *czinfo = ctx->czonenr_list[czonenr], *next_node, *new, *last;
 	struct list_head *list_head;
 	int lzonenr = lba / ctx->nr_lbas_in_zone;
 	struct lsdm_seg_entry *ptr;
@@ -3609,16 +3614,18 @@ int add_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len)
 		czinfo->count = 1;
 		INIT_LIST_HEAD(&czinfo->list);
 		ptr->lzones = 1;
+		ctx->czonenr_list[czonenr] = czinfo;
 		return 0;
 	}
 	list_head = &czinfo->list;
 	list_for_each_entry_safe(czinfo, next_node, list_head, list) {
+		last = czinfo;
 		if (czinfo->lzone < lzonenr) {
 			continue;
 		}
 		if(czinfo->lzone == lzonenr) {
 			czinfo->count += 1;
-			if (lzonenr <= ((lba + len) / ctx->nr_lbas_in_zone)) {
+			if (lzonenr < ((lba + len) / ctx->nr_lbas_in_zone)) {
 				lzonenr = lzonenr + 1;
 				continue;
 			}
@@ -3633,7 +3640,10 @@ int add_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len)
 	new->lzone = lzonenr;
 	new->count = 1;
 	INIT_LIST_HEAD(&new->list);
-	list_add_tail(&new->list, &czinfo->list);
+	if (czinfo) 
+		list_add_tail(&new->list, &czinfo->list);
+	else 
+		list_add(&new->list, &last->list);
 	/* New lzone added to this cache zone */
 	ptr->lzones += 1;
 	return 0;
@@ -3664,7 +3674,9 @@ int remove_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len)
 
 	BUG_ON(!czinfo);
 	list_head = &czinfo->list;
+	//printk(KERN_ERR "\n searching for lzonenr: %d \n", lzonenr);
 	list_for_each_entry_safe(czinfo, next_node, list_head, list) {
+		//printk(KERN_ERR "\n lzone: %d ", czinfo->lzone);
 		if (czinfo->lzone < lzonenr) {
 			continue;
 		}
@@ -3675,14 +3687,14 @@ int remove_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len)
 				/* Remove this lzone */
 				list_del(&czinfo->list);
 			}
-			if (lzonenr <= ((lba + len) / ctx->nr_lbas_in_zone)) {
+			if (lzonenr < ((lba + len) / ctx->nr_lbas_in_zone)) {
 				lzonenr = lzonenr + 1;
 				continue;
 			}
 			return 0;
 		}
-		BUG_ON(1);
 	}
+	//printk(KERN_ERR "\n Error!! lzonenr: %d", lzonenr);
 	return 0;
 }
 
@@ -5164,7 +5176,7 @@ unsigned int get_cost(struct ctx *ctx, u32 zonenr, u32 nrblks, u64 age, char gc_
 {
 	u32 nrzones = get_lzones(ctx, zonenr);
 
-	BUG_ON(nrzones <= nrblks);
+	BUG_ON(nrzones > nrblks);
 
 	if (gc_mode == GC_GREEDY) {
 		return nrzones;
@@ -5472,7 +5484,7 @@ int read_seg_entries_from_block(struct ctx *ctx, struct lsdm_seg_entry *entry, u
 			mark_zone_free(ctx, *zonenr, ctx->free_czone_bitmap, ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit, &ctx->nr_free_cache_zones, 0);
 		}
 		else {
-			//printk(KERN_ERR "\n *segnr: %u entry->vblocks: %llu entry->mtime: %llu", *zonenr, entry->vblocks, entry->mtime);
+			printk(KERN_ERR "\n *segnr: %u entry->vblocks: %u entry->mtime: %lu", *zonenr, entry->vblocks, entry->mtime);
 			if (!update_gc_tree(ctx, *zonenr, entry->vblocks, entry->mtime, __func__))
 				panic("Memory error, write a memory shrinker!");
 		}
