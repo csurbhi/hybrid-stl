@@ -1966,11 +1966,13 @@ again:
 	int test_count = 0;
 	list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
 		lzonenr = zone_nodep->lzonenr;
-		printk(KERN_ERR "\n Checking data zonenr zonenr: %d ", lzonenr);
+		//printk(KERN_ERR "\n Checking data zonenr zonenr: %d ", lzonenr);
 		test_count = test_count + 1;
 	}
 	BUG_ON(test_count != count);
+	test_count = 0;
 	list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
+		test_count = test_count + 1;
 		lzonenr = zone_nodep->lzonenr;
 		//printk(KERN_ERR "\n Merging data zonenr zonenr: %d ", lzonenr);
 		get_zone_lock(ctx, lzonenr);
@@ -2011,13 +2013,17 @@ again:
 		end_t = ktime_get_ns();
 		interval = (end_t - start_t) / 1000000;
 		free_zone_lock(ctx, lzonenr);
-		printk(KERN_ERR "\n Data zone: %u merged in %llu milliseconds ", lzonenr, interval);
+		printk(KERN_ERR "\n gc_mode: %d Data zone: %u merged in %llu milliseconds ", gc_mode, lzonenr, interval);
 		free_gc_extents(ctx);
 		//wake_up_nr(&ctx->gc_th->fggc_wq, count);
 		if (ctx->nr_free_cache_zones > ctx->lower_watermark)
 			wake_up(&ctx->gc_th->fggc_wq);
 		list_del(&zone_nodep->list);
 		kmem_cache_free(ctx->zones_in_cseg_cache, zone_nodep);
+		if (test_count == 100) {
+			wake_up_all(&ctx->gc_th->fggc_wq);
+			test_count = 0;
+		}
 	}
 	//up_write(&ctx->wf_lock);
 	free_data_zone_list(ctx);
@@ -3482,7 +3488,7 @@ void sit_ent_vblocks_decr(struct ctx *ctx, sector_t pba)
 		ptr->mtime = get_elapsed_time(ctx);
 		if (ctx->max_mtime < ptr->mtime)
 			ctx->max_mtime = ptr->mtime;
-		update_gc_tree(ctx, zonenr, ptr->lzones, ptr->mtime, __func__);
+		update_gc_tree(ctx, zonenr, ptr->vblocks, ptr->mtime, __func__);
 		if (!ptr->vblocks) {
 			printk(KERN_ERR "\n %s Freeing zone: %llu \n", __func__, zonenr);
 			mark_zone_free(ctx, zonenr, ctx->free_czone_bitmap, ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit, &ctx->nr_free_cache_zones, 0);
@@ -3533,7 +3539,7 @@ void sit_ent_vblocks_incr(struct ctx *ctx, sector_t pba)
 			ctx->max_mtime = ptr->mtime;
 		/* TODO: Add the zone to the GC tree if the vblocks < 65536 */
 		//printk(KERN_ERR "\n %s Adding zone: %llu to GC tree \n", __func__, zonenr);
-		update_gc_tree(ctx, zonenr, ptr->lzones, ptr->mtime, __func__);
+		update_gc_tree(ctx, zonenr, ptr->vblocks, ptr->mtime, __func__);
 	}
 	//mutex_unlock(&ctx->sit_kv_store_lock);
 	if(vblocks > (1 << (sb->log_zone_size - sb->log_block_size))) {
@@ -6107,8 +6113,8 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
 		goto destroy_gc_page_pool;
 	}
 
-	ctx->middle_watermark = 3;
-	ctx->lower_watermark = 1;
+	ctx->middle_watermark = NR_CACHE_ZONES - 5;
+	ctx->lower_watermark = NR_CACHE_ZONES/2;
 	printk(KERN_ERR "\n Initializing gc_extents list, ctx->gc_extents_cache: %p ", ctx->gc_extents_cache);
 	ctx->gc_extents = kmem_cache_alloc(ctx->gc_extents_cache, GFP_KERNEL);
 	if (!ctx->gc_extents) {
