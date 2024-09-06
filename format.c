@@ -655,7 +655,6 @@ void write_ckpt(int fd, struct lsdm_sb * sb, unsigned long ckpt_pba)
 	ckpt->hot_frontier_pba = sb->czone0_pba;
 	ckpt->nr_free_cache_zones = sb->zone_count_cache - 1; /* one frontier */
 	ckpt->elapsed_time = 0;
-	ckpt->clean = 1;  /* 1 indicates clean datastructures */
 	ckpt->crc = 0;
 	printf("\n-----------------------------------------------------------\n");
 	printf("\n checkpoint written at: %llu cur_frontier_pba: %lld", ckpt_pba, ckpt->hot_frontier_pba);
