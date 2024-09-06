@@ -655,7 +655,6 @@ void write_ckpt(int fd, struct lsdm_sb * sb, unsigned long ckpt_pba)
 	ckpt->hot_frontier_pba = sb->czone0_pba;
 	ckpt->nr_free_cache_zones = sb->zone_count_cache - 1; /* one frontier */
 	ckpt->elapsed_time = 0;
-	ckpt->clean = 1;  /* 1 indicates clean datastructures */
 	ckpt->crc = 0;
 	printf("\n-----------------------------------------------------------\n");
 	printf("\n checkpoint written at: %llu cur_frontier_pba: %lld", ckpt_pba, ckpt->hot_frontier_pba);
@@ -749,7 +748,7 @@ void write_dzone_info_table(int fd, struct lsdm_sb *sb)
 	u64 offset, wp;
 
 	dzit_entries_per_blk = BLK_SZ/sizeof(struct stl_dzones_info);
-	entries_in_last_blk = sb->zone_count % dzit_entries_per_blk;
+	entries_in_last_blk = sb->zone_count_data % dzit_entries_per_blk;
 	offset = sb->dzit_pba * SECTOR_SIZE;
 	ret = lseek(fd, offset, SEEK_SET);
 	if ( ret == -1) {
@@ -775,7 +774,6 @@ void write_dzone_info_table(int fd, struct lsdm_sb *sb)
 	for(j=0; j<entries_in_last_blk; j++) {
 		entry->pzonenr = sb->zone_count + 1;
 		entry->wp = 0;
-		wp = wp + sb->nr_lbas_in_zone;
 		entry++;
 	}
 	ret = write(fd, buffer, BLK_SZ);
