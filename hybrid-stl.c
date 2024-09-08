@@ -1224,6 +1224,8 @@ static int select_zone_to_clean(struct ctx *ctx, int mode, const char *func)
 
 int create_dzone_list(struct ctx *ctx, unsigned int zonenr);
 
+#if 0
+
 static int traverse_gc_victim_tree(struct ctx *ctx)
 {
 	struct rb_root *root = &ctx->gc_cost_root;
@@ -1263,7 +1265,7 @@ static int traverse_gc_victim_tree(struct ctx *ctx)
 	}
 	return(0);
 }
-
+#endif
 
 
 
@@ -1966,7 +1968,7 @@ u64 get_wp(struct ctx *ctx, unsigned int zonenr)
 	return szone->wp;
 }
 
-static int traverse_gc_victim_tree(struct ctx *ctx);
+//static int traverse_gc_victim_tree(struct ctx *ctx);
 /*
  * TODO: write code for FG_GC
  *
@@ -2002,11 +2004,13 @@ again:
 		mutex_unlock(&ctx->gc_lock);
 		return gc_count;
 	}
+	/*
 	int ret = traverse_gc_victim_tree(ctx);
 	printk(KERN_ERR "\n DONE , returning lock!! ");
 	printk(KERN_ERR "\n......................\n");
 	mutex_unlock(&ctx->gc_lock);
 	return (ret);
+	*/
 	zonenr = select_zone_to_clean(ctx, gc_mode, __func__);
 	if (zonenr < 0) {
 		printk(KERN_ERR "\n No zone found for cleaning!! \n");
@@ -5260,14 +5264,16 @@ int remove_zone_from_gc_tree(struct ctx *ctx, unsigned int zonenr)
 		znode = container_of(link, struct gc_zone_node, rb);
 		if (znode->zonenr == zonenr) {
 			cost_node = znode->ptr_to_cost_node;
-			printk(KERN_ERR "\n %s removing zone: %d from the gc_cost_root tree", __func__, zonenr);
+			//printk(KERN_ERR "\n %s removing zone: %d from the gc_cost_root tree", __func__, zonenr);
 			remove_zone_from_cost_node(ctx, cost_node, zonenr);
 			rb_erase(&znode->rb, root);
 			kmem_cache_free(ctx->gc_zone_node_cache, znode);
+			/*
 			if (zonenr == select_zone_to_clean(ctx, BG_GC, __func__)) {
 				printk(KERN_ERR "\n %s zonenr selected next time: %d is same as removed!! \n", __func__, zonenr);
 				BUG_ON(1);
 			}
+			*/
 			return (0);
 		}
 		if (znode->zonenr < zonenr) {
@@ -5432,7 +5438,7 @@ int update_gc_tree(struct ctx *ctx, unsigned int zonenr, u32 nrblks, u64 mtime, 
 	new->cost = cost;
 	RB_CLEAR_NODE(&new->rb);
 	znode->ptr_to_cost_node = new;
-	printk(KERN_ERR "\n  %s adding znode to the cost node's zone list! \n ", __func__);
+	//printk(KERN_ERR "\n  %s adding znode to the cost node's zone list! \n ", __func__);
 	list_add(&znode->list, &new->znodes_list);
 
 	//printk(KERN_ERR "\n %s new cost node initialized, about to add it to the tree! \n", __func__);
