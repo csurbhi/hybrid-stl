@@ -175,7 +175,7 @@ static int create_caches(struct ctx *ctx);
 static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **argv);
 static void hybrid_stl_dtr(struct dm_target *dm_target);
 int get_new_data_zone(struct ctx *ctx);
-int remove_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len);
+//int remove_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len);
 
 long nrpages;
 int _lsdm_verbose;
@@ -852,13 +852,13 @@ static void find_and_remove_rev_tm(struct ctx *ctx, sector_t lba, unsigned int l
 		 * splitting is required. Previous splits if any, are chained
 		 * to the last one as 'clone' is their parent.
 		 */
-			remove_czone_info(ctx, lba, pba, len);
+			//remove_czone_info(ctx, lba, pba, len);
 			remove_rev_translation_entry(ctx, pba, len);
 			break;
 
 		} else {
 			/* overlap is smaller than nr_sectors remaining. */
-			remove_czone_info(ctx, lba, pba, overlap);
+			//remove_czone_info(ctx, lba, pba, overlap);
 			remove_rev_translation_entry(ctx, pba, overlap);
 			/* Since e was smaller, we want to search for the next e */
 			len = len - overlap;
@@ -1222,15 +1222,59 @@ static int select_zone_to_clean(struct ctx *ctx, int mode, const char *func)
 	return -1;
 }
 
+int get_cblocks_count(struct ctx *ctx, unsigned int lzonenr)
+{
+	sector_t diff;
+	struct extent *e = NULL;
+	sector_t lba, last_lba, overlap;
+	int count = 0;
+
+	lba = lzonenr * ctx->nr_lbas_in_zone;
+	last_lba = lba + ctx->nr_lbas_in_zone;
+
+	/* Lookup this pba in the reverse table to find the
+	 * corresponding LBA. 
+	 */
+	while(lba <= last_lba) {
+		e = _lsdm_rb_geq(&ctx->extent_tbl_root, lba, 0);
+		if ((e == NULL) || (e->lba >= last_lba)) {  /* this will never happen:  (e->lba + e->len) <= lba) */
+			break;
+		}
+		/* Case of Overlap, e always overlaps with (lba - last_lba) address range,
+		 * higher e returned. The above if ensures that e->lba < last_lba
+		 */
+		if (e->lba > lba) {
+			/*               [eeeeeeeeeeee]
+			 *    (lba)
+			 */
+			lba = e->lba;
+			/* when we fall through to the next case, lba = e->lba */
+		}
+		/* (e->lba <= lba)
+		 *
+		 *		lba-----------last-lba
+		 *	eeeeeeeeeeeeeeeeee[eeeeeeeeeeeeeeeeeeeeeeee]
+		 *
+		 */
+		overlap = e->lba + e->len - lba;
+		diff = lba - e->lba;
+		lba = lba + overlap;
+		count = count + 1;
+	}
+	printk(KERN_ERR "\n Data zonenr: %u has %d blocks in cache \n", lzonenr, count);
+	return 0;
+}
+
+
+
 int create_dzone_list(struct ctx *ctx, unsigned int zonenr);
 #if 0
 static int traverse_gc_victim_tree(struct ctx *ctx)
 {
-	struct rb_root *root = &ctx->gc_cost_root;
+	//struct rb_root *root = &ctx->gc_cost_root;
+	struct rb_root *root = &ctx->gc_zone_root;
 	struct rb_node *node;
-	struct list_head *list_head = NULL;
-	struct gc_zone_node *znode, *next_znode = NULL;
-	struct gc_cost_node *cnode;
+	struct gc_zone_node *znode;
 	struct cseg_zone_node *zone_nodep, *next_zone_nodep;
 	int czonenr = 0, dzonenr = 0, count=0;
 
@@ -1241,24 +1285,22 @@ static int traverse_gc_victim_tree(struct ctx *ctx)
 		printk(KERN_ERR "\n select_zone_to_clean() returned czonenr: %d ", czonenr);
 	}
 	while(node) {
-		cnode = rb_entry(node, struct gc_cost_node, rb);
-		list_head = &cnode->znodes_list;
+		znode = rb_entry(node, struct gc_zone_node, rb);
 		/* We remove znode from the list maintained by cost node. If this is the last node on the list 
 		 * then we have to remove the cost node from the tree
 		 */
-		list_for_each_entry_safe(znode, next_znode, list_head, list) {
-			printk(KERN_ERR "\n %s zone: %d has %d data zones", __func__, znode->zonenr, znode->vblks);
-			czonenr = znode->zonenr;
-			count = create_dzone_list(ctx, czonenr);
-			printk(KERN_ERR "\n %s Cleaning cache zonenr: %d #valid blks: %d nr_data_zones: %d \n", __func__, czonenr, get_sit_ent_vblocks(ctx, czonenr), count);	
-			list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
-				dzonenr = zone_nodep->lzonenr;
-				printk(KERN_ERR "zonenr: %d \n", dzonenr);
-			}
-			free_data_zone_list(ctx);
-			/* Delete this zone from the cost node list, cost tree and the gc zone tree */
-			remove_zone_from_gc_tree(ctx, czonenr);
+		printk(KERN_ERR "\n %s zone: %d has %d data zones", __func__, znode->zonenr, znode->vblks);
+		czonenr = znode->zonenr;
+		count = create_dzone_list(ctx, czonenr);
+		printk(KERN_ERR "\n %s Cleaning cache zonenr: %d #valid blks: %d nr_data_zones: %d \n", __func__, czonenr, get_sit_ent_vblocks(ctx, czonenr), count);	
+		list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
+			dzonenr = zone_nodep->lzonenr;
+			printk(KERN_ERR "zonenr: %d \n", dzonenr);
+			get_cblocks_count(ctx, dzonenr);
 		}
+		free_data_zone_list(ctx);
+		/* Delete this zone from the cost node list, cost tree and the gc zone tree */
+		remove_zone_from_gc_tree(ctx, czonenr);
 		node = root->rb_node;
 	}
 	return(0);
@@ -1703,7 +1745,7 @@ static int free_gc_extents(struct ctx *ctx)
 		kmem_cache_free(ctx->gc_extents_cache, gc_extent);
 		count = count + 1;
 	}
-	printk(KERN_ERR "\n gc extents freed %d", count);
+	//printk(KERN_ERR "\n gc extents freed %d", count);
 	return 0;
 }
 
@@ -1984,7 +2026,7 @@ static int evict_cache_data(struct ctx *ctx, int gc_mode, int err_flag)
 	struct cseg_zone_node *zone_nodep, *next_zone_nodep;
 	u32 lzonenr, zones_cleaned = 0;
 	struct lsdm_gc_thread *gc_th = ctx->gc_th;
-	u64 start_t, end_t, interval = 0;
+	//u64 start_t, end_t, interval = 0;
 	u64 cstart_t, cend_t, cinterval = 0;
 
 	//printk(KERN_ERR "\a %s * GC thread polling after every few seconds! gc_mode: %d \n", __func__, gc_mode);
@@ -2042,7 +2084,7 @@ again:
 		//printk(KERN_ERR "\n Merging data zonenr zonenr: %d ", lzonenr);
 		get_zone_lock(ctx, lzonenr);
 		down_write(&ctx->lsdm_rb_lock);
-		start_t = ktime_get_ns();
+		//start_t = ktime_get_ns();
 		/* Collect all the extents - either from the cache zone or the data zone, a block can only exist in either of them */
 		create_gc_extents(ctx, lzonenr);
 		if (list_empty(&ctx->gc_extents->list)) {
@@ -2069,22 +2111,19 @@ again:
 			printk(KERN_ERR "\n kthread needs to stop ");
 			goto stop;
 		}
-		wake_up(&ctx->gc_th->fggc_wq);
+		//wake_up_nr(&ctx->gc_th->fggc_wq, 1);
 		//printk(KERN_ERR "\n GC extents read, about to write them to a new zone ");
 		if (write_valid_gc_extents(ctx, lzonenr)) {
 			printk(KERN_ERR "\n Could not cleanup cache zone %d ", lzonenr);
 			goto stop;
 		}
 		up_write(&ctx->lsdm_rb_lock);
-		end_t = ktime_get_ns();
-		interval = (end_t - start_t) / 1000000;
+		//end_t = ktime_get_ns();
+		//interval = (end_t - start_t) / 1000000;
 		free_zone_lock(ctx, lzonenr);
-		printk(KERN_ERR "\n Data zone: %u merged in %llu milliseconds, #freed: %d ", lzonenr, interval, len);
+		//printk(KERN_ERR "\n Data zone: %u merged in %llu milliseconds, #freed: %d ", lzonenr, interval, len);
 		free_gc_extents(ctx);
-		if (ctx->nr_free_cache_zones > ctx->lower_watermark)
-			wake_up_nr(&ctx->gc_th->fggc_wq, count-1);
-		else
-			wake_up(&ctx->gc_th->fggc_wq);
+		wake_up_nr(&ctx->gc_th->fggc_wq, 1);
 		list_del(&zone_nodep->list);
 		kmem_cache_free(ctx->zones_in_cseg_cache, zone_nodep);
 	}
@@ -3551,7 +3590,7 @@ void sit_ent_vblocks_decr(struct ctx *ctx, sector_t pba)
 		ptr->mtime = get_elapsed_time(ctx);
 		if (ctx->max_mtime < ptr->mtime)
 			ctx->max_mtime = ptr->mtime;
-		update_gc_tree(ctx, zonenr, ptr->lzones, ptr->mtime, __func__);
+		update_gc_tree(ctx, zonenr, ptr->vblocks, ptr->mtime, __func__);
 		if (!ptr->vblocks) {
 			printk(KERN_ERR "\n %s Freeing zone: %llu \n", __func__, zonenr);
 			mark_zone_free(ctx, zonenr, ctx->free_czone_bitmap, ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit, &ctx->nr_free_cache_zones, 0);
@@ -3602,7 +3641,7 @@ void sit_ent_vblocks_incr(struct ctx *ctx, sector_t pba)
 			ctx->max_mtime = ptr->mtime;
 		/* TODO: Add the zone to the GC tree if the vblocks < 65536 */
 		//printk(KERN_ERR "\n %s Adding zone: %llu to GC tree \n", __func__, zonenr);
-		update_gc_tree(ctx, zonenr, ptr->lzones, ptr->mtime, __func__);
+		update_gc_tree(ctx, zonenr, ptr->vblocks, ptr->mtime, __func__);
 	}
 	//mutex_unlock(&ctx->sit_kv_store_lock);
 	if(vblocks > (1 << (sb->log_zone_size - sb->log_block_size))) {
@@ -3649,6 +3688,7 @@ void sit_ent_add_mtime(struct ctx *ctx, sector_t pba)
 	//mutex_unlock(&ctx->sit_kv_store_lock);
 }
 
+#if 0
 /* The pba - len is in the same zone.
  * We are trying to find out the number of dzones in a czone
  */
@@ -3717,8 +3757,9 @@ int add_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len)
 	ptr->lzones += 1;
 	return 0;
 }
+#endif
 
-
+#if 0
 int remove_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len)
 {
 	int czonenr = get_czone_nr(ctx, pba);
@@ -3751,6 +3792,7 @@ int remove_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len)
 		}
 		if(czinfo->lzone == lzonenr) {
 			czinfo->count -= 1;
+			ptr->lzones = ptr->lzones - 1;
 			if (!czinfo->count) {
 				ptr->lzones = 0;
 				/* Remove this lzone */
@@ -3766,6 +3808,7 @@ int remove_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len)
 	//printk(KERN_ERR "\n Error!! lzonenr: %d", lzonenr);
 	return 0;
 }
+#endif
 
 int add_rev_translation_entry(struct ctx * ctx, sector_t lba, sector_t pba, size_t len) 
 {
@@ -4468,7 +4511,7 @@ void sub_write_done(struct work_struct * w)
 	kmem_cache_free(ctx->subbio_ctx_cache, subbioctx);
 
 	if (is_cached_write) {
-		add_czone_info(ctx, lba, pba, len);
+		//add_czone_info(ctx, lba, pba, len);
 		add_rev_translation_entry(ctx, lba, pba, len);
 	}
 	return;
@@ -5320,7 +5363,7 @@ struct gc_zone_node * add_zonenr_gc_zone_tree(struct ctx *ctx, unsigned int zone
 	 */
 	rb_link_node(&znew->rb, parent, link);
 	rb_insert_color(&znew->rb, root);
-	//printk(KERN_ERR "\n %s Added zone: %d nrblks: %d to gc tree!znode: %p  znode->list: %p \n", __func__, zonenr, nrblks, znew, znew->list);
+	//printk(KERN_ERR "\n %s Added zone: %d nrblks: %d to gc tree!znode: %p  znode->list: %p \n", __func__, zonenr, nrblks, znew, (void *) znew->list);
 	return znew;
 }
 
@@ -5356,7 +5399,7 @@ int remove_zone_from_cost_node(struct ctx *ctx, struct gc_cost_node *cost_node, 
 		if (zcount >= 1 && flag == 1)
 			break;
 	}
-	if (!zcount) {
+	if (!zcount && flag) {
 		//printk(KERN_ERR "\n %s Zone: %d was the only one on the cost node. Deleting the cost_node %p now! \n", __func__, zonenr, cost_node);
 		rb_erase(&cost_node->rb, &ctx->gc_cost_root);
 		kmem_cache_free(ctx->gc_cost_node_cache, cost_node);
@@ -5406,6 +5449,7 @@ int update_gc_tree(struct ctx *ctx, unsigned int zonenr, u32 nrblks, u64 mtime, 
 	}
 
 	znode->vblks = nrblks;
+	INIT_LIST_HEAD(&znode->list);
 		
 	/* Go to the bottom of the tree */
 	while (*link) {
@@ -5547,7 +5591,7 @@ int read_seg_entries_from_block(struct ctx *ctx, struct lsdm_seg_entry *entry, u
 			continue;
 		}
 		else if (entry->vblocks == 0) {
-    			printk(KERN_ERR "\n FREE *segnr: %u", *zonenr);
+    			//printk(KERN_ERR "\n FREE *segnr: %u", *zonenr);
 			mark_zone_free(ctx, *zonenr, ctx->free_czone_bitmap, ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit, &ctx->nr_free_cache_zones, 0);
 		}
 		else {
@@ -5688,7 +5732,7 @@ int read_dzone_info_table(struct ctx * ctx)
 	struct page *page;
 	int i=0, j=0;
 	sector_t pba = ctx->sb->dzit_pba;
-	int occupied = 0, nr_valid_blks = 0, pzonenr;
+	int nr_valid_blks = 0, pzonenr;
 
 	nr_remaining_entries = ctx->sb->zone_count_data;
 	entries = nr_dzit_entries_in_blk;
@@ -5711,11 +5755,9 @@ int read_dzone_info_table(struct ctx * ctx)
 			szi[i].wp = dzi_entry->wp;
 			szi[i].lzonenr = i;
 			mutex_init(&szi[i].zone_lock);
-			/* 1 indicates free, by default the bit is 0 ie occupied, format writes all zeroes initially, so wp is zero for unmapped zones */
 			if (pzonenr < ctx->sb->zone_count) {
 				mark_zone_occupied(ctx, pzonenr, ctx->free_dzone_bitmap, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit, &ctx->nr_free_data_zones);
-				occupied++;
-				nr_valid_blks = (szi[i].wp - get_first_pba_for_dzone(ctx, pzonenr)) / NR_SECTORS_IN_BLK;
+				nr_valid_blks = (szi[i].wp - get_first_pba_for_dzone(ctx, i)) / NR_SECTORS_IN_BLK;
 				printk(KERN_ERR "\n %s pzonenr: %d nr_valid_blks: %d ", __func__, szi[i].pzonenr, nr_valid_blks);
 			}
 			dzi_entry = dzi_entry + 1;
@@ -5725,7 +5767,6 @@ int read_dzone_info_table(struct ctx * ctx)
 		nr_remaining_entries = nr_remaining_entries - entries;
 	}
 	BUG_ON(i != ctx->sb->zone_count_data);
-	printk(KERN_ERR "\n %s nr zone occupied: %d ", __func__, occupied);
 	return 0;
 }
 

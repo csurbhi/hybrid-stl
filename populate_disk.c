@@ -749,7 +749,7 @@ void write_dzone_info_table(int fd, struct lsdm_sb *sb, int nr_free_blks)
 	u64 offset, wp;
 
 	dzit_entries_per_blk = BLK_SZ/sizeof(struct stl_dzones_info);
-	entries_in_last_blk = sb->zone_count % dzit_entries_per_blk;
+	entries_in_last_blk = sb->zone_count_data % dzit_entries_per_blk;
 	offset = sb->dzit_pba * SECTOR_SIZE;
 	ret = lseek(fd, offset, SEEK_SET);
 	if ( ret == -1) {
@@ -757,11 +757,15 @@ void write_dzone_info_table(int fd, struct lsdm_sb *sb, int nr_free_blks)
 		printf("\n write to disk offset: %u, sectornr: %lld ret: %d\n", offset, sb->dzit_pba, ret);
 		exit(errno);
 	}
-	pzonenr = 1;
-	wp = sb->dzone0_pba + sb->nr_lbas_in_zone;
+	pzonenr = sb->dzone0_pba/sb->nr_lbas_in_zone;
+	wp = sb->dzone0_pba;
 	wp = wp + (sb->nr_lbas_in_zone - (nr_free_blks * NR_SECTORS_IN_BLK)) ;
 	printf("\n !!!!!  dzit entries in a blk: %d ", dzit_entries_per_blk);
 	printf("\n !!!!!  sb->blk_count_dzit: %d ", sb->blk_count_dzit);
+	printf("\n ---------------------------> wp: %llu", wp);
+	printf("\n ---------------------------> sb->dzone0_pba: %llu", sb->dzone0_pba);
+	printf("\n ---------------------------> nr_free_blks: %d", nr_free_blks);
+	printf("\n ---------------------------> pzonenr: %d", pzonenr);
 	for(i=0; i < sb->blk_count_dzit-1; i++) {
 		entry = buffer;
 		memset(buffer, 0, BLK_SZ);
@@ -781,7 +785,6 @@ void write_dzone_info_table(int fd, struct lsdm_sb *sb, int nr_free_blks)
 		entry->pzonenr = sb->zone_count + 1;
 		entry->wp = 0;
 		pzonenr++;
-		wp = wp + sb->nr_lbas_in_zone;
 		entry++;
 	}
 	ret = write(fd, buffer, BLK_SZ);

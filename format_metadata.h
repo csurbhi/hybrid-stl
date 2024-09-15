@@ -74,8 +74,9 @@ __u8 valid_map[VBLK_MAP_SIZE];
  */
 
 //#define NR_CACHE_ZONES 64
-//# define NR_CACHE_ZONE 116 /* for 1 MB -> 112 + 1(metadata) + 3 for GC */
-#define NR_CACHE_ZONES 16 /* for 4K size is 7, but with 90/10 its 11 + 4 */
+//# define NR_CACHE_ZONES 117 /* for 1 MB -> 112 + 1(metadata) + 4 for GC */
+# define NR_CACHE_ZONES 148 /* for 1 MB -> 144 + 1(metadata) + 3 for GC */
+//#define NR_CACHE_ZONES 16 /* for 4K size is 7, but with 90/10 its 11 + 4 */
 //#define NR_CACHE_ZONES 14 /* for 4K size is 7, but with 90/10 its 11 + 4 */
 
 #define SIT_ENTRIES_BLK 	(BLK_SIZE/sizeof(struct lsdm_seg_entry))
