@@ -1896,6 +1896,7 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 	int count = 0;
 	struct lsdm_sb * sb = ctx->sb;
 	unsigned int pzonenr;
+	int cacheblks = 0;
 
 	/* TODO: ensure wp belongs to the same pzonenr */
 	if (szi->pzonenr < sb->zone_count) {
@@ -1984,10 +1985,11 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 		}
 		add_extent_to_gclist(ctx, &temp);
 		lba = lba + overlap;
+		cacheblks = cacheblks + 1;
 	}
 	//printk(KERN_ERR "\n %s number of sectors from the data zone(%d): %d ", __func__, szi->pzonenr, count);
 	//printk(KERN_ERR "\n Returning from : %s ", __func__);
-	return 0;
+	return cacheblks;
 }
 
 void get_zone_lock(struct ctx * ctx, unsigned int zonenr)
@@ -2022,7 +2024,7 @@ static int evict_cache_data(struct ctx *ctx, int gc_mode, int err_flag)
 {
 	int zonenr;
 	u64 gc_count = 0;
-	int count;
+	int count, cacheblks = 0;
 	struct cseg_zone_node *zone_nodep, *next_zone_nodep;
 	u32 lzonenr, zones_cleaned = 0;
 	struct lsdm_gc_thread *gc_th = ctx->gc_th;
@@ -2086,7 +2088,7 @@ again:
 		down_write(&ctx->lsdm_rb_lock);
 		//start_t = ktime_get_ns();
 		/* Collect all the extents - either from the cache zone or the data zone, a block can only exist in either of them */
-		create_gc_extents(ctx, lzonenr);
+		cacheblks = create_gc_extents(ctx, lzonenr);
 		if (list_empty(&ctx->gc_extents->list)) {
 			list_del(&zone_nodep->list);
 			kmem_cache_free(ctx->zones_in_cseg_cache, zone_nodep);
@@ -2123,7 +2125,7 @@ again:
 		free_zone_lock(ctx, lzonenr);
 		//printk(KERN_ERR "\n Data zone: %u merged in %llu milliseconds, #freed: %d ", lzonenr, interval, len);
 		free_gc_extents(ctx);
-		wake_up_nr(&ctx->gc_th->fggc_wq, 1);
+		wake_up_nr(&ctx->gc_th->fggc_wq, cacheblks);
 		list_del(&zone_nodep->list);
 		kmem_cache_free(ctx->zones_in_cseg_cache, zone_nodep);
 	}
