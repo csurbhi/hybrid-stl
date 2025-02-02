@@ -1520,7 +1520,7 @@ static int read_gc_extents(struct ctx *ctx)
 		len = len + gc_extent->e.len;
 		count++;
 	}
-	//printk(KERN_ERR "\n GC extents submitted for read: %d ", count);
+	trace_printk("\n GC extents submitted for read: %d ", count);
 	return len;
 }
 
@@ -1627,10 +1627,6 @@ static int write_valid_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 	/* Allocate a new one only if this sequential data zone actually has any data */
 	if ((pzonenr > ctx->sb->zone_count) || szi->wp) {
 		pzonenr = get_new_data_zone(ctx);
-		if (szi->wp) {
-			/* No data zone lies in the CMR zone, so no need to check */
-			mark_zone_free(ctx, pzonenr, ctx->free_dzone_bitmap, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit, &ctx->nr_free_data_zones, 1);
-		}
 		//printk(KERN_ERR "\n %s Allocated a new pzonenr: %d ", __func__, pzonenr);
 	}
 	BUG_ON(pzonenr > ctx->sb->zone_count);
@@ -1668,11 +1664,15 @@ static int write_valid_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 		gc_extent->bio_pages = NULL;
 		count++;
 	}
-	/* We dont have to free the data zone explicitly. It will be freed from sit_ent_vblocks_decr()
+	/* We have to free the old physical data zone explicitly. Cache zone not data zone is freed in sit_ent_vblocks_decr()
 	 */
+	if (szi->wp) {
+		/* No data zone lies in the CMR zone, so no need to check */
+		mark_zone_free(ctx, szi->pzonenr, ctx->free_dzone_bitmap, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit, &ctx->nr_free_data_zones, 1);
+	}
 	szi->pzonenr = pzonenr;
 	szi->wp = wp;
-	//printk(KERN_ERR "\n GC extents submitted for write: %d zonenr: %d", count, lzonenr);
+	trace_printk("\n GC extents submitted for write: %d zonenr: %d", count, lzonenr);
 	return 0;
 }
 
@@ -2044,6 +2044,10 @@ again:
 	if (kthread_should_stop()) {
 		printk(KERN_ERR "\n kthread needs to stop ");
 		mutex_unlock(&ctx->gc_lock);
+		if (gc_th->gc_wake) {
+			gc_th->gc_wake = 0;
+			wake_up_all(&ctx->gc_th->fggc_wq);
+		}
 		return gc_count;
 	}
 	/*
@@ -2070,7 +2074,15 @@ again:
 	cstart_t = ktime_get_ns();
 	count = create_dzone_list(ctx, zonenr);
 	if (count <= 0) {
-		goto stop;
+		printk(KERN_ERR "\n No data zone found for merging!! \n");
+		mutex_unlock(&ctx->gc_lock);
+		if (gc_th->gc_wake) {
+			gc_th->gc_wake = 0;
+			wake_up_all(&ctx->gc_th->fggc_wq);
+		}
+		if (gc_count)
+			printk(KERN_ERR "\n Cleaned cache zones, resuming writes!!");
+		return gc_count;
 	}
 	printk(KERN_ERR "\n %s Cleaning cache zonenr: %d #valid blks: %d nr_data_zones: %d \n", __func__, zonenr, get_sit_ent_vblocks(ctx, zonenr), count);	
 	int test_count = 0;
@@ -2090,35 +2102,32 @@ again:
 		/* Collect all the extents - either from the cache zone or the data zone, a block can only exist in either of them */
 		cacheblks = create_gc_extents(ctx, lzonenr);
 		if (list_empty(&ctx->gc_extents->list)) {
-			list_del(&zone_nodep->list);
-			kmem_cache_free(ctx->zones_in_cseg_cache, zone_nodep);
-			printk(KERN_ERR "\n lzonenr is empty: %d ", lzonenr);
 			up_write(&ctx->lsdm_rb_lock);
 			free_zone_lock(ctx, lzonenr);
-			//up_write(&ctx->wf_lock);
-			mutex_unlock(&ctx->gc_lock);
-			if (gc_th->gc_wake) {
-				gc_th->gc_wake = 0;
-				wake_up_all(&ctx->gc_th->fggc_wq);
-			}
-			BUG();
+			list_del(&zone_nodep->list);
+			kmem_cache_free(ctx->zones_in_cseg_cache, zone_nodep);
+			trace_printk("\n lzonenr is empty: %d ", lzonenr);
+			continue;
 		}
 		//printk(KERN_ERR "\n Created GC extents, about to read them \n");
 		if (kthread_should_stop()) {
-			printk(KERN_ERR "\n kthread needs to stop ");
+			trace_printk("\n GC kthread needs to stop ");
+			up_write(&ctx->lsdm_rb_lock);
 			free_zone_lock(ctx, lzonenr);
 			goto stop;
 		}
 		len = read_gc_extents(ctx);
 		if (kthread_should_stop()) {
-			printk(KERN_ERR "\n kthread needs to stop ");
+			trace_printk("\n GC kthread needs to stop - after reading extents");
+			up_write(&ctx->lsdm_rb_lock);
 			free_zone_lock(ctx, lzonenr);
 			goto stop;
 		}
 		//wake_up_nr(&ctx->gc_th->fggc_wq, 1);
 		//printk(KERN_ERR "\n GC extents read, about to write them to a new zone ");
 		if (write_valid_gc_extents(ctx, lzonenr)) {
-			printk(KERN_ERR "\n Could not cleanup cache zone %d ", lzonenr);
+			trace_printk("\n Could not merge (aka write) data zone %d ", lzonenr);
+			up_write(&ctx->lsdm_rb_lock);
 			free_zone_lock(ctx, lzonenr);
 			goto stop;
 		}
@@ -2142,15 +2151,18 @@ again:
 	if ((gc_mode == FG_GC) && (ctx->nr_free_cache_zones <= ctx->middle_watermark)) {
 		goto again;
 	}
-	wake_up_all(&ctx->gc_th->fggc_wq);
+	if (gc_th->gc_wake) {
+                gc_th->gc_wake = 0;
+		wake_up_all(&ctx->gc_th->fggc_wq);
+	}
 	mutex_unlock(&ctx->gc_lock);
 	return zones_cleaned;
 stop:
+	trace_printk("\n Stopping GC thread ! \n");
 	if (gc_th->gc_wake) {
                 gc_th->gc_wake = 0;
                 wake_up_all(&ctx->gc_th->fggc_wq);
         }
-	up_write(&ctx->lsdm_rb_lock);
 	//up_write(&ctx->wf_lock);
 	mutex_unlock(&ctx->gc_lock);
 	free_gc_extents(ctx);
@@ -4789,8 +4801,9 @@ int hybrid_stl_write_io(struct ctx *ctx, struct bio *bio)
 	struct lsdm_bioctx * bioctx;
 	struct lsdm_ckpt *ckpt;
 	int ret, dosplit, nr_sectors;
-	sector_t lba, wp;
+	sector_t lba, wp, end_pba;
 	unsigned int lzonenr, pzonenr, free_sectors_in_zone, s8, maxlen, lba_offset_in_zone, pba_offset;
+	unsigned int zone_is_full = 0;
 
 	maxlen = (BIO_MAX_PAGES * 8);
 
@@ -4838,13 +4851,19 @@ int hybrid_stl_write_io(struct ctx *ctx, struct bio *bio)
 		lba = bio->bi_iter.bi_sector;
 		lba_offset_in_zone = lba % ctx->nr_lbas_in_zone;
 		wp = 0;
+		zone_is_full = 0;
 		lzonenr = lba / ctx->nr_lbas_in_zone;
+		get_zone_lock(ctx, lzonenr);
 		pzonenr = ctx->dzit[lzonenr].pzonenr;
 		free_sectors_in_zone = ctx->nr_lbas_in_zone;
 		if (pzonenr < ctx->sb->zone_count) {
 			wp = ctx->dzit[lzonenr].wp;
 			free_sectors_in_zone = get_free_sectors_in_zone(ctx, lzonenr);
-			get_zone_lock(ctx, lzonenr);
+			end_pba = get_first_pba_for_dzone(ctx, pzonenr) + ctx->nr_lbas_in_zone;
+			/* end_pba is past this zone. A full zone cannot get sequential writes */
+			if (wp == end_pba) {
+				zone_is_full = 1;
+			}
 		}
 		pba_offset = wp % ctx->nr_lbas_in_zone;
 		if (s8 > free_sectors_in_zone) {
@@ -4861,7 +4880,7 @@ int hybrid_stl_write_io(struct ctx *ctx, struct bio *bio)
 			split->bi_private = bioctx;
 		}
 		/* LBA starts from 0, but PBA starts after the cache */
-		if (pba_offset  == lba_offset_in_zone) {
+		if ((!zone_is_full) && (pba_offset  == lba_offset_in_zone)) {
 			/* writing in place in the data zone */
 			if (pzonenr > ctx->sb->zone_count) {
 				pzonenr = get_new_data_zone(ctx);
@@ -4873,22 +4892,21 @@ int hybrid_stl_write_io(struct ctx *ctx, struct bio *bio)
 				ctx->dzit[lzonenr].pzonenr = pzonenr;
 				ctx->dzit[lzonenr].lzonenr = lzonenr;
 				ctx->dzit[lzonenr].wp = get_first_pba_for_dzone(ctx, pzonenr);
-				mutex_init(&ctx->dzit[lzonenr].zone_lock);
-				get_zone_lock(ctx, lzonenr);
+				/* lock should be initialized in read_dzone_info() */
 				wp = ctx->dzit[lzonenr].wp;
 			}
 			BUG_ON(!s8);
 			prepare_bio(split, s8, wp, 0);
 			submit_bio(split);
-			trace_printk("\n %s() (SEQ write):: lba: %llu pba: %llu len: %u nr_sectors: %u", __func__, lba, wp, s8, nr_sectors);
 			/* Update the wp with the zone lock held. */
 			ctx->dzit[lzonenr].wp += s8;
-			free_zone_lock(ctx, lzonenr);
-			sector_t end_pba = get_first_pba_for_dzone(ctx, pzonenr) + ctx->nr_lbas_in_zone;
+			trace_printk("\n %s() (SEQ write):: lba: %llu pba: %llu len: %u nr_sectors: %u", __func__, lba, wp, s8, nr_sectors);
+			end_pba = get_first_pba_for_dzone(ctx, pzonenr) + ctx->nr_lbas_in_zone;
 			if (ctx->dzit[lzonenr].wp > end_pba) {
 				printk(KERN_ERR "\n %s ctx->dzit[lzonenr].wp: %llu pzonenr: %d s8: %d lzonenr: %d end_pba: %llu", __func__, ctx->dzit[lzonenr].wp, pzonenr, s8, lzonenr, end_pba);
 				BUG_ON(ctx->dzit[lzonenr].wp > end_pba);
 			}
+			free_zone_lock(ctx, lzonenr);
 		} else {
 			free_zone_lock(ctx, lzonenr);
 			if (ctx->nr_free_cache_zones <= ctx->middle_watermark) {
