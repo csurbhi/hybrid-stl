@@ -1520,7 +1520,7 @@ static int read_gc_extents(struct ctx *ctx)
 		len = len + gc_extent->e.len;
 		count++;
 	}
-	trace_printk("\n GC extents submitted for read: %d ", count);
+	trace_printk("\n GC extents submitted for read: %d , #sectors read: %d", count, len);
 	return len;
 }
 
@@ -1620,15 +1620,12 @@ static int write_valid_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 	sector_t wp;
 	int count  = 0, offset = 0;
 	sector_t last_pba = 0;
+	int nr_sectors = 0;
 	
 	/* If list is empty we have nothing to do */
 	BUG_ON(list_empty(&ctx->gc_extents->list));
-	pzonenr = szi->pzonenr;
-	/* Allocate a new one only if this sequential data zone actually has any data */
-	if ((pzonenr > ctx->sb->zone_count) || szi->wp) {
-		pzonenr = get_new_data_zone(ctx);
-		//printk(KERN_ERR "\n %s Allocated a new pzonenr: %d ", __func__, pzonenr);
-	}
+	pzonenr = get_new_data_zone(ctx);
+	//printk(KERN_ERR "\n %s Allocated a new pzonenr: %d ", __func__, pzonenr);
 	BUG_ON(pzonenr > ctx->sb->zone_count);
 	wp = get_first_pba_for_dzone(ctx, pzonenr);
 	last_pba = wp + ctx->nr_lbas_in_zone;
@@ -1638,14 +1635,18 @@ static int write_valid_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 		gc_extent = list_entry(pos, struct gc_extents, list);
 		offset = gc_extent->e.lba % ctx->nr_lbas_in_zone;
 		current_offset = wp % ctx->nr_lbas_in_zone;
-		if (offset != current_offset) {
+		BUG_ON(offset < current_offset);
+		if (offset > current_offset) {
 			diff = offset - current_offset;
 			if (write_zero_pages(ctx, diff, wp)) {
 				printk(KERN_ERR "\n Could not complete cache zone cleaning due to resources ");
 				return -ENOMEM;
 			}
 			wp = wp + diff;
-			BUG_ON(wp >= last_pba);
+			nr_sectors += diff;
+			trace_printk("(zero pages) lzonenr: %u, pzonenr: %d wp: %llu last_pba: %llu nr_sectors: %d ", lzonenr, pzonenr, wp, last_pba, nr_sectors);
+			BUG_ON(nr_sectors > ctx->nr_lbas_in_zone);
+			BUG_ON(wp > last_pba);
 		}
 		gc_extent->bio = NULL;
 		/* next function will set up the bio */
@@ -1655,7 +1656,11 @@ static int write_valid_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 		bio->bi_iter.bi_sector = wp;
 		submit_bio_wait(gc_extent->bio);
 		write_metadata_extent(ctx, gc_extent, wp);
+		trace_printk("\n (extent write) lzonenr: %u, pzonenr: %d wp: %llu last_pba: %llu nr_sectors: %d gc_extent->(lba: %llu, len: %llu) ", lzonenr, pzonenr, wp, last_pba, nr_sectors, gc_extent->e.lba, gc_extent->e.len);
 		wp = wp + gc_extent->e.len;
+		nr_sectors += gc_extent->e.len;
+		BUG_ON(nr_sectors > ctx->nr_lbas_in_zone);
+		BUG_ON(wp > last_pba);
 		bio_for_each_segment_all(bv, gc_extent->bio, iter_all) {
 			mempool_free(bv->bv_page, ctx->gc_page_pool);
 		}
@@ -1672,7 +1677,7 @@ static int write_valid_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 	}
 	szi->pzonenr = pzonenr;
 	szi->wp = wp;
-	trace_printk("\n GC extents submitted for write: %d zonenr: %d", count, lzonenr);
+	trace_printk("\n #GC extents written to disk: %d logical zonenr: %d, new physical zone: %d", count, lzonenr, pzonenr);
 	return 0;
 }
 
@@ -1926,7 +1931,7 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 	temp.pba = 0;
 	temp.lba = 0;
 	temp.len = 0;
-	while(lba <= last_lba) {
+	while(lba < last_lba) {
 		e = _lsdm_rb_geq(&ctx->extent_tbl_root, lba, 0);
 		if ((e == NULL) || (e->lba >= last_lba)) {  /* this will never happen:  (e->lba + e->len) <= lba) */
 			/* Not found in the cache. Now check if this can be seen in the actual data zone */
@@ -4859,7 +4864,10 @@ int hybrid_stl_write_io(struct ctx *ctx, struct bio *bio)
 		if (pzonenr < ctx->sb->zone_count) {
 			wp = ctx->dzit[lzonenr].wp;
 			free_sectors_in_zone = get_free_sectors_in_zone(ctx, lzonenr);
+			sector_t first_pba = get_first_pba_for_dzone(ctx, pzonenr);
+			BUG_ON(wp < first_pba);
 			end_pba = get_first_pba_for_dzone(ctx, pzonenr) + ctx->nr_lbas_in_zone;
+			BUG_ON(wp > end_pba);
 			/* end_pba is past this zone. A full zone cannot get sequential writes */
 			if (wp == end_pba) {
 				zone_is_full = 1;

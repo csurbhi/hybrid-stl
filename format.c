@@ -877,8 +877,8 @@ long reset_shingled_zones(int fd)
 		bzr->nr_zones = zone_count;
 	} else {
 		bzr->nr_zones = 1024;
-	}*/
-
+	}
+	*/
 	printf("\n zone_count: %d ", bzr->nr_zones);
 	for (i=0; i<bzr->nr_zones; i++) {
 		if ((bzr->zones[i].type == BLK_ZONE_TYPE_SEQWRITE_PREF)  || 
