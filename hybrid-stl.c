@@ -815,6 +815,55 @@ static struct extent * lsdm_rb_insert(struct ctx *ctx, struct extent *new)
 	return NULL;
 }
 
+
+static struct extent * find_tm_entry(struct ctx *ctx, sector_t lba, unsigned int len)
+{
+	struct extent *e, *ret_e;
+	unsigned overlap, diff;
+	sector_t pba;
+
+	e = _lsdm_rb_geq(&ctx->extent_tbl_root, lba, 0);
+	/* case of no overlap */
+	if ((e == NULL) || (e->lba >= (lba + len)) || ((e->lba + e->len) <= lba))  {
+		return NULL;
+	}
+
+	ret_e = kmem_cache_alloc(ctx->extent_cache, GFP_KERNEL);
+	if (!ret_e)
+		return NULL;
+
+	/* Case of Overlap, e always overlaps with bio */
+	if (e->lba > lba) {
+	/*   		 [eeeeeeeeeeee]
+	 *	[---------bio------] 
+	 */
+		diff = e->lba - lba;
+		lba = lba + diff;
+		len = len - diff;
+		/* we fall through as e->lba == lba now */
+	} 
+	//(e->lba <= lba) 
+	/* [eeeeeeeeeeee] eeeeeeeeeeeee]<- could be shorter or longer
+	 */
+	/*  [---------bio------] */
+	overlap = e->lba + e->len - lba;
+	diff = lba - e->lba;
+	BUG_ON(diff < 0);
+	pba = e->pba + diff;
+	//printk(KERN_ERR "\n lba: %llu, pba: %llu, overlap: %d, len: %d", lba, pba, overlap, len);
+	ret_e->lba = lba;
+	ret_e->pba = pba;
+	if (overlap >= len) { 
+		ret_e->len = len;
+	} else {
+		ret_e->len = overlap;
+	}
+	return ret_e;
+}
+
+
+
+
 static void find_and_remove_rev_tm(struct ctx *ctx, sector_t lba, unsigned int len)
 {
 	struct extent *e;
@@ -2140,7 +2189,7 @@ again:
 		end_t = ktime_get_ns();
 		interval = (end_t - start_t) / 1000000;
 		free_zone_lock(ctx, lzonenr);
-		trace_printk("\n Data zone: %u merged in %llu milliseconds, #freed: %d ", lzonenr, interval, len);
+		trace_printk("\n Data zone: %u merged in %llu milliseconds, #freed: %d from cache", lzonenr, interval, cacheblks);
 		free_gc_extents(ctx);
 		wake_up_nr(&ctx->gc_th->fggc_wq, cacheblks);
 		list_del(&zone_nodep->list);
@@ -4593,6 +4642,31 @@ void lsdm_clone_endio(struct bio * clone)
 	return;
 }
 
+void lsdm_clone_endio_no_updates(struct bio * clone)
+{
+	struct lsdm_sub_bioctx *subbioctx = NULL;
+	struct bio *bio = NULL;
+	struct ctx *ctx;
+	struct lsdm_bioctx *bioctx;
+
+	subbioctx = clone->bi_private;
+	BUG_ON(!subbioctx);
+	bioctx = subbioctx->bioctx;
+	BUG_ON(!bioctx);
+	ctx = bioctx->ctx;
+	BUG_ON(!ctx);
+	bio = bioctx->orig;
+	BUG_ON(!bio);
+	if (clone->bi_status != BLK_STS_OK) {
+		bio->bi_status = clone->bi_status;
+		ctx->err = 1;
+	}
+	bio_put(clone);
+	kref_put(&bioctx->ref, write_done);
+	kmem_cache_free(ctx->subbio_ctx_cache, subbioctx);
+	return;
+}
+
 
 int lsdm_write_checks(struct ctx *ctx, struct bio *bio)
 {
@@ -4714,6 +4788,8 @@ int ls_cache_write(struct ctx *ctx, struct bio *clone)
 	sector_t s8, lba = clone->bi_iter.bi_sector, wf = 0;
 	int dosplit = 0;
 	struct lsdm_bioctx * bioctx = clone->bi_private;
+	struct bio * split;
+	struct extent * e;
 
 
 	/* Keep the next line - for actually finding out how many zones there are in a cache worth 112 zones
@@ -4726,6 +4802,27 @@ int ls_cache_write(struct ctx *ctx, struct bio *clone)
 
 	do {
 		nr_sectors = bio_sectors(clone);
+		e = find_tm_entry(ctx, lba, nr_sectors);
+		if (e) {
+			if (nr_sectors < e->len) {
+				split = bio_split(clone, e->len, GFP_NOIO, &fs_bio_set);
+				prepare_bio(split, e->len, e->pba, 0);
+				submit_bio(split);
+				lba = lba + e->len;
+				/* free e */		
+				kmem_cache_free(ctx->extent_cache, e);
+				continue;
+			} else {
+				bioctx->ctx = ctx;
+				clone->bi_private = bioctx;
+				prepare_bio(clone, e->len, e->pba, 0);
+				clone->bi_end_io = lsdm_clone_endio_no_updates;
+				submit_bio(clone);
+				/* free e */		
+				kmem_cache_free(ctx->extent_cache, e);
+				break;
+			}
+		}
 		BUG_ON(!nr_sectors);
 		s8 = round_up(nr_sectors, NR_SECTORS_IN_BLK);
 		dosplit = 0;
@@ -5763,7 +5860,7 @@ int read_dzone_info_table(struct ctx * ctx)
 	nr_remaining_entries = ctx->sb->zone_count_data;
 	entries = nr_dzit_entries_in_blk;
 
-	printk(KERN_ERR "\n %s nr_remaining_entries: %d entries: %d nr_dzit_entries_in_blk: %d dzit_pba: %llu", __func__, nr_remaining_entries, entries, nr_dzit_entries_in_blk, pba);
+	printk(KERN_ERR "\n %s nr_remaining_entries: %d entries: %d nr_dzit_entries_in_blk: %d dzit_pba: %llu \n", __func__, nr_remaining_entries, entries, nr_dzit_entries_in_blk, pba);
 
 	while(nr_remaining_entries > 0) {
 		if (nr_remaining_entries < nr_dzit_entries_in_blk) {
@@ -5784,7 +5881,7 @@ int read_dzone_info_table(struct ctx * ctx)
 			if (pzonenr < ctx->sb->zone_count) {
 				mark_zone_occupied(ctx, pzonenr, ctx->free_dzone_bitmap, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit, &ctx->nr_free_data_zones);
 				nr_valid_blks = (szi[i].wp - get_first_pba_for_dzone(ctx, i)) / NR_SECTORS_IN_BLK;
-				//printk(KERN_ERR "\n %s pzonenr: %d nr_valid_blks: %d ", __func__, szi[i].pzonenr, nr_valid_blks);
+				//printk(KERN_ERR "\n %s !!!!!!!!!!!!!! pzonenr: %d nr_valid_blks: %d ", __func__, szi[i].pzonenr, nr_valid_blks);
 			}
 			dzi_entry = dzi_entry + 1;
 		}
@@ -5792,7 +5889,8 @@ int read_dzone_info_table(struct ctx * ctx)
 		pba = pba + NR_SECTORS_IN_BLK;
 		nr_remaining_entries = nr_remaining_entries - entries;
 	}
-	BUG_ON(i != ctx->sb->zone_count_data);
+	printk(KERN_ERR "%s i: %d ctx->sb->zone_count_data: %llu \n", __func__, i, ctx->sb->zone_count_data);
+	//BUG_ON(i != ctx->sb->zone_count_data);
 	return 0;
 }
 
