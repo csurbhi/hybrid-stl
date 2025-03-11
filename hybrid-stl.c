@@ -175,7 +175,9 @@ static int create_caches(struct ctx *ctx);
 static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **argv);
 static void hybrid_stl_dtr(struct dm_target *dm_target);
 int get_new_data_zone(struct ctx *ctx);
-//int remove_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len);
+void cached_data_zone_incr(struct ctx *ctx, sector_t lba);
+void cached_data_zone_decr(struct ctx *ctx, sector_t lba);
+
 
 long nrpages;
 int _lsdm_verbose;
@@ -1249,13 +1251,13 @@ int lsdm_flush_thread_stop(struct ctx *ctx)
  * part of the tree; or we want 'n' sequential zones that give the
  * most of any other 'n'
  */
-static int select_zone_to_clean(struct ctx *ctx, int mode, const char *func)
+static int select_zone_to_clean(struct ctx *ctx, int heuristic, const char *func)
 {
-	struct rb_node *node = NULL;
-	struct gc_cost_node * cnode = NULL;
-	struct gc_zone_node * znode = NULL;
 
-	//if (mode == FG_GC) {
+	if (heuristic == SEG_GREEDY) {
+		struct rb_node *node = NULL;
+		struct gc_cost_node * cnode = NULL;
+		struct gc_zone_node * znode = NULL;
 		node = rb_first(&ctx->gc_cost_root);
 		if (!node)
 			return -1;
@@ -1265,9 +1267,16 @@ static int select_zone_to_clean(struct ctx *ctx, int mode, const char *func)
 			//printk(KERN_ERR "\n %s zone: %d has %d blks caller: %s", __func__, znode->zonenr, znode->vblks, func);
 			return znode->zonenr;
 		}
+	} else if (heuristic == DZONE_GREEDY) {
+		struct cached_dzone_info *node;
+		struct list_head *head = &ctx->cached_dzones;
+		if (list_empty(head))
+			return -1;
 
-	//}
-	/* TODO: Mode: BG_GC */
+		node = list_entry(head->next, struct cached_dzone_info, list);
+		return node->czonenr;
+	}
+	/* TODO: Mode: BG_GC, Calculate the age of all the nodes now. We have only 29K nodes. We can also use only the nodes calculated in the last run*/
 	return -1;
 }
 
@@ -2111,7 +2120,7 @@ again:
 	mutex_unlock(&ctx->gc_lock);
 	return (ret);
 	*/
-	zonenr = select_zone_to_clean(ctx, gc_mode, __func__);
+	zonenr = select_zone_to_clean(ctx, DZONE_GREEDY, __func__);
 	if (zonenr < 0) {
 		printk(KERN_ERR "\n No zone found for cleaning!! \n");
 		mutex_unlock(&ctx->gc_lock);
@@ -3745,128 +3754,6 @@ void sit_ent_add_mtime(struct ctx *ctx, sector_t pba)
 	//mutex_unlock(&ctx->sit_kv_store_lock);
 }
 
-#if 0
-/* The pba - len is in the same zone.
- * We are trying to find out the number of dzones in a czone
- */
-int add_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len)
-{
-	int czonenr = get_czone_nr(ctx, pba);
-	struct czone_info *czinfo = ctx->czonenr_list[czonenr], *next_node, *new, *last;
-	struct list_head *list_head;
-	int lzonenr = lba / ctx->nr_lbas_in_zone;
-	struct lsdm_seg_entry *ptr;
-	struct sit_page *sit_page;
-	int index;
-
-	sit_page = add_sit_page_kv_store(ctx, pba, __func__);
-	if (!sit_page) {
-		/* TODO: do something, low memory */
-		print_memory_usage(ctx, "During sit_ent_vblocks_incr");
-		BUG_ON(1);
-		//panic("Low memory, could not allocate sit_entry");
-	}
-
-	index = czonenr % SIT_ENTRIES_BLK; 
-	ptr = (struct lsdm_seg_entry *) page_address(sit_page->page);
-	ptr = ptr + index;
-
-	if (!czinfo) {
-		czinfo = kmem_cache_alloc(ctx->czinfo_cache, GFP_KERNEL);
-		if (!czinfo) {
-			return -1;
-		}
-		czinfo->lzone = lzonenr;
-		czinfo->count = 1;
-		INIT_LIST_HEAD(&czinfo->list);
-		ptr->lzones = 1;
-		ctx->czonenr_list[czonenr] = czinfo;
-		return 0;
-	}
-	list_head = &czinfo->list;
-	list_for_each_entry_safe(czinfo, next_node, list_head, list) {
-		last = czinfo;
-		if (czinfo->lzone < lzonenr) {
-			continue;
-		}
-		if(czinfo->lzone == lzonenr) {
-			czinfo->count += 1;
-			if (lzonenr < ((lba + len) / ctx->nr_lbas_in_zone)) {
-				lzonenr = lzonenr + 1;
-				continue;
-			}
-			return 0;
-		}
-		break;
-	}
-	new = kmem_cache_alloc(ctx->czinfo_cache, GFP_KERNEL);
-	if (!new) {
-		return -1;
-	}
-	new->lzone = lzonenr;
-	new->count = 1;
-	INIT_LIST_HEAD(&new->list);
-	if (czinfo) 
-		list_add_tail(&new->list, &czinfo->list);
-	else 
-		list_add(&new->list, &last->list);
-	/* New lzone added to this cache zone */
-	ptr->lzones += 1;
-	return 0;
-}
-#endif
-
-#if 0
-int remove_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len)
-{
-	int czonenr = get_czone_nr(ctx, pba);
-	struct czone_info *czinfo = ctx->czonenr_list[czonenr], *next_node;
-	struct list_head *list_head;
-	int lzonenr = lba / ctx->nr_lbas_in_zone;
-	struct sit_page *sit_page;
-	struct lsdm_seg_entry *ptr;
-	int index;
-
-	sit_page = add_sit_page_kv_store(ctx, pba, __func__);
-	if (!sit_page) {
-		/* TODO: do something, low memory */
-		print_memory_usage(ctx, "During sit_ent_vblocks_incr");
-		BUG_ON(1);
-		//panic("Low memory, could not allocate sit_entry");
-	}
-
-	index = czonenr % SIT_ENTRIES_BLK; 
-	ptr = (struct lsdm_seg_entry *) page_address(sit_page->page);
-	ptr = ptr + index;
-
-	BUG_ON(!czinfo);
-	list_head = &czinfo->list;
-	//printk(KERN_ERR "\n searching for lzonenr: %d \n", lzonenr);
-	list_for_each_entry_safe(czinfo, next_node, list_head, list) {
-		//printk(KERN_ERR "\n lzone: %d ", czinfo->lzone);
-		if (czinfo->lzone < lzonenr) {
-			continue;
-		}
-		if(czinfo->lzone == lzonenr) {
-			czinfo->count -= 1;
-			ptr->lzones = ptr->lzones - 1;
-			if (!czinfo->count) {
-				ptr->lzones = 0;
-				/* Remove this lzone */
-				list_del(&czinfo->list);
-			}
-			if (lzonenr < ((lba + len) / ctx->nr_lbas_in_zone)) {
-				lzonenr = lzonenr + 1;
-				continue;
-			}
-			return 0;
-		}
-	}
-	//printk(KERN_ERR "\n Error!! lzonenr: %d", lzonenr);
-	return 0;
-}
-#endif
-
 int add_rev_translation_entry(struct ctx * ctx, sector_t lba, sector_t pba, size_t len) 
 {
 	struct rev_tm_entry * ptr;
@@ -3918,6 +3805,7 @@ int add_rev_translation_entry(struct ctx * ctx, sector_t lba, sector_t pba, size
 		/* we need to incr the vblocks always */
 		sit_ent_vblocks_incr(ctx, pba);
 		ptr->lba = lba;
+		cached_data_zone_incr(ctx, lba);
 		pba = pba + NR_SECTORS_IN_BLK;
 		lba = lba + NR_SECTORS_IN_BLK;
 		index = index + 1;
@@ -3981,6 +3869,7 @@ int remove_rev_translation_entry(struct ctx * ctx, sector_t pba, unsigned int le
 		}
 		/*-----------------------------------------------*/
 		sit_ent_vblocks_decr(ctx, pba);
+		cached_data_zone_decr(ctx, ptr->lba);
 		//# This is how we denote INVALID LBA
 		ptr->lba = (ctx->sb->max_pba + 1);
 		pba = pba + NR_SECTORS_IN_BLK;
@@ -5476,10 +5365,10 @@ struct gc_zone_node * add_zonenr_gc_zone_tree(struct ctx *ctx, unsigned int zone
 		printk(KERN_ERR "\n %s could not allocate memory for gc_zone_node \n", __func__);
 		return NULL;
 	}
+	INIT_LIST_HEAD(&znew->list);
 	znew->zonenr = zonenr;
 	znew->vblks = nrblks;
 	znew->ptr_to_cost_node = NULL;
-	INIT_LIST_HEAD(&znew->list);
 
 	/* link holds the address of left or the right pointer
 	 * appropriately
@@ -5529,6 +5418,101 @@ int remove_zone_from_cost_node(struct ctx *ctx, struct gc_cost_node *cost_node, 
 	}
 	return 0;
 }
+
+void insert_to_cached_dzone_list(struct ctx *ctx, struct cached_dzone_info *new)
+{
+	struct cached_dzone_info *temp;
+
+	list_for_each_entry(temp, &ctx->cached_dzones, list) {
+		if(temp->vblks > new->vblks) {
+			/* add before temp */
+			list_add_tail(&new->list, &temp->list);
+			return;
+		}
+	}
+	/* if you are here, then the above condition was never hit
+	 * Add new after temp 
+	 */
+	list_add(&new->list, &temp->list);
+	return;
+}
+
+void cached_data_zone_incr(struct ctx *ctx, sector_t lba)
+{
+	struct rb_root *root = &ctx->cached_dzones_rb_root;
+	struct rb_node **link = &root->rb_node, *parent = NULL;
+	unsigned int dzonenr = lba / ctx->nr_lbas_in_zone;
+	struct cached_dzone_info * znew = NULL, *e = NULL;
+	while (*link) {
+		parent = *link;
+		e = container_of(parent, struct cached_dzone_info, rb);
+		if (e->czonenr == dzonenr) {
+			list_del_init(&e->list);
+			e->vblks += 1;
+			e->mtime = get_elapsed_time(ctx);
+			insert_to_cached_dzone_list(ctx, e);
+			break;
+		}
+		if (e->czonenr < dzonenr) {
+			link = &(*link)->rb_right;
+		} else {
+			link = &(*link)->rb_left;
+		}
+	}
+	znew = kmem_cache_alloc(ctx->cached_dzones_cache, GFP_KERNEL | __GFP_ZERO);
+	if (!znew) {
+		printk(KERN_ERR "\n %s could not allocate memory for gc_zone_node \n", __func__);
+		return;
+	}
+	znew->czonenr = dzonenr;
+	znew->vblks = 1;
+	znew->mtime = get_elapsed_time(ctx);
+	INIT_LIST_HEAD(&znew->list);
+	insert_to_cached_dzone_list(ctx, znew);
+	RB_CLEAR_NODE(&znew->rb);
+
+	/* link holds the address of left or the right pointer
+	 * appropriately
+	 */
+	rb_link_node(&znew->rb, parent, link);
+	rb_insert_color(&znew->rb, root);
+	//printk(KERN_ERR "\n %s Added zone: %d nrblks: %d to gc tree!znode: %p  znode->list: %p \n", __func__, zonenr, nrblks, znew, (void *) znew->list);
+	return;
+}
+
+void cached_data_zone_decr(struct ctx *ctx, sector_t lba)
+{
+	struct rb_root *root = &ctx->cached_dzones_rb_root;
+	struct rb_node **link = &root->rb_node, *parent = NULL;
+	unsigned int dzonenr = lba / ctx->nr_lbas_in_zone;
+	struct cached_dzone_info *e = NULL;
+	while (*link) {
+		parent = *link;
+		e = container_of(parent, struct cached_dzone_info, rb);
+		if (e->czonenr == dzonenr) {
+			list_del_init(&e->list);
+			e->vblks -= 1;
+			if (e->vblks) {
+				e->mtime = get_elapsed_time(ctx);
+				insert_to_cached_dzone_list(ctx, e);
+			} else {
+				rb_erase(&e->rb, &ctx->cached_dzones_rb_root);
+				kmem_cache_free(ctx->cached_dzones_cache, e);
+
+			}
+			break;
+		}
+		if (e->czonenr < dzonenr) {
+			link = &(*link)->rb_right;
+		} else {
+			link = &(*link)->rb_left;
+		}
+	}
+	/* You should not be here */
+	printk(KERN_ERR "\n Trying to delete a cached data zone that is missing!! ");
+	return;
+}
+
 /*
  *
  * TODO: Current default is Cost Benefit.
@@ -5766,9 +5750,6 @@ int read_seg_info_table(struct ctx *ctx)
 	printk(KERN_INFO "\n Allocated free cache bitmap, ret: %d", ret);
 	if (!ctx->free_czone_bitmap)
 		return -1;
-	ctx->free_dzone_bitmap = allocate_freebitmap(ctx, ctx->dzone_bitmap_bytes);
-	memset(ctx->free_dzone_bitmap, (char) ~0, ctx->dzone_bitmap_bytes);
-	printk(KERN_INFO "\n Allocated free datazone bitmap, ret: %d", ret);
 
 
 	ctx->min_mtime = ULLONG_MAX;
@@ -5855,7 +5836,17 @@ int read_dzone_info_table(struct ctx * ctx)
 	struct page *page;
 	int i=0, j=0;
 	sector_t pba = ctx->sb->dzit_pba;
-	int nr_valid_blks = 0, pzonenr;
+	//int nr_valid_blks = 0, pzonenr;
+	int pzonenr;
+
+
+	ctx->free_dzone_bitmap = allocate_freebitmap(ctx, ctx->dzone_bitmap_bytes);
+	if (!ctx->free_dzone_bitmap) {
+		printk(KERN_ERR "\n Could not allocated data zone free bitmap btyes! \n");
+		return -ENOMEM;
+	}
+	memset(ctx->free_dzone_bitmap, (char) ~0, ctx->dzone_bitmap_bytes);
+	printk(KERN_INFO "\n Allocated free datazone bitmap");
 
 	nr_remaining_entries = ctx->sb->zone_count_data;
 	entries = nr_dzit_entries_in_blk;
@@ -5880,7 +5871,7 @@ int read_dzone_info_table(struct ctx * ctx)
 			mutex_init(&szi[i].zone_lock);
 			if (pzonenr < ctx->sb->zone_count) {
 				mark_zone_occupied(ctx, pzonenr, ctx->free_dzone_bitmap, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit, &ctx->nr_free_data_zones);
-				nr_valid_blks = (szi[i].wp - get_first_pba_for_dzone(ctx, i)) / NR_SECTORS_IN_BLK;
+				//nr_valid_blks = (szi[i].wp - get_first_pba_for_dzone(ctx, i)) / NR_SECTORS_IN_BLK;
 				//printk(KERN_ERR "\n %s !!!!!!!!!!!!!! pzonenr: %d nr_valid_blks: %d ", __func__, szi[i].pzonenr, nr_valid_blks);
 			}
 			dzi_entry = dzi_entry + 1;
@@ -6075,7 +6066,6 @@ err:
 
 void destroy_caches(struct ctx *ctx)
 {
-	kmem_cache_destroy(ctx->czinfo_cache);
 	kmem_cache_destroy(ctx->zones_in_cseg_cache);
 	kmem_cache_destroy(ctx->bio_cache);
 	kmem_cache_destroy(ctx->extent_cache);
@@ -6143,8 +6133,8 @@ int create_caches(struct ctx *ctx)
 	if (!ctx->zones_in_cseg_cache) {
 		goto destroy_bio_cache;
 	}
-	ctx->czinfo_cache  = kmem_cache_create("czinfo_cache", sizeof(struct czone_info), 0, SLAB_RED_ZONE|SLAB_ACCOUNT, NULL);
-	if (!ctx->czinfo_cache) {
+	ctx->cached_dzones_cache= kmem_cache_create("cached_dzones_cache", sizeof(struct cached_dzone_info), 0, SLAB_RED_ZONE|SLAB_ACCOUNT, NULL);
+	if (!ctx->cached_dzones_cache) {
 		goto destroy_zones_in_cseg_cache;
 	}
 	return 0;
@@ -6357,6 +6347,8 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
 	if (ret) {
 		goto stop_gc_thread;
 	}
+	ctx->cached_dzones_rb_root = RB_ROOT;
+	INIT_LIST_HEAD(&ctx->cached_dzones);
 	//debugfs_create_u32("freezones", 0444, debug_dir, &ctx->ckpt->nr_free_cache_zones);
 	printk(KERN_ERR "\n ctr() done!!");
 	return 0;

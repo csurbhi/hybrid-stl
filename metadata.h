@@ -41,6 +41,8 @@
  */
 #define SMALL_NR_ZONES 1000 /* 250 GB */
 #define FREE_BLKS_WATERMARK 2560 /* 10 MB */
+#define SEG_GREEDY 1
+#define DZONE_GREEDY 2
 
 struct seq_zones_info {
 	u32 lzonenr;
@@ -310,6 +312,7 @@ struct ctx {
 	struct kmem_cache *bio_cache;
 	struct kmem_cache *zones_in_cseg_cache;
 	struct kmem_cache *czinfo_cache;
+	struct kmem_cache *cached_dzones_cache;
 	spinlock_t tm_ref_lock;
 	spinlock_t tm_flush_lock;
 	spinlock_t rev_flush_lock;
@@ -357,6 +360,8 @@ struct ctx {
 	struct work_struct tb_work;
 	struct czone_info * czonenr_list[NR_CACHE_ZONES];
 	unsigned int err;
+	struct list_head cached_dzones;
+	struct rb_root cached_dzones_rb_root;
 };
 
 struct extent {
@@ -386,6 +391,14 @@ struct gc_zone_node {
 	u32 vblks;
 	struct gc_cost_node *ptr_to_cost_node; 
 	struct list_head list; /* we add this node to the list maintained on gc_cost_node */
+};
+
+struct cached_dzone_info {
+	int czonenr;
+	int vblks;
+	time64_t mtime;
+	struct rb_node rb;  	/* we add this on the cached data zones tree */
+	struct list_head list; /* we add this node to the list maintained on cached_dzones */
 };
 
 struct czone_info {
