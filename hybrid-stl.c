@@ -1331,14 +1331,43 @@ static int select_cache_zone_to_clean(struct ctx *ctx, int mode, const char *fun
 	return -1;
 }
 
+/*
+ * As nrblks increases, u increases, u can be max 100.
+ *
+ * when mtime is closer to max_mtime, age will be closer to 0.
+ * ie with recent updates, the age will be younger.
+ * When the mtime == min_mtime, age is 100 which is the oldest
+ *
+ * You want to select a zone with MAXIMUM number of blocks and
+ * oldest age.
+ *
+ * So the higher the returned value, the more attractive is the
+ * data zone.
+ */
+unsigned int get_dzone_cb_cost(struct ctx *ctx , u32 nrblks, u64 mtime)
+{
+	unsigned int u, age;
+	struct lsdm_sb *sb = ctx->sb;
+
+	u = (nrblks * 100) >> (sb->log_zone_size - sb->log_block_size);
+
+	if (!(ctx->max_mtime - ctx->min_mtime)) {
+		dump_stack();
+		return u;
+	}
+	age = 100 - div_u64(100 * (mtime - ctx->min_mtime),
+				ctx->max_mtime - ctx->min_mtime);
+
+	return ((100 * u * age)/ (100 + (100 - u)));
+}
+
 static int select_data_zone_to_clean(struct ctx *ctx, int heuristic, const char *func)
 {
 	int lzonenr;
+	struct cached_dzone_info *node;
+	if (list_empty(&ctx->cached_dzones))
+		return -1;
 	if (heuristic == DZONE_GREEDY) {
-		struct cached_dzone_info *node;
-		if (list_empty(&ctx->cached_dzones))
-			return -1;
-
 		/* we first try to find a cache zone with no in flight writes */
 		list_for_each_entry(node, &ctx->cached_dzones, list) {
 			if(!atomic_read(&node->inflight_writes)) {
@@ -1364,6 +1393,17 @@ static int select_data_zone_to_clean(struct ctx *ctx, int heuristic, const char 
 			io_schedule();
 			return node->czonenr;
 		}
+	} else if (heuristic == DZONE_COST_BENEFIT) {
+		int max_cost = INT_MIN, max_dzone = -1;
+		int cost;
+		list_for_each_entry(node, &ctx->cached_dzones, list) {
+			/* oldest age will be 100 */
+			cost = get_dzone_cb_cost(ctx, atomic_read(&node->vblks), node->mtime);
+			if (cost > max_cost) {
+				max_dzone = node->czonenr;
+			}
+		}
+		return max_dzone;
 	}
 	/* TODO: Mode: BG_GC, Calculate the age of all the nodes now. We have only 29K nodes. We can also use only the nodes calculated in the last run*/
 	return -1;
@@ -2205,7 +2245,8 @@ again:
 		return 0;
 	}
 	while(1) {
-		dzonenr = select_data_zone_to_clean(ctx, DZONE_GREEDY, __func__);
+		//dzonenr = select_data_zone_to_clean(ctx, DZONE_GREEDY, __func__);
+		dzonenr = select_data_zone_to_clean(ctx, DZONE_COST_BENEFIT, __func__);
 		if (dzonenr < 0) {
 			printk(KERN_ERR "\n No data zone found for eviction!! \n");
 			mutex_unlock(&ctx->gc_lock);
@@ -5400,6 +5441,16 @@ char * allocate_freebitmap(struct ctx *ctx, unsigned int bitmap_bytes)
 	return free_bitmap;
 }
 
+/*
+ * As nrblks increases, u increases, u can be max 100.
+ *
+ * when mtime is closer to max_mtime, age will be closer to 0.
+ * ie with recent updates, the age will be younger.
+ * When the mtime == min_mtime, age is 100 which is the oldest
+ *
+ * You want to select a zone with minimum number of blocks and
+ * oldest age.
+ */
 unsigned int get_cb_cost(struct ctx *ctx , u32 nrblks, u64 mtime)
 {
 	unsigned int u, age;
