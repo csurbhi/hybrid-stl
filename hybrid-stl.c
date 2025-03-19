@@ -175,9 +175,14 @@ static int create_caches(struct ctx *ctx);
 static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **argv);
 static void hybrid_stl_dtr(struct dm_target *dm_target);
 int get_new_data_zone(struct ctx *ctx);
-void cached_data_zone_incr(struct ctx *ctx, sector_t lba);
-void cached_data_zone_decr(struct ctx *ctx, sector_t lba);
-
+void cached_data_zone_incr_cblocks(struct ctx *ctx, sector_t lba);
+void cached_data_zone_decr_cblocks(struct ctx *ctx, sector_t lba);
+void cached_data_zone_incr_writes(struct ctx *ctx, sector_t lba);
+void cached_data_zone_decr_writes(struct ctx *ctx, sector_t lba);
+void get_zone_lock(struct ctx * ctx, unsigned int zonenr);
+void free_zone_lock(struct ctx * ctx, unsigned int zonenr);
+int cached_data_zone_gc_flag(struct ctx *ctx, int dzonenr);
+void free_cached_dzone_list(struct ctx *ctx);
 
 long nrpages;
 int _lsdm_verbose;
@@ -1328,15 +1333,37 @@ static int select_cache_zone_to_clean(struct ctx *ctx, int mode, const char *fun
 
 static int select_data_zone_to_clean(struct ctx *ctx, int heuristic, const char *func)
 {
+	int lzonenr;
 	if (heuristic == DZONE_GREEDY) {
 		struct cached_dzone_info *node;
-		struct list_head *head = &ctx->cached_dzones;
-		if (list_empty(head))
+		if (list_empty(&ctx->cached_dzones))
 			return -1;
 
-		node = list_entry(head->next, struct cached_dzone_info, list);
-		printk(KERN_ERR "\n %s zone: %d has %d blks in cache, caller: %s ", __func__, node->czonenr, atomic_read(&node->vblks), func);
-		return node->czonenr;
+		/* we first try to find a cache zone with no in flight writes */
+		list_for_each_entry(node, &ctx->cached_dzones, list) {
+			if(!atomic_read(&node->inflight_writes)) {
+				lzonenr = node->czonenr;
+				/* Prevents any further overwrites, otherwise these can be lost as GC is unaware*/
+				get_zone_lock(ctx, lzonenr);
+				node->gc_flag = ONGOING_GC;
+				free_zone_lock(ctx, lzonenr);
+				printk(KERN_ERR "\n %s zone: %d has %d blks in cache, caller: %s ", __func__, node->czonenr, atomic_read(&node->vblks), func);
+				return node->czonenr;
+			}
+		}
+
+		list_for_each_entry(node, &ctx->cached_dzones, list) {
+			/* We are returning a czone with inflight writes
+			 */
+			lzonenr = node->czonenr;
+			/* Prevents any further overwrites, otherwise these can be lost as GC is unaware*/
+			get_zone_lock(ctx, lzonenr);
+			node->gc_flag = ONGOING_GC;
+			free_zone_lock(ctx, lzonenr);
+			/* flush all writes to the disk */
+			io_schedule();
+			return node->czonenr;
+		}
 	}
 	/* TODO: Mode: BG_GC, Calculate the age of all the nodes now. We have only 29K nodes. We can also use only the nodes calculated in the last run*/
 	return -1;
@@ -3835,7 +3862,7 @@ int add_rev_translation_entry(struct ctx * ctx, sector_t lba, sector_t pba, size
 		/* we need to incr the vblocks always */
 		sit_ent_vblocks_incr(ctx, pba);
 		ptr->lba = lba;
-		cached_data_zone_incr(ctx, lba);
+		cached_data_zone_incr_cblocks(ctx, lba);
 		pba = pba + NR_SECTORS_IN_BLK;
 		lba = lba + NR_SECTORS_IN_BLK;
 		index = index + 1;
@@ -3901,7 +3928,7 @@ int remove_rev_translation_entry(struct ctx * ctx, sector_t pba, unsigned int le
 		//# This is how we denote INVALID LBA
 		if (ptr->lba < ctx->sb->max_pba) {
 			sit_ent_vblocks_decr(ctx, pba);
-			cached_data_zone_decr(ctx, ptr->lba);
+			cached_data_zone_decr_cblocks(ctx, ptr->lba);
 			//# Mark this mapping invalid - for on disk mapping
 			ptr->lba = (ctx->sb->max_pba + 1);
 		}
@@ -4492,6 +4519,7 @@ void sub_write_done(struct work_struct * w)
 	if (is_cached_write) {
 		add_rev_translation_entry(ctx, lba, pba, len);
 	}
+	cached_data_zone_decr_writes(ctx, lba);
 	return;
 }
 
@@ -4569,9 +4597,11 @@ void lsdm_clone_endio_no_updates(struct bio * clone)
 	struct bio *bio = NULL;
 	struct ctx *ctx;
 	struct lsdm_bioctx *bioctx;
+	sector_t lba;
 
 	subbioctx = clone->bi_private;
 	BUG_ON(!subbioctx);
+	lba = subbioctx->extent.lba;
 	bioctx = subbioctx->bioctx;
 	BUG_ON(!bioctx);
 	ctx = bioctx->ctx;
@@ -4585,6 +4615,7 @@ void lsdm_clone_endio_no_updates(struct bio * clone)
 	bio_put(clone);
 	kref_put(&bioctx->ref, write_done);
 	kmem_cache_free(ctx->subbio_ctx_cache, subbioctx);
+	cached_data_zone_decr_writes(ctx, lba);
 	return;
 }
 
@@ -4646,6 +4677,7 @@ int prepare_bio(struct bio * clone, sector_t s8, sector_t wf, unsigned int is_ca
 	struct lsdm_bioctx * bioctx = clone->bi_private;
 	struct ctx *ctx = bioctx->ctx;
 	sector_t lba = clone->bi_iter.bi_sector;
+	cached_data_zone_incr_writes(ctx, lba);
 	BUG_ON(!ctx);
 
 	//printk(KERN_ERR "\n About to write %llu sectors at LBA: %llu, PBA: %llu, is_cache_write: %d", s8, lba, wf, is_cache_write);
@@ -4718,6 +4750,18 @@ int ls_write(struct ctx *ctx, struct bio *clone)
 		return 0;
 	}
 
+	if (ctx->nr_free_cache_zones <= ctx->middle_watermark) {
+		ctx->gc_th->gc_wake = 1;
+		wake_up(&ctx->gc_th->lsdm_gc_wait_queue);
+		DEFINE_WAIT(wait);
+		prepare_to_wait(&ctx->gc_th->fggc_wq, &wait,
+						TASK_UNINTERRUPTIBLE);
+		/* setting gc_wake=1 and the next wakeup will trigger lsdm_gc(ctx, FG_GC, 0) by waking up a sleeping gc thread */
+		io_schedule();
+		finish_wait(&ctx->gc_th->fggc_wq, &wait);
+			//printk(KERN_ERR "\n %s %d woken up lba: %llu, nrsectors: %d ", __func__,  __LINE__, lba, nr_sectors);
+	}
+
 	do {
 		nr_sectors = bio_sectors(clone);
 		BUG_ON(!nr_sectors);
@@ -4773,6 +4817,7 @@ int ls_cache_write(struct ctx *ctx, struct bio *clone)
 	struct lsdm_bioctx * bioctx = clone->bi_private;
 	struct bio * split;
 	struct extent * e;
+	unsigned int lzonenr;
 
 
 	/* Keep the next line - for actually finding out how many zones there are in a cache worth 112 zones
@@ -4786,8 +4831,19 @@ int ls_cache_write(struct ctx *ctx, struct bio *clone)
 	do {
 		nr_sectors = bio_sectors(clone);
 		lba = clone->bi_iter.bi_sector;
+		lzonenr = lba / ctx->nr_lbas_in_zone;
 		e = find_tm_entry(ctx, lba, nr_sectors);
 		if (e) {
+			get_zone_lock(ctx, lzonenr);
+			if (cached_data_zone_gc_flag(ctx, lzonenr)) {
+				/* Once GC starts we skip overwrite, as this can cause a missed write
+				 * where GC removes the translation entry, and an overwrite does not make
+				 * any changes to translation entry. No one notices the write on disk.
+				 */
+				free_zone_lock(ctx, lzonenr);
+				goto skip_overwrite;
+			}
+
 			BUG_ON(e->lba < lba);
 			/*
 			 * split bio: (lba < e->lba)
@@ -4800,10 +4856,15 @@ int ls_cache_write(struct ctx *ctx, struct bio *clone)
 				split = bio_split(clone, diff, GFP_NOIO, &fs_bio_set);
 				/* first part needs to be ls */
 				split->bi_private = bioctx;
+				free_zone_lock(ctx, lzonenr);
+				/* second part must be in place overwrite, but we need to recheck for gc writes
+				 * We give up the lock to do ls write, we might need GC before ls_write!
+				 * So we go to the top again, and we free e here.
+				 */
+				kmem_cache_free(ctx->extent_cache, e);
+				free_zone_lock(ctx, lzonenr);
 				ls_write(ctx, split);
-				/* second part must be in place overwrite, will fall through */
-				lba = clone->bi_iter.bi_sector;
-				nr_sectors = bio_sectors(clone);
+				continue;
 			}
 			/* we are here when e->lba == lba
 			 * Dont split bio:
@@ -4819,6 +4880,7 @@ int ls_cache_write(struct ctx *ctx, struct bio *clone)
 				submit_bio(clone);
 				/* free e */		
 				kmem_cache_free(ctx->extent_cache, e);
+				free_zone_lock(ctx, lzonenr);
 				break;
 			} 
 			else {
@@ -4837,20 +4899,11 @@ int ls_cache_write(struct ctx *ctx, struct bio *clone)
 				/* free e */		
 				kmem_cache_free(ctx->extent_cache, e);
 				/* search for the next e - dont jump to lswrite */
+				free_zone_lock(ctx, lzonenr);
 				continue;
 			}
 		}
-		if (ctx->nr_free_cache_zones <= ctx->middle_watermark) {
-			ctx->gc_th->gc_wake = 1;
-			wake_up(&ctx->gc_th->lsdm_gc_wait_queue);
-			DEFINE_WAIT(wait);
-			prepare_to_wait(&ctx->gc_th->fggc_wq, &wait,
-						TASK_UNINTERRUPTIBLE);
-			/* setting gc_wake=1 and the next wakeup will trigger lsdm_gc(ctx, FG_GC, 0) by waking up a sleeping gc thread */
-			io_schedule();
-			finish_wait(&ctx->gc_th->fggc_wq, &wait);
-			//printk(KERN_ERR "\n %s %d woken up lba: %llu, nrsectors: %d ", __func__,  __LINE__, lba, nr_sectors);
-		}
+skip_overwrite:
 		clone->bi_private = bioctx;
 		ls_write(ctx, clone);
 		break;
@@ -5511,6 +5564,18 @@ int remove_zone_from_cost_node(struct ctx *ctx, struct gc_cost_node *cost_node, 
 	return 0;
 }
 
+
+void free_cached_dzone_list(struct ctx *ctx)
+{
+	struct cached_dzone_info *temp, *next;
+
+	list_for_each_entry_safe(temp, next, &ctx->cached_dzones, list) {
+		list_del(&temp->list);
+		kmem_cache_free(ctx->cached_dzones_cache, temp);
+	}
+	return;
+}
+
 void insert_to_cached_dzone_list(struct ctx *ctx, struct cached_dzone_info *new)
 {
 	struct cached_dzone_info *temp;
@@ -5529,7 +5594,7 @@ void insert_to_cached_dzone_list(struct ctx *ctx, struct cached_dzone_info *new)
 	return;
 }
 
-void cached_data_zone_incr(struct ctx *ctx, sector_t lba)
+void cached_data_zone_incr_cblocks(struct ctx *ctx, sector_t lba)
 {
 	struct rb_root *root = &ctx->cached_dzones_rb_root;
 	struct rb_node **link = &root->rb_node, *parent = NULL;
@@ -5558,6 +5623,8 @@ void cached_data_zone_incr(struct ctx *ctx, sector_t lba)
 	}
 	znew->czonenr = dzonenr;
 	atomic_set(&znew->vblks, 1);
+	atomic_set(&znew->inflight_writes, 1);
+	znew->gc_flag = NO_GC;
 	znew->mtime = get_elapsed_time(ctx);
 	INIT_LIST_HEAD(&znew->list);
 	insert_to_cached_dzone_list(ctx, znew);
@@ -5572,7 +5639,7 @@ void cached_data_zone_incr(struct ctx *ctx, sector_t lba)
 	return;
 }
 
-void cached_data_zone_decr(struct ctx *ctx, sector_t lba)
+void cached_data_zone_decr_cblocks(struct ctx *ctx, sector_t lba)
 {
 	struct rb_root *root = &ctx->cached_dzones_rb_root;
 	struct rb_node **link = &root->rb_node, *parent = NULL;
@@ -5602,6 +5669,74 @@ void cached_data_zone_decr(struct ctx *ctx, sector_t lba)
 	/* You should not be here */
 	printk(KERN_ERR "\n Trying to delete a cached data zone that is missing!! ");
 	return;
+}
+
+
+void cached_data_zone_incr_writes(struct ctx *ctx, sector_t lba)
+{
+	struct rb_root *root = &ctx->cached_dzones_rb_root;
+	struct rb_node **link = &root->rb_node, *parent = NULL;
+	unsigned int dzonenr = lba / ctx->nr_lbas_in_zone;
+	struct cached_dzone_info *e = NULL;
+	while (*link) {
+		parent = *link;
+		e = container_of(parent, struct cached_dzone_info, rb);
+		if (e->czonenr == dzonenr) {
+			atomic_inc(&e->inflight_writes);
+			return;
+		}
+		if (e->czonenr < dzonenr) {
+			link = &(*link)->rb_right;
+		} else {
+			link = &(*link)->rb_left;
+		}
+	}
+	/* if the data zone is not found in the cache, that is okay, we ignore it */
+	return;
+}
+
+void cached_data_zone_decr_writes(struct ctx *ctx, sector_t lba)
+{
+	struct rb_root *root = &ctx->cached_dzones_rb_root;
+	struct rb_node **link = &root->rb_node, *parent = NULL;
+	unsigned int dzonenr = lba / ctx->nr_lbas_in_zone;
+	struct cached_dzone_info *e = NULL;
+	while (*link) {
+		parent = *link;
+		e = container_of(parent, struct cached_dzone_info, rb);
+		if (e->czonenr == dzonenr) {
+			atomic_dec(&e->inflight_writes);
+			return;
+		}
+		if (e->czonenr < dzonenr) {
+			link = &(*link)->rb_right;
+		} else {
+			link = &(*link)->rb_left;
+		}
+	}
+	/* if the data zone is not found in the cache, that is okay, we ignore it */
+	return;
+}
+
+int cached_data_zone_gc_flag(struct ctx *ctx, int dzonenr)
+{
+	struct rb_root *root = &ctx->cached_dzones_rb_root;
+	struct rb_node **link = &root->rb_node, *parent = NULL;
+	struct cached_dzone_info *e = NULL;
+	while (*link) {
+		parent = *link;
+		e = container_of(parent, struct cached_dzone_info, rb);
+		if (e->czonenr == dzonenr) {
+			return e->gc_flag;
+		}
+		if (e->czonenr < dzonenr) {
+			link = &(*link)->rb_right;
+		} else {
+			link = &(*link)->rb_left;
+		}
+	}
+	BUG();
+	return 0;
 }
 
 /*
@@ -6157,6 +6292,7 @@ err:
 
 void destroy_caches(struct ctx *ctx)
 {
+	kmem_cache_destroy(ctx->cached_dzones_cache);
 	kmem_cache_destroy(ctx->zones_in_cseg_cache);
 	kmem_cache_destroy(ctx->bio_cache);
 	kmem_cache_destroy(ctx->extent_cache);
@@ -6541,6 +6677,7 @@ static void hybrid_stl_dtr(struct dm_target *dm_target)
 	printk(KERN_ERR "\n gc cleaning time average: %llu", ctx->gc_average);
 	printk(KERN_ERR "\n gc total nr of data zones evicted: %d", ctx->gc_count);
 	printk(KERN_ERR "\n gc total time spent cleaning: %llu", ctx->gc_total);
+	free_cached_dzone_list(ctx);
 	destroy_caches(ctx);
 	dm_put_device(dm_target, ctx->dev);
 	kfree(ctx);
