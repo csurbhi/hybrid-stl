@@ -395,7 +395,7 @@ struct gc_zone_node {
 
 struct cached_dzone_info {
 	int czonenr;
-	int vblks;
+	atomic_t vblks;
 	time64_t mtime;
 	struct rb_node rb;  	/* we add this on the cached data zones tree */
 	struct list_head list; /* we add this node to the list maintained on cached_dzones */
