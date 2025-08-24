@@ -2526,6 +2526,8 @@ int handle_full_overlap(struct ctx *ctx, struct bio *clone, sector_t nr_sectors,
 	struct bio *split, *bio;
 	BUG_ON(pba > ctx->sb->max_pba);
 
+	print = 0;
+
 	bio = read_ctx->bio;
 	if (print) {
 		//printk(KERN_ERR "\n %s lba: %llu pba: %llu len: %llu \n", __func__, clone->bi_iter.bi_sector, pba, nr_sectors);
@@ -5601,14 +5603,15 @@ int read_seg_entries_from_block(struct ctx *ctx, struct lsdm_seg_entry *entry, u
 	int i = 0;
 	struct lsdm_sb *sb;
 	unsigned int nr_blks_in_zone;
+	unsigned hot_frontier = get_czone_nr(ctx, ctx->ckpt->hot_frontier_pba);
        
 	sb = ctx->sb;
 	nr_blks_in_zone = (1 << (sb->log_zone_size - sb->log_block_size));
-	//printk("\n Number of seg entries: %u", nr_seg_entries);
+	printk("\n Number of seg entries: %u, hot_frontier: %d, zonenr: %d", nr_seg_entries, hot_frontier, *zonenr);
 
 	while (i < nr_seg_entries) {
 		/* 0th zonenr is the zone that holds all the metadata */
-		if (*zonenr == get_czone_nr(ctx, ctx->ckpt->hot_frontier_pba)) {
+		if (*zonenr == hot_frontier) {
 			/* 1 indicates zone is free, 0 is the default bit because of kzalloc */
 			printk(KERN_ERR "\n zonenr: %d vblocks: %u is our cur_frontier! not marking it free!", *zonenr, entry->vblocks);
 			entry = entry + 1;
@@ -5653,7 +5656,7 @@ int read_seg_info_table(struct ctx *ctx)
 	struct lsdm_seg_entry *entry0;
 	unsigned int zonenr = 0;
 	struct lsdm_sb *sb;
-	unsigned long nr_data_zones;
+	unsigned long nr_cache_zones;
 	unsigned long nr_seg_entries_read;
 	struct page * sit_page;
 	
@@ -5661,10 +5664,10 @@ int read_seg_info_table(struct ctx *ctx)
 		return -1;
 
 	sb = ctx->sb;
-	nr_data_zones = sb->zone_count_cache; /* these are the number of segment entries to read */
+	nr_cache_zones = sb->zone_count_cache; /* these are the number of segment entries to read */
 	nr_seg_entries_read = 0;
 	
-	printk(KERN_ERR "\n nr_cache_zones: %lu", nr_data_zones);
+	printk(KERN_ERR "\n nr_cache_zones: %lu", nr_cache_zones);
 	ctx->free_czone_bitmap = allocate_freebitmap(ctx, ctx->czone_bitmap_bytes);
 	printk(KERN_INFO "\n Allocated free cache bitmap, ret: %d", ret);
 	if (!ctx->free_czone_bitmap)
@@ -5681,7 +5684,7 @@ int read_seg_info_table(struct ctx *ctx)
 	printk(KERN_ERR "\n get_czone_nr(ctx, ctx->ckpt->hot_frontier_pba): %u", get_czone_nr(ctx, ctx->ckpt->hot_frontier_pba));
 	printk(KERN_ERR "\n %s Read seginfo from pba: %llu sectornr: %d zone0_pba: %llu \n", __func__, sb->sit_pba, sectornr, ctx->sb->czone0_pba);
 	printk("\n ctx->hot_frontier_pba: %llu, ckpt->frontier zone: %u", ctx->ckpt->hot_frontier_pba, get_czone_nr(ctx, ctx->ckpt->hot_frontier_pba));
-	while (nr_data_zones > 0) {
+	while (nr_cache_zones > 0) {
 		//trace_printk("\n zonenr: %u", zonenr);
 		if ((sectornr + sb->sit_pba) > ctx->sb->czone0_pba) {
 			printk(KERN_ERR "\n Seg entry blknr cannot be bigger than the data blknr");
@@ -5694,16 +5697,16 @@ int read_seg_info_table(struct ctx *ctx)
 			return -1;
 		}
 		entry0 = (struct lsdm_seg_entry *) page_address(sit_page);
-		if (nr_data_zones > nr_seg_entries_blk) {
+		if (nr_cache_zones > nr_seg_entries_blk) {
 			nr_seg_entries_read = nr_seg_entries_blk;
 		}
 		else {
-			nr_seg_entries_read = nr_data_zones;
-			printk(KERN_ERR "\n Usual segentries: %d, (now) last blk has: %lu \n", nr_seg_entries_blk, nr_data_zones);
+			nr_seg_entries_read = nr_cache_zones;
+			printk(KERN_ERR "\n Usual segentries: %d, (now) last blk has: %lu \n", nr_seg_entries_blk, nr_cache_zones);
 		}
-		nr_data_zones = nr_data_zones - nr_seg_entries_read;
+		nr_cache_zones = nr_cache_zones - nr_seg_entries_read;
 		ret = read_seg_entries_from_block(ctx, entry0, nr_seg_entries_read, &zonenr);
-		add_sit_page_kv_store_by_blknr(ctx, sit_page, sectornr);
+		//add_sit_page_kv_store_by_blknr(ctx, sit_page, sectornr);
 		//printk(KERN_ERR "\n %s nrpages: %llu", __func__, nrpages);
 		//sectornr = sectornr + (ctx->q->limits.physical_block_size/ctx->q->limits.logical_block_size);
 		sectornr = sectornr + NR_SECTORS_IN_BLK;
@@ -5763,8 +5766,7 @@ int read_dzone_info_table(struct ctx * ctx)
 	nr_remaining_entries = ctx->sb->zone_count_data;
 	entries = nr_dzit_entries_in_blk;
 
-	printk(KERN_ERR "\n %s nr_remaining_entries: %d entries: %d nr_dzit_entries_in_blk: %d dzit_pba: %llu", __func__, nr_remaining_entries, entries, nr_dzit_entries_in_blk, pba);
-
+	printk(KERN_ERR "\n %s nr_remaining_entries: %d entries: %d nr_dzit_entries_in_blk: %d dzit_pba: %llu \n", __func__, nr_remaining_entries, entries, nr_dzit_entries_in_blk, pba);
 	while(nr_remaining_entries > 0) {
 		if (nr_remaining_entries < nr_dzit_entries_in_blk) {
 			entries = nr_remaining_entries;
@@ -5784,7 +5786,7 @@ int read_dzone_info_table(struct ctx * ctx)
 			if (pzonenr < ctx->sb->zone_count) {
 				mark_zone_occupied(ctx, pzonenr, ctx->free_dzone_bitmap, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit, &ctx->nr_free_data_zones);
 				nr_valid_blks = (szi[i].wp - get_first_pba_for_dzone(ctx, i)) / NR_SECTORS_IN_BLK;
-				//printk(KERN_ERR "\n %s pzonenr: %d nr_valid_blks: %d ", __func__, szi[i].pzonenr, nr_valid_blks);
+				printk(KERN_ERR "\n %s pzonenr: %d nr_valid_blks: %d ", __func__, szi[i].pzonenr, nr_valid_blks);
 			}
 			dzi_entry = dzi_entry + 1;
 		}
@@ -5915,7 +5917,6 @@ int read_metadata(struct ctx * ctx)
 	printk(KERN_ERR "\n %s %d ctx->hot_wf_pba: %llu\n", __func__, __LINE__, ctx->hot_wf_pba);
 	printk(KERN_ERR "\n %s %d kernel wf end: %llu\n", __func__, __LINE__, ctx->hot_wf_end);
 	printk(KERN_ERR "\n max_pba = %llu", ctx->max_pba);
-
 	ret = read_rev_translation_map(ctx);
 	if (0 > ret) {
 		__free_pages(ctx->sb_page, 0);
