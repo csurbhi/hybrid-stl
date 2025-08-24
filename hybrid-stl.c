@@ -161,7 +161,7 @@ int read_rev_translation_map(struct ctx *);
 int read_extents_from_block(struct ctx * ctx, struct rev_tm_entry *entry, u64 lba);
 void lsdm_ioidle(struct mykref *kref);
 static int get_next_freezone_nr(struct ctx *ctx, char *bitmap, u32 bitmap_byte, u32 bitmap_bit, uint * nrfreezones);
-static int free_data_zone_list(struct ctx *ctx);
+//static int free_data_zone_list(struct ctx *ctx);
 static int gc_thread_fn(void * data);
 static int zero_fill_clone(struct bio *clone);
 static int hybrid_stl_read_io(struct ctx *ctx, struct bio *bio);
@@ -1394,16 +1394,38 @@ static int select_data_zone_to_clean(struct ctx *ctx, int heuristic, const char 
 			return node->czonenr;
 		}
 	} else if (heuristic == DZONE_COST_BENEFIT) {
-		int max_cost = INT_MIN, max_dzone = -1;
-		int cost;
+		int max_cost = INT_MIN;
+		int cost, vblks = 0;
+		struct cached_dzone_info *opt_node = NULL;
+
+again:
 		list_for_each_entry(node, &ctx->cached_dzones, list) {
 			/* oldest age will be 100 */
-			cost = get_dzone_cb_cost(ctx, atomic_read(&node->vblks), node->mtime);
+			vblks = atomic_read(&node->vblks);
+			if (!vblks)
+				continue;
+			cost = get_dzone_cb_cost(ctx, vblks, node->mtime);
 			if (cost > max_cost) {
-				max_dzone = node->czonenr;
+				max_cost = cost;
+				opt_node = node;
 			}
 		}
-		return max_dzone;
+		if (!opt_node) {
+			return -1;
+		}
+		lzonenr = opt_node->czonenr;
+		/* Prevents any further overwrites, otherwise these can be lost as GC is unaware*/
+		get_zone_lock(ctx, lzonenr);
+		opt_node->gc_flag = ONGOING_GC;
+		free_zone_lock(ctx, lzonenr);
+		/* flush all writes to the disk */
+		//io_schedule();
+		vblks = atomic_read(&opt_node->vblks);
+		if (!vblks) {
+			goto again;
+		}
+		printk(KERN_ERR "\n %s zone: %d has %d blks in cache, cost: %d, caller: %s ", __func__, opt_node->czonenr, vblks, max_cost, func);
+		return lzonenr;
 	}
 	/* TODO: Mode: BG_GC, Calculate the age of all the nodes now. We have only 29K nodes. We can also use only the nodes calculated in the last run*/
 	return -1;
@@ -1864,7 +1886,7 @@ static int write_valid_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 	}
 	szi->pzonenr = pzonenr;
 	szi->wp = wp;
-	trace_printk("\n #GC extents written to disk: %d logical zonenr: %d, new physical zone: %d", count, lzonenr, pzonenr);
+	printk(KERN_ERR "\n #GC extents written to disk: %d logical zonenr: %d, new physical zone: %d", count, lzonenr, pzonenr);
 	return 0;
 }
 
@@ -1941,6 +1963,7 @@ static int free_gc_extents(struct ctx *ctx)
 	return 0;
 }
 
+/*
 static int free_data_zone_list(struct ctx *ctx)
 {
 	struct cseg_zone_node *cseg_znode, *next_ptr;
@@ -1951,6 +1974,7 @@ static int free_data_zone_list(struct ctx *ctx)
 	}
 	return 0;
 }
+*/
 
 int verify_gc_zone(struct ctx *ctx, int zonenr, sector_t pba)
 {
@@ -2216,7 +2240,7 @@ int evict_cache_data(struct ctx *ctx, int gc_mode, int err_flag)
 {
 	int dzonenr;
 	int cacheblks = 0;
-	u32 lzonenr, zones_cleaned = 0;
+	u32 zones_cleaned = 0;
 	struct lsdm_gc_thread *gc_th = ctx->gc_th;
 	u64 start_t, end_t, interval = 0;
 	int len = 0;
@@ -2246,7 +2270,10 @@ again:
 	}
 	while(1) {
 		//dzonenr = select_data_zone_to_clean(ctx, DZONE_GREEDY, __func__);
+		start_t = ktime_get_ns();
 		dzonenr = select_data_zone_to_clean(ctx, DZONE_COST_BENEFIT, __func__);
+		end_t = ktime_get_ns();
+		interval = (end_t - start_t) / 1000000;
 		if (dzonenr < 0) {
 			printk(KERN_ERR "\n No data zone found for eviction!! \n");
 			mutex_unlock(&ctx->gc_lock);
@@ -2258,45 +2285,47 @@ again:
 		}
 
 		//down_write(&ctx->wf_lock);
-		trace_printk("\n Merging data zonenr zonenr: %d ", dzonenr);
+		printk(KERN_ERR "\n Merging data zonenr zonenr: %d (#selection time: %llu milliseconds)", dzonenr, interval);
 		get_zone_lock(ctx, dzonenr);
 		down_write(&ctx->lsdm_rb_lock);
 		start_t = ktime_get_ns();
 		/* Collect all the extents - either from the cache zone or the data zone, a block can only exist in either of them */
 		cacheblks = create_gc_extents(ctx, dzonenr);
-		if (list_empty(&ctx->gc_extents->list)) {
+		if (!cacheblks) {
+			//list_empty(&ctx->gc_extents->list) {
+			free_gc_extents(ctx);
 			up_write(&ctx->lsdm_rb_lock);
-			free_zone_lock(ctx, lzonenr);
-			trace_printk("\n lzonenr is empty: %d ", lzonenr);
+			free_zone_lock(ctx, dzonenr);
+			trace_printk("\n dzonenr no longer has cache blks: %d ", dzonenr);
 			continue;
 		}
-		//printk(KERN_ERR "\n Created GC extents, about to read them \n");
+		printk(KERN_ERR "\n Created GC extents, about to read them \n");
 		if (kthread_should_stop()) {
 			trace_printk("\n GC kthread needs to stop ");
 			up_write(&ctx->lsdm_rb_lock);
-			free_zone_lock(ctx, lzonenr);
+			free_zone_lock(ctx, dzonenr);
 			goto stop;
 		}
 		len = read_gc_extents(ctx);
 		if (kthread_should_stop()) {
 			trace_printk("\n GC kthread needs to stop - after reading extents");
 			up_write(&ctx->lsdm_rb_lock);
-			free_zone_lock(ctx, lzonenr);
+			free_zone_lock(ctx, dzonenr);
 			goto stop;
 		}
 		//wake_up_nr(&ctx->gc_th->fggc_wq, 1);
-		//printk(KERN_ERR "\n GC extents read, about to write them to a new zone ");
+		printk(KERN_ERR "\n GC extents read, about to write them to a new zone ");
 		if (write_valid_gc_extents(ctx, dzonenr)) {
-			trace_printk("\n Could not merge (aka write) data zone %d ", lzonenr);
+			printk(KERN_ERR "\n Could not merge (aka write) data zone %d ", dzonenr);
 			up_write(&ctx->lsdm_rb_lock);
 			free_zone_lock(ctx, dzonenr);
 			goto stop;
 		}
 		up_write(&ctx->lsdm_rb_lock);
+		free_zone_lock(ctx, dzonenr);
 		end_t = ktime_get_ns();
 		interval = (end_t - start_t) / 1000000;
-		free_zone_lock(ctx, dzonenr);
-		trace_printk("\n Data zone: %u merged in %llu milliseconds, #freed: %d from cache", lzonenr, interval, cacheblks);
+		printk(KERN_ERR "\n Data zone: %u merged in %llu milliseconds, #freed: %d from cache, #cleaned: %d", dzonenr, interval, cacheblks, zones_cleaned);
 		free_gc_extents(ctx);
 		wake_up_nr(&ctx->gc_th->fggc_wq, cacheblks);
 		zones_cleaned++;
@@ -2310,11 +2339,11 @@ again:
 	if ((gc_mode == FG_GC) && (ctx->nr_free_cache_zones <= ctx->middle_watermark)) {
 		goto again;
 	}
+	mutex_unlock(&ctx->gc_lock);
 	if (gc_th->gc_wake) {
                 gc_th->gc_wake = 0;
 		wake_up_all(&ctx->gc_th->fggc_wq);
 	}
-	mutex_unlock(&ctx->gc_lock);
 	return zones_cleaned;
 stop:
 	trace_printk("\n Stopping GC thread ! \n");
@@ -2325,7 +2354,7 @@ stop:
 	//up_write(&ctx->wf_lock);
 	mutex_unlock(&ctx->gc_lock);
 	free_gc_extents(ctx);
-	free_data_zone_list(ctx);
+	//free_data_zone_list(ctx);
 	return zones_cleaned;
 }
 
@@ -3283,7 +3312,7 @@ int get_new_cache_zone(struct ctx *ctx)
 try_again:
 	zone_nr = get_next_freezone_nr(ctx, ctx->free_czone_bitmap, ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit, &ctx->nr_free_cache_zones);
 	if (zone_nr < 0) {
-		printk(KERN_ERR "\n Could not find a clean cache zone for writing. Calling lsdm_gc \n");
+		printk(KERN_ERR "\n ********** Could not find a clean cache zone for writing. Calling lsdm_gc \n");
 		printk(KERN_ERR "\n 1. ctx->nr_free_cache_zones: %d, ctx->middle_watermark: %d. Starting GC.....\n", ctx->nr_free_cache_zones, ctx->middle_watermark);
 		ctx->gc_th->gc_wake = 1;
 		wake_up(&ctx->gc_th->lsdm_gc_wait_queue);
@@ -3293,11 +3322,14 @@ try_again:
 		/* setting gc_wake=1 and the next wakeup will trigger lsdm_gc(ctx, FG_GC, 0) by waking up a sleeping gc thread */
 		io_schedule();
 		finish_wait(&ctx->gc_th->fggc_wq, &wait);
+		printk(KERN_ERR "\n *********************** Woken up %s by FG eviction !! \n", __func__);
 		if (0 == trial) {
 			trial++;
 			goto try_again;
 		}
-		printk(KERN_INFO "No more disk space available for writing!");
+		printk(KERN_ERR "\n ********************************************\n");
+		printk(KERN_ERR "\n No more disk space available for writing! \n");
+		printk(KERN_ERR "\n ********************************************\n");
 		mark_disk_full(ctx);
 		ctx->hot_wf_pba = 0;
 		return -1;
@@ -3756,7 +3788,7 @@ void sit_ent_vblocks_decr(struct ctx *ctx, sector_t pba)
 			ctx->max_mtime = ptr->mtime;
 		update_gc_tree(ctx, zonenr, ptr->vblocks, ptr->mtime, __func__);
 		if (!ptr->vblocks) {
-			printk(KERN_ERR "\n %s Freeing zone: %llu \n", __func__, zonenr);
+			printk(KERN_ERR "\n %s Freeing cache zone: %llu \n", __func__, zonenr);
 			mark_zone_free(ctx, zonenr, ctx->free_czone_bitmap, ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit, &ctx->nr_free_cache_zones, 0);
 		}
 	}
@@ -4775,6 +4807,7 @@ fail:
 	return NULL;
 }
 
+/* cache write in a log structured manner */
 int ls_write(struct ctx *ctx, struct bio *clone)
 {
 	unsigned nr_sectors = bio_sectors(clone);
@@ -4800,7 +4833,7 @@ int ls_write(struct ctx *ctx, struct bio *clone)
 		/* setting gc_wake=1 and the next wakeup will trigger lsdm_gc(ctx, FG_GC, 0) by waking up a sleeping gc thread */
 		io_schedule();
 		finish_wait(&ctx->gc_th->fggc_wq, &wait);
-			//printk(KERN_ERR "\n %s %d woken up lba: %llu, nrsectors: %d ", __func__,  __LINE__, lba, nr_sectors);
+		printk(KERN_ERR "\n %s %d woken up lba: %llu, nrsectors: %d ", __func__,  __LINE__, lba, nr_sectors);
 	}
 
 	do {
@@ -4903,7 +4936,6 @@ int ls_cache_write(struct ctx *ctx, struct bio *clone)
 				 * So we go to the top again, and we free e here.
 				 */
 				kmem_cache_free(ctx->extent_cache, e);
-				free_zone_lock(ctx, lzonenr);
 				ls_write(ctx, split);
 				continue;
 			}
@@ -5240,6 +5272,7 @@ struct lsdm_ckpt * get_cur_checkpoint(struct ctx *ctx)
 	ctx->nr_invalid_zones = ckpt->nr_invalid_zones;
 	ctx->hot_wf_pba = ckpt->hot_frontier_pba;
 	ctx->elapsed_time = ckpt->elapsed_time;
+	printk(KERN_ERR "\n Elapsed time: %llu \n", ctx->elapsed_time);
 	/* TODO: Do recovery if necessary */
 	//do_recovery(ckpt);
 	return ckpt;
@@ -5658,6 +5691,12 @@ void cached_data_zone_incr_cblocks(struct ctx *ctx, sector_t lba)
 			list_del_init(&e->list);
 			atomic_inc(&e->vblks);
 			e->mtime = get_elapsed_time(ctx);
+			if (ctx->min_mtime > e->mtime) {
+				ctx->min_mtime = e->mtime;
+			}
+			if (ctx->max_mtime < e->mtime) {
+				ctx->max_mtime = e->mtime;
+			}
 			insert_to_cached_dzone_list(ctx, e);
 			return;
 		}

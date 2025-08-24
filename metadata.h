@@ -43,6 +43,7 @@
 #define FREE_BLKS_WATERMARK 2560 /* 10 MB */
 #define SEG_GREEDY 1
 #define DZONE_GREEDY 2
+#define DZONE_COST_BENEFIT 3
 
 struct seq_zones_info {
 	u32 lzonenr;
