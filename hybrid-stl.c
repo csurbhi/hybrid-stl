@@ -1990,9 +1990,9 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 		}
 		add_extent_to_gclist(ctx, &temp);
 		lba = lba + overlap;
-		cacheblks = cacheblks + 1;
+		cacheblks = cacheblks + temp.len;
 	}
-	//printk(KERN_ERR "\n %s number of sectors from the data zone(%d): %d ", __func__, szi->pzonenr, count);
+	trace_printk("\n %s number of cacheblks from the data zone(%d): %d ", __func__, lzonenr, cacheblks);
 	//printk(KERN_ERR "\n Returning from : %s ", __func__);
 	return cacheblks;
 }
@@ -2027,7 +2027,7 @@ u64 get_wp(struct ctx *ctx, unsigned int zonenr)
  */
 int evict_cache_data(struct ctx *ctx, int gc_mode, int err_flag)
 {
-	int zonenr;
+	static int zonenr = 0;
 	u64 gc_count = 0;
 	int count, cacheblks = 0;
 	struct cseg_zone_node *zone_nodep, *next_zone_nodep;
@@ -2062,6 +2062,7 @@ again:
 	mutex_unlock(&ctx->gc_lock);
 	return (ret);
 	*/
+	/*
 	zonenr = select_zone_to_clean(ctx, gc_mode, __func__);
 	if (zonenr < 0) {
 		printk(KERN_ERR "\n No zone found for cleaning!! \n");
@@ -2074,7 +2075,11 @@ again:
 			printk(KERN_ERR "\n Cleaned cache zones, resuming writes!!");
 		return gc_count;
 	}
-
+	*/
+	zonenr = zonenr + 1;
+	if (zonenr == NR_CACHE_ZONES) {
+		zonenr = 0;
+	}
 	//down_write(&ctx->wf_lock);
 	cstart_t = ktime_get_ns();
 	count = create_dzone_list(ctx, zonenr);
@@ -2089,7 +2094,7 @@ again:
 			printk(KERN_ERR "\n Cleaned cache zones, resuming writes!!");
 		return gc_count;
 	}
-	printk(KERN_ERR "\n %s Cleaning cache zonenr: %d #valid blks: %d nr_data_zones: %d \n", __func__, zonenr, get_sit_ent_vblocks(ctx, zonenr), count);	
+	printk(KERN_ERR "\n %s (RR) Cleaning cache zonenr: %d #valid blks: %d nr_data_zones: %d \n", __func__, zonenr, get_sit_ent_vblocks(ctx, zonenr), count);	
 	int test_count = 0;
 	int len = 0;
 	list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
@@ -5786,7 +5791,7 @@ int read_dzone_info_table(struct ctx * ctx)
 			if (pzonenr < ctx->sb->zone_count) {
 				mark_zone_occupied(ctx, pzonenr, ctx->free_dzone_bitmap, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit, &ctx->nr_free_data_zones);
 				nr_valid_blks = (szi[i].wp - get_first_pba_for_dzone(ctx, i)) / NR_SECTORS_IN_BLK;
-				printk(KERN_ERR "\n %s pzonenr: %d nr_valid_blks: %d ", __func__, szi[i].pzonenr, nr_valid_blks);
+				//printk(KERN_ERR "\n %s pzonenr: %d nr_valid_blks: %d ", __func__, szi[i].pzonenr, nr_valid_blks);
 			}
 			dzi_entry = dzi_entry + 1;
 		}
