@@ -1992,7 +1992,7 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 		lba = lba + overlap;
 		cacheblks = cacheblks + temp.len;
 	}
-	trace_printk("\n %s number of cacheblks from the data zone(%d): %d ", __func__, lzonenr, cacheblks);
+	printk(KERN_ERR "\n %s number of cacheblks from the data zone(%d): %d ", __func__, lzonenr, cacheblks);
 	//printk(KERN_ERR "\n Returning from : %s ", __func__);
 	return cacheblks;
 }
@@ -2062,7 +2062,6 @@ again:
 	mutex_unlock(&ctx->gc_lock);
 	return (ret);
 	*/
-	/*
 	zonenr = select_zone_to_clean(ctx, gc_mode, __func__);
 	if (zonenr < 0) {
 		printk(KERN_ERR "\n No zone found for cleaning!! \n");
@@ -2075,11 +2074,11 @@ again:
 			printk(KERN_ERR "\n Cleaned cache zones, resuming writes!!");
 		return gc_count;
 	}
-	*/
+	/*
 	zonenr = zonenr + 1;
 	if (zonenr == NR_CACHE_ZONES) {
 		zonenr = 0;
-	}
+	}*/
 	//down_write(&ctx->wf_lock);
 	cstart_t = ktime_get_ns();
 	count = create_dzone_list(ctx, zonenr);
