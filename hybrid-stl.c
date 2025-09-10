@@ -65,7 +65,7 @@ int lsdm_flush_thread_stop(struct ctx *ctx);
 void read_gcextent_done(struct bio * bio);
 int verify_gc_zone(struct ctx *ctx, int zonenr, sector_t pba);
 void print_memory_usage(struct ctx *ctx, const char *action);
-int create_gc_extents(struct ctx *ctx, unsigned int lzonenr);
+int create_gc_extents(struct ctx *ctx, unsigned int lzonenr, unsigned int czonenr);
 void print_sub_extents(struct rb_node *parent);
 int lsdm_gc_thread_start(struct ctx *ctx);
 int lsdm_gc_thread_stop(struct ctx *ctx);
@@ -1891,7 +1891,7 @@ int create_dzone_list(struct ctx *ctx, unsigned int zonenr)
 }
 
 
-int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
+int create_gc_extents(struct ctx *ctx, unsigned int lzonenr, unsigned int czonenr)
 {
 	sector_t diff;
 	struct extent *e = NULL;
@@ -1902,6 +1902,9 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 	struct lsdm_sb * sb = ctx->sb;
 	unsigned int pzonenr;
 	int cacheblks = 0;
+	sector_t first_czone_pba, last_czone_pba;
+	int czone_blks = 0;
+
 
 	/* TODO: ensure wp belongs to the same pzonenr */
 	if (szi->pzonenr < sb->zone_count) {
@@ -1914,6 +1917,8 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 		BUG_ON(szi->wp > get_last_pba_for_dzone(ctx, pzonenr));
 		*/
 	}
+	first_czone_pba = get_first_pba_for_czone(ctx, czonenr);
+	last_czone_pba = get_last_pba_for_czone(ctx, czonenr);
 	lba = lzonenr * ctx->nr_lbas_in_zone;
 	last_lba = lba + ctx->nr_lbas_in_zone;
 
@@ -1947,6 +1952,7 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 			}
 			break;
 		}
+		
 		/* Case of Overlap, e always overlaps with (lba - last_lba) address range,
 		 * higher e returned. The above if ensures that e->lba < last_lba
 		 */
@@ -1991,9 +1997,22 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 		add_extent_to_gclist(ctx, &temp);
 		lba = lba + overlap;
 		cacheblks = cacheblks + temp.len;
+
+		if ((temp.pba >= first_czone_pba) && (temp.pba <= last_czone_pba)) {
+			if (last_czone_pba >= (temp.pba + temp.len)) {
+				czone_blks = czone_blks + temp.len;
+			} else {
+				czone_blks = czone_blks + last_czone_pba - temp.pba;
+			}
+		}
 	}
-	trace_printk("\n %s number of cacheblks from the data zone(%d): %d ", __func__, lzonenr, cacheblks);
+	/* for 1MB tests we divide by as many sectors as are in a 1MB block */
+	czone_blks = czone_blks / 2048;
+	cacheblks = cacheblks / 2048;
+	printk(KERN_ERR "\n %s czonenr: %d, dzonenr: %d, #blks in this cache zone: %d, #blks in cache: %d", __func__, czonenr, lzonenr, czone_blks, cacheblks);
+	//trace_printk("\n %s number of cacheblks from the data zone(%d): %d ", __func__, lzonenr, cacheblks);
 	//printk(KERN_ERR "\n Returning from : %s ", __func__);
+	//return czone_blks;
 	return cacheblks;
 }
 
@@ -2110,7 +2129,7 @@ again:
 		down_write(&ctx->lsdm_rb_lock);
 		start_t = ktime_get_ns();
 		/* Collect all the extents - either from the cache zone or the data zone, a block can only exist in either of them */
-		cacheblks = create_gc_extents(ctx, lzonenr);
+		cacheblks = create_gc_extents(ctx, lzonenr, zonenr);
 		if (list_empty(&ctx->gc_extents->list)) {
 			up_write(&ctx->lsdm_rb_lock);
 			free_zone_lock(ctx, lzonenr);
@@ -6237,8 +6256,17 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
 		goto destroy_gc_page_pool;
 	}
 
-	ctx->middle_watermark = 4;
-	ctx->lower_watermark = 1;
+	/*
+	 * 90/10 zipfs watermark is 54
+	 *
+	ctx->middle_watermark = 54;
+	ctx->lower_watermark = 54;
+	*/
+	
+	/* uniform random watermark is 88 (200 - 112)
+	 */
+	ctx->middle_watermark = 88;
+	ctx->lower_watermark = 88;
 	printk(KERN_ERR "\n Initializing gc_extents list, ctx->gc_extents_cache: %p ", ctx->gc_extents_cache);
 	ctx->gc_extents = kmem_cache_alloc(ctx->gc_extents_cache, GFP_KERNEL);
 	if (!ctx->gc_extents) {
