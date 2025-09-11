@@ -1366,14 +1366,14 @@ static int add_extent_to_gclist(struct ctx *ctx, struct extent_entry *e)
 	return count;
 }
 
-static int add_zone_to_gclist(struct ctx *ctx, unsigned int zonenr)
+static int add_zone_to_gclist(struct ctx *ctx, unsigned int zonenr, int len)
 {
 	struct cseg_zone_node *cseg_znode, *next_ptr;
 
 	BUG_ON(zonenr > ctx->sb->zone_count_data);
 	list_for_each_entry_safe(cseg_znode, next_ptr, &ctx->cseg_znodes->list, list) {
 		if (cseg_znode->lzonenr == zonenr) {
-			cseg_znode->dblks++;
+			cseg_znode->dblks = len;
 			return 0;
 		}
 	}
@@ -1385,7 +1385,7 @@ static int add_zone_to_gclist(struct ctx *ctx, unsigned int zonenr)
 		return -ENOMEM;
 	}
 	cseg_znode->lzonenr = zonenr;
-	cseg_znode->dblks = 1;
+	cseg_znode->dblks = len;
 	list_add_tail(&cseg_znode->list, &ctx->cseg_znodes->list);
 	return 1;
 }
@@ -1819,6 +1819,7 @@ int cmp_nr_dblks(void *priv, const struct list_head *a, const struct list_head *
         return (entry_a->dblks < entry_b->dblks);
 }
 
+int sort_dzones_on_cache_blks(struct ctx *ctx);
 
 int create_dzone_list(struct ctx *ctx, unsigned int zonenr)
 {
@@ -1892,18 +1893,91 @@ int create_dzone_list(struct ctx *ctx, unsigned int zonenr)
 		}
 		BUG_ON(!temp.len);
 		u32 zonenr = temp.lba / ctx->nr_lbas_in_zone;
-		ret = add_zone_to_gclist(ctx, zonenr);
+		ret = add_zone_to_gclist(ctx, zonenr, 0);
 		if (ret < 0) {
 			return -ENOMEM;
 		}
 		count = count + ret;
 		pba = temp.pba + temp.len;
 	}
-	/* Now let us sort this list based on the data blocks in each of these dzones */
-	list_sort(NULL, &ctx->cseg_znodes->list, cmp_nr_dblks);
+	sort_dzones_on_cache_blks(ctx);
 	printk(KERN_ERR "\n Number of data zones in this cache zone: %d  is: %d", zonenr, count);
 	return count;
 }
+
+int sort_dzones_on_cache_blks(struct ctx *ctx)
+{
+	sector_t diff;
+	struct extent *e = NULL;
+	struct extent_entry temp;
+	sector_t pba, lba, last_lba, zerolen, overlap;
+	int count = 0;
+	struct lsdm_sb * sb = ctx->sb;
+	unsigned int dzonenr = 0;
+	struct cseg_zone_node *zone_nodep, *next_zone_nodep;
+
+
+	list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
+		dzonenr = zone_nodep->lzonenr;
+		lba = dzonenr * ctx->nr_lbas_in_zone;
+		last_lba = lba + ctx->nr_lbas_in_zone;
+		//printk(KERN_ERR "\n %s() :: first lba: %llu, last lba: %llu", __func__, lba, last_lba);
+
+		//print_memory_usage(ctx, "Before GC");
+		/* Lookup this pba in the reverse table to find the
+		 * corresponding LBA. 
+		 * TODO: If the valid blocks are sequential, we need to keep
+		 * this segment as an open segment that can append data. We do
+		 * not need to perform GC on this segment.
+		 */
+		temp.pba = 0;
+		temp.lba = 0;
+		temp.len = 0;
+		while(lba < last_lba) {
+			e = _lsdm_rb_geq(&ctx->extent_tbl_root, lba, 0);
+			if ((e == NULL) || (e->lba >= last_lba)) {  /* this will never happen:  (e->lba + e->len) <= lba) */
+				break;
+			}
+			
+			/* Case of Overlap, e always overlaps with (lba - last_lba) address range,
+			 * higher e returned. The above if ensures that e->lba < last_lba
+			 */
+			if (e->lba > lba) {
+				/*               [eeeeeeeeeeee]
+				 *    (lba)
+				 */
+				zerolen = e->lba - lba;
+				// BUG_ON(e->lba >= last_lba);
+				lba = e->lba;
+				//BUG_ON(lba >= last_lba);
+				/* when we fall through to the next case, lba = e->lba */
+			}
+			/* (e->lba <= lba)
+			 *
+			 *		lba-----------last-lba
+			 *	eeeeeeeeeeeeeeeeee[eeeeeeeeeeeeeeeeeeeeeeee]
+			 *
+			 */
+			overlap = e->lba + e->len - lba;
+			diff = lba - e->lba;
+			temp.pba = e->pba + diff;
+			temp.lba = lba;
+			if (lba + overlap >= last_lba) {
+				temp.len =  last_lba - lba;
+				/* add this temp to the list */
+			} else {
+				temp.len = overlap;
+			}
+			lba = lba + overlap;
+			add_zone_to_gclist(ctx, dzonenr, temp.len);
+		}
+	}
+	/* Now let us sort this list based on the data blocks in each of these dzones */
+	list_sort(NULL, &ctx->cseg_znodes->list, cmp_nr_dblks);
+	return 0;
+}
+
+
 
 
 int create_gc_extents(struct ctx *ctx, unsigned int lzonenr, unsigned int czonenr)
