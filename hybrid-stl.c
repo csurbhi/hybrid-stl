@@ -1422,6 +1422,7 @@ static int add_zone_to_gclist(struct ctx *ctx, unsigned int zonenr)
 	BUG_ON(zonenr > ctx->sb->zone_count_data);
 	list_for_each_entry_safe(cseg_znode, next_ptr, &ctx->cseg_znodes->list, list) {
 		if (cseg_znode->lzonenr == zonenr) {
+			cseg_znode->dblks++;
 			return 0;
 		}
 	}
@@ -1433,6 +1434,7 @@ static int add_zone_to_gclist(struct ctx *ctx, unsigned int zonenr)
 		return -ENOMEM;
 	}
 	cseg_znode->lzonenr = zonenr;
+	cseg_znode->dblks = 1;
 	list_add_tail(&cseg_znode->list, &ctx->cseg_znodes->list);
 	return 1;
 }
@@ -1856,6 +1858,17 @@ void print_memory_usage(struct ctx *ctx, const char *action)
 	printk(KERN_ERR "\n %s : available memory: %lu mB", action, available);
 }
 
+/* compare the file_blk_nr in the entry */
+int cmp_nr_dblks(void *prev, const struct list_head *a, const struct list_head *b)
+{
+        struct cseg_zone_node * entry_a = container_of(a, struct cseg_zone_node, list);
+        struct cseg_zone_node * entry_b = container_of(b, struct cseg_zone_node, list);
+
+	/* we want the dzones with larger dblks to appear before */
+        return (entry_a->dblks < entry_b->dblks);
+}
+
+
 int create_dzone_list(struct ctx *ctx, unsigned int zonenr)
 {
 	sector_t diff;
@@ -1935,6 +1948,8 @@ int create_dzone_list(struct ctx *ctx, unsigned int zonenr)
 		count = count + ret;
 		pba = temp.pba + temp.len;
 	}
+	/* Now let us sort this list based on the data blocks in each of these dzones */
+	list_sort(NULL, &ctx->cseg_znodes->list, cmp_nr_dblks);
 	printk(KERN_ERR "\n Number of data zones in this cache zone: %d  is: %d", zonenr, count);
 	return count;
 }
@@ -6329,9 +6344,8 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
 		goto destroy_gc_page_pool;
 	}
 
-	ctx->middle_watermark = 4;
-	ctx->lower_watermark = 1;
-	printk(KERN_ERR "\n Initializing gc_extents list, ctx->gc_extents_cache: %p ", ctx->gc_extents_cache);
+	ctx->middle_watermark = 112;
+	printk(KERN_ERR "\n Initializing gc_extents list, ctx->gc_extents_cache: %p watermark: %d", ctx->gc_extents_cache, ctx->middle_watermark);
 	ctx->gc_extents = kmem_cache_alloc(ctx->gc_extents_cache, GFP_KERNEL);
 	if (!ctx->gc_extents) {
 		printk(KERN_ERR "\n Could not allocate gc_extent and hence could not initialized \n");
