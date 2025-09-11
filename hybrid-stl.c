@@ -65,7 +65,7 @@ int lsdm_flush_thread_stop(struct ctx *ctx);
 void read_gcextent_done(struct bio * bio);
 int verify_gc_zone(struct ctx *ctx, int zonenr, sector_t pba);
 void print_memory_usage(struct ctx *ctx, const char *action);
-int create_gc_extents(struct ctx *ctx, unsigned int lzonenr, unsigned int czonenr);
+int create_gc_extents(struct ctx *ctx, unsigned int lzonenr);
 void print_sub_extents(struct rb_node *parent);
 int lsdm_gc_thread_start(struct ctx *ctx);
 int lsdm_gc_thread_stop(struct ctx *ctx);
@@ -1267,7 +1267,7 @@ int get_cblocks_count(struct ctx *ctx, unsigned int lzonenr)
 
 
 
-int create_dzone_list(struct ctx *ctx, unsigned int zonenr);
+int create_dzone_list(struct ctx *ctx);
 #if 0
 static int traverse_gc_victim_tree(struct ctx *ctx)
 {
@@ -1373,7 +1373,7 @@ static int add_zone_to_gclist(struct ctx *ctx, unsigned int zonenr, int len)
 	BUG_ON(zonenr > ctx->sb->zone_count_data);
 	list_for_each_entry_safe(cseg_znode, next_ptr, &ctx->cseg_znodes->list, list) {
 		if (cseg_znode->lzonenr == zonenr) {
-			cseg_znode->dblks = len;
+			cseg_znode->dblks += len;
 			return 0;
 		}
 	}
@@ -1384,9 +1384,13 @@ static int add_zone_to_gclist(struct ctx *ctx, unsigned int zonenr, int len)
 		BUG();
 		return -ENOMEM;
 	}
+	INIT_LIST_HEAD(&cseg_znode->list);
 	cseg_znode->lzonenr = zonenr;
 	cseg_znode->dblks = len;
-	list_add_tail(&cseg_znode->list, &ctx->cseg_znodes->list);
+	if (!len) {
+		printk(KERN_ERR "\n Adding new zones to the cseg list - through sort function ");
+	}
+	list_add(&cseg_znode->list, &ctx->cseg_znodes->list);
 	return 1;
 }
 
@@ -1815,34 +1819,31 @@ int cmp_nr_dblks(void *priv, const struct list_head *a, const struct list_head *
         struct cseg_zone_node * entry_a = container_of(a, struct cseg_zone_node, list);
         struct cseg_zone_node * entry_b = container_of(b, struct cseg_zone_node, list);
 
-	/* we want the dzones with larger dblks to appear before */
+	/* negative logic: we want a to be before b */
         return (entry_a->dblks < entry_b->dblks);
 }
 
 int sort_dzones_on_cache_blks(struct ctx *ctx);
 
-int create_dzone_list(struct ctx *ctx, unsigned int zonenr)
+int create_dzone_list(struct ctx *ctx)
 {
 	sector_t diff;
 	struct extent *e = NULL, temp;
 	struct rev_extent *rev_e = NULL;
 	sector_t pba, last_pba; 
-	int count = 0, ret = 0;
+	int ret = 0;
+	struct cseg_zone_node *zone_nodep, *next_zone_nodep;
+	u32 dzonenr = 0;
+	int count = 0;
 
-	pba = get_first_pba_for_czone(ctx, zonenr);
-	last_pba = get_last_pba_for_czone(ctx, zonenr);
+	pba = get_first_pba_for_czone(ctx, 0);
+	/* We are not cleaning 200 zones */
+	last_pba = get_last_pba_for_czone(ctx, 112);
 	INIT_LIST_HEAD(&ctx->cseg_znodes->list);
 
-	//printk(KERN_ERR "\n %s zonenr: %u first_pba: %llu, last_pba: %llu", __func__, zonenr, pba, last_pba);
-
-	//print_memory_usage(ctx, "Before GC");
 	/* Lookup this pba in the reverse table to find the
 	 * corresponding LBA. 
-	 * TODO: If the valid blocks are sequential, we need to keep
-	 * this segment as an open segment that can append data. We do
-	 * not need to perform GC on this segment.
 	 */
-
 	while(pba <= last_pba) {
 		rev_e = lsdm_rb_revmap_find(ctx, pba, 0, last_pba, __func__);
 		//BUG_ON(NULL == rev_e);
@@ -1892,16 +1893,16 @@ int create_dzone_list(struct ctx *ctx, unsigned int zonenr)
 			//printk(KERN_ERR "\n %s Adjusted len: (lba: %llu, pba: %llu len: %ld) last_pba: %lld", __func__, temp.lba, temp.pba, temp.len, last_pba);
 		}
 		BUG_ON(!temp.len);
-		u32 zonenr = temp.lba / ctx->nr_lbas_in_zone;
-		ret = add_zone_to_gclist(ctx, zonenr, 0);
+		dzonenr = temp.lba / ctx->nr_lbas_in_zone;
+		ret = add_zone_to_gclist(ctx, dzonenr, 0);
 		if (ret < 0) {
 			return -ENOMEM;
 		}
-		count = count + ret;
 		pba = temp.pba + temp.len;
+		count = 1;
 	}
-	sort_dzones_on_cache_blks(ctx);
-	printk(KERN_ERR "\n Number of data zones in this cache zone: %d  is: %d", zonenr, count);
+	//sort_dzones_on_cache_blks(ctx);
+	/* we have already found all dzones and all their dblks in the entire cache while doing so */
 	return count;
 }
 
@@ -1915,6 +1916,7 @@ int sort_dzones_on_cache_blks(struct ctx *ctx)
 	struct lsdm_sb * sb = ctx->sb;
 	unsigned int dzonenr = 0;
 	struct cseg_zone_node *zone_nodep, *next_zone_nodep;
+	int zcount = 0;
 
 
 	list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
@@ -1968,26 +1970,31 @@ int sort_dzones_on_cache_blks(struct ctx *ctx)
 			} else {
 				temp.len = overlap;
 			}
-			lba = lba + overlap;
+			lba = lba + temp.len;
 			add_zone_to_gclist(ctx, dzonenr, temp.len);
 		}
 	}
 	/* Now let us sort this list based on the data blocks in each of these dzones */
 	list_sort(NULL, &ctx->cseg_znodes->list, cmp_nr_dblks);
+	zcount = 0;
+	list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
+		if (zone_nodep->dblks < next_zone_nodep->dblks) {
+			printk(KERN_ERR "\n List is not sorted ");
+			break;
+		}
+		zcount = zcount + 1;
+	}
+	printk(KERN_ERR "\n %s Number of data zones in the cache: %d ", __func__, count);
 	return 0;
 }
 
-
-
-
-int create_gc_extents(struct ctx *ctx, unsigned int lzonenr, unsigned int czonenr)
+int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 {
 	sector_t diff;
 	struct extent *e = NULL;
 	struct extent_entry temp;
 	sector_t pba, lba, last_lba, zerolen, overlap;
 	struct seq_zones_info *szi = &ctx->dzit[lzonenr];
-	int count = 0;
 	struct lsdm_sb * sb = ctx->sb;
 	unsigned int pzonenr;
 	int cacheblks = 0;
@@ -1998,16 +2005,7 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr, unsigned int czonen
 	/* TODO: ensure wp belongs to the same pzonenr */
 	if (szi->pzonenr < sb->zone_count) {
 		pzonenr = szi->pzonenr;
-		/*
-		pzonenr = get_dzone_nr(ctx, szi->wp);
-		if (pzonenr != szi->pzonenr) {
-			printk(KERN_ERR "\n %s pzonenr: %d, szi->pzonenr: %d, szi->wp: %llu", __func__, pzonenr, szi->pzonenr, szi->wp);
-		}
-		BUG_ON(szi->wp > get_last_pba_for_dzone(ctx, pzonenr));
-		*/
 	}
-	first_czone_pba = get_first_pba_for_czone(ctx, czonenr);
-	last_czone_pba = get_last_pba_for_czone(ctx, czonenr);
 	lba = lzonenr * ctx->nr_lbas_in_zone;
 	last_lba = lba + ctx->nr_lbas_in_zone;
 
@@ -2036,7 +2034,6 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr, unsigned int czonen
 					temp.lba = lba;
 					temp.len = szi->wp - pba;
 					add_extent_to_gclist(ctx, &temp);
-					count = count + temp.len;
 				}
 			}
 			break;
@@ -2060,7 +2057,6 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr, unsigned int czonen
 					if (zerolen > (szi->wp - pba))
 						temp.len = szi->wp - pba;
 					add_extent_to_gclist(ctx, &temp);
-					count = count + temp.len;
 				}
 			}
 			lba = e->lba;
@@ -2084,24 +2080,12 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr, unsigned int czonen
 			temp.len = overlap;
 		}
 		add_extent_to_gclist(ctx, &temp);
-		lba = lba + overlap;
+		lba = lba + temp.len;
 		cacheblks = cacheblks + temp.len;
-
-		if ((temp.pba >= first_czone_pba) && (temp.pba <= last_czone_pba)) {
-			if (last_czone_pba >= (temp.pba + temp.len)) {
-				czone_blks = czone_blks + temp.len;
-			} else {
-				czone_blks = czone_blks + last_czone_pba - temp.pba;
-			}
-		}
 	}
 	/* for 1MB tests we divide by as many sectors as are in a 1MB block */
-	czone_blks = czone_blks / 2048;
 	cacheblks = cacheblks / 2048;
-	printk(KERN_ERR "\n %s czonenr: %d, dzonenr: %d, #blks in this cache zone: %d, #blks in cache: %d", __func__, czonenr, lzonenr, czone_blks, cacheblks);
-	//trace_printk("\n %s number of cacheblks from the data zone(%d): %d ", __func__, lzonenr, cacheblks);
-	//printk(KERN_ERR "\n Returning from : %s ", __func__);
-	//return czone_blks;
+	printk(KERN_ERR "\n %s dzonenr: %d, #blks in cache: %d", __func__, lzonenr, cacheblks);
 	return cacheblks;
 }
 
@@ -2184,13 +2168,15 @@ again:
 		return gc_count;
 	}
 	*/
+	/*
 	zonenr = zonenr + 1;
-	if (zonenr == NR_CACHE_ZONES) {
+	if (zonenr == NR_CACHE_ZONES - ctx->middle_watermark) {
 		zonenr = 0;
-	}
+	}*/
+	zonenr = 0;
 	//down_write(&ctx->wf_lock);
 	cstart_t = ktime_get_ns();
-	count = create_dzone_list(ctx, zonenr);
+	count = create_dzone_list(ctx);
 	if (count <= 0) {
 		printk(KERN_ERR "\n No data zone found for merging!! \n");
 		mutex_unlock(&ctx->gc_lock);
@@ -2202,23 +2188,17 @@ again:
 			printk(KERN_ERR "\n Cleaned cache zones, resuming writes!!");
 		return gc_count;
 	}
-	printk(KERN_ERR "\n %s (RR) Cleaning cache zonenr: %d #valid blks: %d nr_data_zones: %d \n", __func__, zonenr, get_sit_ent_vblocks(ctx, zonenr), count);	
-	int test_count = 0;
 	int len = 0;
 	list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
 		lzonenr = zone_nodep->lzonenr;
-		//printk(KERN_ERR "\n Checking data zonenr zonenr: %d ", lzonenr);
-		test_count = test_count + 1;
-	}
-	BUG_ON(test_count != count);
-	list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
-		lzonenr = zone_nodep->lzonenr;
-		trace_printk("\n Merging data zonenr zonenr: %d ", lzonenr);
+		if (zone_nodep->dblks < next_zone_nodep->dblks) {
+			printk(KERN_ERR "\n DLL are not sorted!!!! :/ \n");
+		}
 		get_zone_lock(ctx, lzonenr);
 		down_write(&ctx->lsdm_rb_lock);
 		start_t = ktime_get_ns();
 		/* Collect all the extents - either from the cache zone or the data zone, a block can only exist in either of them */
-		cacheblks = create_gc_extents(ctx, lzonenr, zonenr);
+		cacheblks = create_gc_extents(ctx, lzonenr);
 		if (list_empty(&ctx->gc_extents->list)) {
 			up_write(&ctx->lsdm_rb_lock);
 			free_zone_lock(ctx, lzonenr);
@@ -2262,10 +2242,6 @@ again:
 	//up_write(&ctx->wf_lock);
 	free_data_zone_list(ctx);
 	//do_checkpoint(ctx);
-	zones_cleaned++;
-	cend_t = ktime_get_ns();
-	cinterval = (cend_t - cstart_t)/1000000;
-	printk(KERN_ERR "\n Cache zone: %u emptied, evicted %d datazones in %llu milliseconds", zonenr, test_count, cinterval);
 	if ((gc_mode == FG_GC) && (ctx->nr_free_cache_zones <= ctx->middle_watermark)) {
 		goto again;
 	}
