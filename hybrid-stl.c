@@ -65,7 +65,7 @@ int lsdm_flush_thread_stop(struct ctx *ctx);
 void read_gcextent_done(struct bio * bio);
 int verify_gc_zone(struct ctx *ctx, int zonenr, sector_t pba);
 void print_memory_usage(struct ctx *ctx, const char *action);
-int create_gc_extents(struct ctx *ctx, unsigned int lzonenr, unsigned int czonenr);
+int create_gc_extents(struct ctx *ctx, unsigned int lzonenr);
 void print_sub_extents(struct rb_node *parent);
 int lsdm_gc_thread_start(struct ctx *ctx);
 int lsdm_gc_thread_stop(struct ctx *ctx);
@@ -1208,13 +1208,19 @@ static int select_zone_to_clean(struct ctx *ctx, int mode, const char *func)
 		/* we are in greedy heuristic - we select a data zone with maximum number of data blocks
 		 * so that we can wake up maximum number of writers
 		 */
-		node = rb_last(&ctx->gc_cost_root);
+		node = rb_first(&ctx->gc_cost_root);
 		if (!node)
 			return -1;
 
 		cnode = rb_entry(node, struct gc_cost_node, rb);
+		while(!cnode->cost) {
+			node = rb_next(&cnode->rb);
+			if (!node)
+				return -1;
+			cnode = rb_entry(node, struct gc_cost_node, rb);
+		}
 		list_for_each_entry(znode, &cnode->znodes_list, list) {
-			printk(KERN_ERR "\n %s data zone: %d has %d blks in the cache, caller: %s", __func__, znode->zonenr, znode->vblks, func);
+			//printk(KERN_ERR "\n %s data zone: %d has %d blks in the cache, cost: %d caller: %s", __func__, znode->zonenr, znode->vblks, cnode->cost, func);
 			return znode->zonenr;
 		}
 
@@ -1892,7 +1898,7 @@ int create_dzone_list(struct ctx *ctx, unsigned int zonenr)
 }
 
 
-int create_gc_extents(struct ctx *ctx, unsigned int lzonenr, unsigned int czonenr)
+int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 {
 	sector_t diff;
 	struct extent *e = NULL;
@@ -1904,7 +1910,6 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr, unsigned int czonen
 	unsigned int pzonenr;
 	int cacheblks = 0;
 	sector_t first_czone_pba, last_czone_pba;
-	int czone_blks = 0;
 
 
 	/* TODO: ensure wp belongs to the same pzonenr */
@@ -1918,8 +1923,6 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr, unsigned int czonen
 		BUG_ON(szi->wp > get_last_pba_for_dzone(ctx, pzonenr));
 		*/
 	}
-	first_czone_pba = get_first_pba_for_czone(ctx, czonenr);
-	last_czone_pba = get_last_pba_for_czone(ctx, czonenr);
 	lba = lzonenr * ctx->nr_lbas_in_zone;
 	last_lba = lba + ctx->nr_lbas_in_zone;
 
@@ -1996,21 +1999,12 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr, unsigned int czonen
 			temp.len = overlap;
 		}
 		add_extent_to_gclist(ctx, &temp);
-		lba = lba + overlap;
+		lba = lba + temp.len;
 		cacheblks = cacheblks + temp.len;
-
-		if ((temp.pba >= first_czone_pba) && (temp.pba <= last_czone_pba)) {
-			if (last_czone_pba >= (temp.pba + temp.len)) {
-				czone_blks = czone_blks + temp.len;
-			} else {
-				czone_blks = czone_blks + last_czone_pba - temp.pba;
-			}
-		}
 	}
 	/* for 1MB tests we divide by as many sectors as are in a 1MB block */
-	czone_blks = czone_blks / 2048;
 	cacheblks = cacheblks / 2048;
-	printk(KERN_ERR "\n %s czonenr: %d, dzonenr: %d, #blks in this cache zone: %d, #blks in cache: %d", __func__, czonenr, lzonenr, czone_blks, cacheblks);
+	printk(KERN_ERR "\n %s dzonenr: %d, #1MB blks in cache: %d", __func__, lzonenr, cacheblks);
 	//trace_printk("\n %s number of cacheblks from the data zone(%d): %d ", __func__, lzonenr, cacheblks);
 	//printk(KERN_ERR "\n Returning from : %s ", __func__);
 	//return czone_blks;
@@ -2091,16 +2085,17 @@ again:
 	}
 	//down_write(&ctx->wf_lock);
 	cstart_t = ktime_get_ns();
-	printk(KERN_ERR "\n Merging data zonenr zonenr: %d \n", lzonenr);
+	//printk(KERN_ERR "\n Merging data zonenr zonenr: %d free_cache_zones: %d \n", lzonenr, ctx->nr_free_cache_zones);
 	get_zone_lock(ctx, lzonenr);
 	down_write(&ctx->lsdm_rb_lock);
 	start_t = ktime_get_ns();
 	/* Collect all the extents - either from the cache zone or the data zone, a block can only exist in either of them */
-	cacheblks = create_gc_extents(ctx, lzonenr, zonenr);
+	cacheblks = create_gc_extents(ctx, lzonenr);
 	if (list_empty(&ctx->gc_extents->list)) {
 		up_write(&ctx->lsdm_rb_lock);
 		free_zone_lock(ctx, lzonenr);
 		trace_printk("\n lzonenr is empty: %d ", lzonenr);
+		remove_zone_from_gc_tree(ctx, lzonenr);
 		goto again;
 	}
 	//printk(KERN_ERR "\n Created GC extents, about to read them \n");
@@ -3569,7 +3564,6 @@ void sit_ent_vblocks_decr(struct ctx *ctx, sector_t lba, sector_t pba)
 	ptr->mtime = get_elapsed_time(ctx);
 	if (ctx->max_mtime < ptr->mtime)
 		ctx->max_mtime = ptr->mtime;
-	update_gc_tree(ctx, dzonenr, 0, ptr->mtime, __func__);
 	/* Send the older vblocks, mtime along with the new vblocks,mtime to this
 	 * function. The older vblocks, mtime is used to calculated
 	 * the older cost which is stored in the tree. The newer ones
@@ -3625,7 +3619,6 @@ void sit_ent_vblocks_incr(struct ctx *ctx, sector_t lba, sector_t pba)
 	ptr->mtime = get_elapsed_time(ctx);
 	if (ctx->max_mtime < ptr->mtime)
 		ctx->max_mtime = ptr->mtime;
-	update_gc_tree(ctx, dzonenr, 1, ptr->mtime, __func__);
 	/* we compare with the pba of the last block in the zone*/
 	//mutex_unlock(&ctx->sit_kv_store_lock);
 	if(vblocks > (1 << (sb->log_zone_size - sb->log_block_size))) {
@@ -3801,6 +3794,7 @@ int add_rev_translation_entry(struct ctx * ctx, sector_t lba, sector_t pba, size
 	int nrblks = len >> SECTOR_BLK_SHIFT;
 	struct tm_page * rev_tm_page = NULL;
 	struct page *page;
+	int dzonenr;
 
 	BUG_ON(len < 0);
 	BUG_ON(nrblks == 0);
@@ -3825,7 +3819,6 @@ int add_rev_translation_entry(struct ctx * ctx, sector_t lba, sector_t pba, size
 	index = blknr %  REV_TM_ENTRIES_BLK;
 	ptr = ptr + index;
 
-	//printk(KERN_ERR "\n %s Cache write!! COMPLETED: lba: %llu, pba: %llu, len: %lu nrblks: %d ", __func__, lba, pba, len, nrblks);
 	for(i=0; i<nrblks; i++) {
 		if (lba > ctx->sb->max_pba) {
 			printk(KERN_ERR "\n %s lba: %llu pba: %llu max_pba: %llu len: %zu i: %d", __func__, lba, pba, ctx->sb->max_pba, len, i);
@@ -3843,7 +3836,9 @@ int add_rev_translation_entry(struct ctx * ctx, sector_t lba, sector_t pba, size
 			return -ENOMEM;
 		}
 		/* we need to incr the vblocks always */
-		sit_ent_vblocks_incr(ctx, ptr->lba, pba);
+		dzonenr = lba/ctx->nr_lbas_in_zone; /* this is the logical zone number */;
+		update_gc_tree(ctx, dzonenr, 1, get_elapsed_time(ctx), __func__);
+		sit_ent_vblocks_incr(ctx, lba, pba);
 		ptr->lba = lba;
 		pba = pba + NR_SECTORS_IN_BLK;
 		lba = lba + NR_SECTORS_IN_BLK;
@@ -3871,10 +3866,11 @@ int add_rev_translation_entry(struct ctx * ctx, sector_t lba, sector_t pba, size
 int remove_rev_translation_entry(struct ctx * ctx, sector_t pba, unsigned int len) 
 {
 	struct rev_tm_entry * ptr;
-	int index, i, blknr;
+	int index, i, blknr, dzonenr = 0;
 	int nrblks = len >> SECTOR_BLK_SHIFT;
 	struct tm_page * rev_tm_page = NULL;
 	struct page *page;
+	int lba;
 
 	BUG_ON(len < 0);
 	BUG_ON(nrblks == 0);
@@ -3907,7 +3903,12 @@ int remove_rev_translation_entry(struct ctx * ctx, sector_t pba, unsigned int le
 			return -ENOMEM;
 		}
 		/*-----------------------------------------------*/
-		sit_ent_vblocks_decr(ctx, ptr->lba, pba);
+		if(ptr->lba < (ctx->sb->max_pba + 1)) {
+			/* the lba was invalid and does not need updating */
+			dzonenr = ptr->lba/ctx->nr_lbas_in_zone; /* this is the logical zone number */;
+			update_gc_tree(ctx, dzonenr, 0, get_elapsed_time(ctx), __func__);
+			sit_ent_vblocks_decr(ctx, ptr->lba, pba);
+		}
 		//# This is how we denote INVALID LBA
 		ptr->lba = (ctx->sb->max_pba + 1);
 		pba = pba + NR_SECTORS_IN_BLK;
@@ -4713,7 +4714,7 @@ int ls_cache_write(struct ctx *ctx, struct bio *clone)
 		}
 		BUG_ON(!s8);
 		wf = ctx->hot_wf_pba;
-		trace_printk("\n %s CACHE: LBA: %llu zonenr: %llu PBA: %llu s8: %llu nr_sectors: %u" , __func__, lba, lba/ctx->nr_lbas_in_zone, wf, s8, nr_sectors);
+		//printk(KERN_ERR "\n %s CACHE: PBA: %llu s8: %llu nr_sectors: %u" , __func__,  wf, s8, nr_sectors);
 		bioctx->ctx = ctx;
 		clone->bi_private = bioctx;
 		if (!dosplit) {
@@ -5095,6 +5096,7 @@ int read_extents_from_block(struct ctx * ctx, struct rev_tm_entry *entry, u64 pb
 	int i = 0;
 	int nr_extents = REV_TM_ENTRIES_BLK;
 	int ret = 0;
+	int dzonenr;
 
 	while (i < nr_extents) {
 		i++;
@@ -5107,11 +5109,15 @@ int read_extents_from_block(struct ctx * ctx, struct rev_tm_entry *entry, u64 pb
 			continue;
 			
 		}
-		//printk(KERN_ERR "\n %s i: %d entry->lba: %llu entry->pba: %llu", __func__, i, lba, entry->pba);
+		printk(KERN_ERR "\n %s i: %d entry->lba: %llu entry->pba: %llu", __func__, i, entry->lba, pba);
 		/* TODO: right now everything should be zeroed out */
 		down_write(&ctx->lsdm_rb_lock);
 		lsdm_rb_update_range(ctx, entry->lba, pba, NR_SECTORS_IN_BLK);
 		up_write(&ctx->lsdm_rb_lock);
+		dzonenr = entry->lba/ctx->nr_lbas_in_zone; /* this is the logical zone number */;
+		/* the mtime should be read from the segment - but now we are using this one-
+		 * its anyway not used in this heuristic, so we keep our life simple */
+		update_gc_tree(ctx, dzonenr, 1, get_elapsed_time(ctx), __func__);
 		pba = pba + NR_SECTORS_IN_BLK; /* Every 512 bytes sector has an LBA in a SMR drive */
 		entry = entry + 1;
 		ret = 1;
@@ -5428,14 +5434,18 @@ int update_gc_tree(struct ctx *ctx, unsigned int zonenr, int op, u64 mtime, cons
 	if (op == INCR) {
 		znode->vblks++;
 	} else {
+		// op = DECR
 		znode->vblks--;
-		if ((op == DECR) && (znode->vblks == 0)) {
+		if (znode->vblks == 0) {
 			//printk(KERN_ERR "\n %s Removing zone: %d from gc tree! \n", __func__, zonenr);
 			remove_zone_from_gc_tree(ctx, zonenr);
 			return 0;
 		}
 	}
 	cost = get_cost(ctx, zonenr, znode->vblks, mtime, GC_GREEDY);
+	if (!cost) {
+		remove_zone_from_gc_tree(ctx, zonenr);
+	}
 	if (znode->ptr_to_cost_node) {
 		new = znode->ptr_to_cost_node;
 		if (new->cost == cost) {
@@ -5492,7 +5502,7 @@ int update_gc_tree(struct ctx *ctx, unsigned int zonenr, int op, u64 mtime, cons
 	rb_link_node(&new->rb, parent, link);
 	rb_insert_color(&new->rb, root);
 
-	zonenr = select_zone_to_clean(ctx, BG_GC, __func__);
+	//zonenr = select_zone_to_clean(ctx, BG_GC, __func__);
 	//printk(KERN_ERR "\n %s zone to clean: %d ", __func__, zonenr);
 	return 0;
 }
@@ -5598,8 +5608,6 @@ int read_seg_entries_from_block(struct ctx *ctx, struct lsdm_seg_entry *entry, u
 		}
 		else {
 			printk(KERN_ERR "\n *segnr: %u entry->vblocks: %u entry->mtime: %lu", *zonenr, entry->vblocks, entry->mtime);
-			if (!update_gc_tree(ctx, *zonenr, 1, entry->mtime, __func__))
-				panic("Memory error, write a memory shrinker!");
 		}
 		if (ctx->min_mtime > entry->mtime)
 			ctx->min_mtime = entry->mtime;
@@ -6206,16 +6214,16 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
 	}
 
 	/*
-	 * 90/10 zipfs watermark is 54
+	 * 90/10 zipfs watermark is 144
 	 *
-	ctx->middle_watermark = 54;
-	ctx->lower_watermark = 54;
+	ctx->middle_watermark = 144;
+	ctx->lower_watermark = 144;
 	*/
 	
-	/* uniform random watermark is 88 (200 - 112)
+	/* uniform random watermark is 112 - GC starts at 28 GB
 	 */
-	ctx->middle_watermark = 88;
-	ctx->lower_watermark = 88;
+	ctx->middle_watermark = 112;
+	ctx->lower_watermark = 112;
 	printk(KERN_ERR "\n Initializing gc_extents list, ctx->gc_extents_cache: %p ", ctx->gc_extents_cache);
 	ctx->gc_extents = kmem_cache_alloc(ctx->gc_extents_cache, GFP_KERNEL);
 	if (!ctx->gc_extents) {
