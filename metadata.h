@@ -208,6 +208,7 @@ struct gc_extents {
 
 struct cseg_zone_node {
 	unsigned int lzonenr;
+	unsigned int dblks;
 	struct list_head list;
 };
 
