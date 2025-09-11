@@ -1447,7 +1447,7 @@ static int read_extent_bio(struct ctx *ctx, struct gc_extents *gc_extent)
 #endif
 	gc_extent->read = 1;
 	/* submiting the bio in read_all_bios_and_wait */
-	submit_bio_wait(gc_extent->bio);
+	//submit_bio_wait(gc_extent->bio);
 	//refcount_dec(&gc_extent->ref);
 	bio_put(bio);
 	gc_extent->bio = NULL;
@@ -1598,7 +1598,7 @@ int write_zero_pages(struct ctx *ctx, int diff, sector_t wp)
 		bio->bi_status = BLK_STS_OK;
 		zero_fill_bio(bio);
 		bio->bi_iter.bi_sector = wp;
-		submit_bio_wait(bio);
+		//submit_bio_wait(bio);
 		bio_for_each_segment_all(bv, bio, iter_all) {
 			mempool_free(bv->bv_page, ctx->gc_page_pool);
 		}
@@ -1656,7 +1656,7 @@ static int write_valid_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 		//printk(KERN_ERR "\n %s (lba: %llu, pba: %llu e->len: %llu)", __func__, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len);
 		bio = gc_extent->bio;
 		bio->bi_iter.bi_sector = wp;
-		submit_bio_wait(gc_extent->bio);
+		//submit_bio_wait(gc_extent->bio);
 		write_metadata_extent(ctx, gc_extent, wp);
 		trace_printk("\n (extent write) lzonenr: %u, pzonenr: %d wp: %llu last_pba: %llu nr_sectors: %d gc_extent->(lba: %llu, len: %llu) ", lzonenr, pzonenr, wp, last_pba, nr_sectors, gc_extent->e.lba, gc_extent->e.len);
 		wp = wp + gc_extent->e.len;
