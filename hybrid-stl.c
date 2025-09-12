@@ -1838,7 +1838,7 @@ int create_dzone_list(struct ctx *ctx)
 
 	pba = get_first_pba_for_czone(ctx, 0);
 	/* We are not cleaning 200 zones */
-	last_pba = get_last_pba_for_czone(ctx, 112);
+	last_pba = get_last_pba_for_czone(ctx, NR_CACHE_ZONES);
 	INIT_LIST_HEAD(&ctx->cseg_znodes->list);
 
 	/* Lookup this pba in the reverse table to find the
@@ -1901,7 +1901,6 @@ int create_dzone_list(struct ctx *ctx)
 		pba = temp.pba + temp.len;
 		count = 1;
 	}
-	//sort_dzones_on_cache_blks(ctx);
 	/* we have already found all dzones and all their dblks in the entire cache while doing so */
 	return count;
 }
@@ -1918,6 +1917,9 @@ int sort_dzones_on_cache_blks(struct ctx *ctx)
 	struct cseg_zone_node *zone_nodep, *next_zone_nodep;
 	int zcount = 0;
 
+	list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
+		zone_nodep->dblks = 0;
+	}
 
 	list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
 		dzonenr = zone_nodep->lzonenr;
@@ -1984,7 +1986,7 @@ int sort_dzones_on_cache_blks(struct ctx *ctx)
 		}
 		zcount = zcount + 1;
 	}
-	printk(KERN_ERR "\n %s Number of data zones in the cache: %d ", __func__, count);
+	printk(KERN_ERR "\n %s Number of data zones in the cache: %d ", __func__, zcount);
 	return 0;
 }
 
@@ -2189,6 +2191,8 @@ again:
 		return gc_count;
 	}
 	int len = 0;
+list_traverse_again:
+	sort_dzones_on_cache_blks(ctx);
 	list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
 		lzonenr = zone_nodep->lzonenr;
 		if (zone_nodep->dblks < next_zone_nodep->dblks) {
@@ -2238,6 +2242,7 @@ again:
 		wake_up_nr(&ctx->gc_th->fggc_wq, cacheblks);
 		list_del(&zone_nodep->list);
 		kmem_cache_free(ctx->zones_in_cseg_cache, zone_nodep);
+		goto list_traverse_again;
 	}
 	//up_write(&ctx->wf_lock);
 	free_data_zone_list(ctx);
