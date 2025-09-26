@@ -1448,7 +1448,7 @@ static int read_extent_bio(struct ctx *ctx, struct gc_extents *gc_extent)
 #endif
 	gc_extent->read = 1;
 	/* submiting the bio in read_all_bios_and_wait */
-	//submit_bio_wait(gc_extent->bio);
+	submit_bio_wait(gc_extent->bio);
 	//refcount_dec(&gc_extent->ref);
 	bio_put(bio);
 	gc_extent->bio = NULL;
@@ -1599,7 +1599,7 @@ int write_zero_pages(struct ctx *ctx, int diff, sector_t wp)
 		bio->bi_status = BLK_STS_OK;
 		zero_fill_bio(bio);
 		bio->bi_iter.bi_sector = wp;
-		//submit_bio_wait(bio);
+		submit_bio_wait(bio);
 		bio_for_each_segment_all(bv, bio, iter_all) {
 			mempool_free(bv->bv_page, ctx->gc_page_pool);
 		}
@@ -1657,7 +1657,7 @@ static int write_valid_gc_extents(struct ctx *ctx, unsigned int lzonenr)
 		//printk(KERN_ERR "\n %s (lba: %llu, pba: %llu e->len: %llu)", __func__, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len);
 		bio = gc_extent->bio;
 		bio->bi_iter.bi_sector = wp;
-		//submit_bio_wait(gc_extent->bio);
+		submit_bio_wait(gc_extent->bio);
 		write_metadata_extent(ctx, gc_extent, wp);
 		trace_printk("\n (extent write) lzonenr: %u, pzonenr: %d wp: %llu last_pba: %llu nr_sectors: %d gc_extent->(lba: %llu, len: %llu) ", lzonenr, pzonenr, wp, last_pba, nr_sectors, gc_extent->e.lba, gc_extent->e.len);
 		wp = wp + gc_extent->e.len;
@@ -1901,7 +1901,7 @@ int create_dzone_list(struct ctx *ctx, unsigned int zonenr)
 		count = count + ret;
 		pba = temp.pba + temp.len;
 	}
-	sort_dzones_on_cache_blks(ctx);
+	//sort_dzones_on_cache_blks(ctx);
 	printk(KERN_ERR "\n Number of data zones in this cache zone: %d  is: %d", zonenr, count);
 	return count;
 }
@@ -1977,9 +1977,6 @@ int sort_dzones_on_cache_blks(struct ctx *ctx)
 	list_sort(NULL, &ctx->cseg_znodes->list, cmp_nr_dblks);
 	return 0;
 }
-
-
-
 
 int create_gc_extents(struct ctx *ctx, unsigned int lzonenr, unsigned int czonenr)
 {
@@ -6330,13 +6327,19 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
 	}
 
 	/*
-	 * 90/10 zipfs watermark is 54
+	 * 90/10 zipfs watermark is 56
 	 *
-	ctx->middle_watermark = 54;
-	ctx->lower_watermark = 54;
+	ctx->middle_watermark = 56;
+	ctx->lower_watermark = 56;
+	*/
+
+	/* 70/30 zipf watermark is 81 */
+	/*
+	ctx->middle_watermark = 81;
+	ctx->lower_watermark = 81;
 	*/
 	
-	/* uniform random watermark is 88 (200 - 112)
+	/* uniform random watermark is 84 (200 - 112)
 	 */
 	ctx->middle_watermark = 88;
 	ctx->lower_watermark = 88;
