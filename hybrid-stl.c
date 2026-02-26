@@ -1894,7 +1894,8 @@ int create_dzone_list(struct ctx *ctx, unsigned int zonenr)
 		}
 		BUG_ON(!temp.len);
 		u32 zonenr = temp.lba / ctx->nr_lbas_in_zone;
-		ret = add_zone_to_gclist(ctx, zonenr, 0);
+		//ret = add_zone_to_gclist(ctx, zonenr, 0);
+		ret = add_zone_to_gclist(ctx, zonenr, temp.len);
 		if (ret < 0) {
 			return -ENOMEM;
 		}
@@ -2083,8 +2084,8 @@ int create_gc_extents(struct ctx *ctx, unsigned int lzonenr, unsigned int czonen
 		}
 	}
 	/* for 1MB tests we divide by as many sectors as are in a 1MB block */
-	czone_blks = czone_blks / 2048;
-	cacheblks = cacheblks / 2048;
+	//czone_blks = czone_blks / 2048;
+	//cacheblks = cacheblks / 2048;
 	//trace_printk("\n %s number of cacheblks from the data zone(%d): %d ", __func__, lzonenr, cacheblks);
 	//printk(KERN_ERR "\n Returning from : %s ", __func__);
 	//return czone_blks;
@@ -3156,7 +3157,7 @@ void mark_zone_free(struct ctx *ctx , uint zonenr, char * bitmap, uint bitmap_by
 	bitmap[bytenr] = bitmap[bytenr] | (1 << bitnr);
 	*nrfreezones = *nrfreezones + 1;
 	get_byte_string(bitmap[bytenr], str);
-	//printk(KERN_ERR "\n %s Freed zonenr: %d, bytenr: %d, bitnr: %d byte:%s", __func__, zonenr, bytenr, bitnr, str);
+	printk(KERN_ERR "\n %s Freed zonenr: %d, bytenr: %d, bitnr: %d byte:%s", __func__, zonenr, bytenr, bitnr, str);
 	/* we need to reset the  zone that we are about to use */
 }
 
@@ -6327,10 +6328,10 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
 	}
 
 	/*
-	 * 90/10 zipfs watermark is 56
+	 * 90/10 zipfs watermark is 58
 	 *
-	ctx->middle_watermark = 56;
-	ctx->lower_watermark = 56;
+	ctx->middle_watermark = 58;
+	ctx->lower_watermark = 58;
 	*/
 
 	/* 70/30 zipf watermark is 81 */
@@ -6340,9 +6341,15 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
 	*/
 	
 	/* uniform random watermark is 84 (200 - 112)
-	 */
+	 *
 	ctx->middle_watermark = 88;
 	ctx->lower_watermark = 88;
+	*/
+	/* uniform random watermark is 8 (11 - 3)
+	 *
+	ctx->middle_watermark = 3;
+	ctx->lower_watermark = 3;
+	*/
 	printk(KERN_ERR "\n Initializing gc_extents list, ctx->gc_extents_cache: %p ", ctx->gc_extents_cache);
 	ctx->gc_extents = kmem_cache_alloc(ctx->gc_extents_cache, GFP_KERNEL);
 	if (!ctx->gc_extents) {

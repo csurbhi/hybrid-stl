@@ -75,10 +75,9 @@ __u8 valid_map[VBLK_MAP_SIZE];
 
 //#define NR_CACHE_ZONES 64
 //# define NR_CACHE_ZONES 116 /* for 1 MB -> 112 + 1(metadata) + 3 for GC */
-# define NR_CACHE_ZONES 201 /* to emulate on-device cache eviction */
+//# define NR_CACHE_ZONES 201 /* to emulate on-device cache eviction */
 //# define NR_CACHE_ZONES 148 /* for 1 MB -> 144 + 1(metadata) + 3 for GC */
-//#define NR_CACHE_ZONES 16 /* for 4K size is 7, but with 90/10 its 11 + 4 */
-//#define NR_CACHE_ZONES 14 /* for 4K size is 7, but with 90/10 its 11 + 4 */
+#define NR_CACHE_ZONES 7 /* for 4K size is 3 zones (750 MB), but with 90/10 its 2GB (8 zones) + 3 */
 
 #define SIT_ENTRIES_BLK 	(BLK_SIZE/sizeof(struct lsdm_seg_entry))
 #define REV_TM_ENTRIES_BLK 		(BLK_SIZE/sizeof(struct rev_tm_entry))
