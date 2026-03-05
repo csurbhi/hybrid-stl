@@ -2,6 +2,7 @@
 #include <linux/wait.h>
 #include <linux/async.h>
 #include <linux/workqueue.h>
+#include <linux/sysfs.h>
 #include "format_metadata.h"
 
 /*
@@ -357,6 +358,8 @@ struct ctx {
 	struct work_struct tb_work;
 	struct czone_info * czonenr_list[NR_CACHE_ZONES];
 	unsigned int err;
+	struct kobject kobj;
+	unsigned int verbose;
 };
 
 struct extent {

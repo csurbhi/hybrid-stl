@@ -1,5 +1,5 @@
 /*
- *  Copyright (C) 2020 Surbhi Palande.
+ *  Copyright (C) 2016 Peter Desnoyers and 2020 Surbhi Palande.
  *
  * This file is released under the GPL
  *
@@ -49,24 +49,26 @@
 #include <linux/blkdev.h>
 #include <linux/refcount.h>
 #include <linux/debugfs.h>
-#include <linux/sysfs.h>
 
 #include "metadata.h"
 #define DM_MSG_PREFIX "lsdm"
 #define BIO_MAX_PAGES 256
 #define BLK_SZ 4096
-#define DEF_FLUSH_TIME 10000 /* (milliseconds) */
-#define DEF_GC_TIME	10000000 /*1000 seconds */
 
 #undef LSDM_DEBUG
 
 void print_sub_tree(struct rb_node *parent);
+void print_revmap_tree(struct ctx *ctx);
+struct rev_extent * lsdm_revmap_find_print(struct ctx *ctx, u64 pba, size_t len, u64 last_pba);
+struct rev_extent * lsdm_rb_revmap_find(struct ctx *ctx, u64 pba, size_t len, u64 last_pba, const char * caller);
+struct rev_extent * lsdm_rb_revmap_insert(struct ctx *ctx, struct extent *extent);
 int lsdm_flush_thread_start(struct ctx * ctx);
 int lsdm_flush_thread_stop(struct ctx *ctx);
 void read_gcextent_done(struct bio * bio);
+int complete_revmap_blk_flush(struct ctx * ctx, struct page *page);
 int verify_gc_zone(struct ctx *ctx, int zonenr, sector_t pba);
 void print_memory_usage(struct ctx *ctx, const char *action);
-int create_gc_extents(struct ctx *ctx, unsigned int lzonenr);
+int create_gc_extents(struct ctx *ctx, int zonenr);
 void print_sub_extents(struct rb_node *parent);
 int lsdm_gc_thread_start(struct ctx *ctx);
 int lsdm_gc_thread_stop(struct ctx *ctx);
@@ -75,14 +77,16 @@ void no_op(struct kref *kref);
 void complete_small_reads(struct bio *clone);
 struct bio * construct_smaller_bios(struct ctx * ctx, sector_t pba, struct app_read_ctx * readctx);
 void request_start_unaligned(struct ctx *ctx, struct bio *clone, struct app_read_ctx *read_ctx, sector_t pba, sector_t zerolen);
-struct bio * handle_partial_overlap(struct ctx *ctx, struct bio *clone, sector_t overlap, struct app_read_ctx *read_ctx, sector_t pba);
-int handle_full_overlap(struct ctx *ctx, struct bio *clone, sector_t nr_sectors, sector_t pba, struct app_read_ctx *read_ctx, int print);
+int zero_fill_inital_bio(struct ctx *ctx, struct bio *bio, struct bio *clone, sector_t zerolen, struct app_read_ctx *read_ctx);
+int handle_partial_overlap(struct ctx *ctx, struct bio * bio, struct bio *clone, sector_t overlap, struct app_read_ctx *read_ctx, sector_t pba);
+int handle_full_overlap(struct ctx *ctx, struct bio * bio, struct bio *clone, sector_t nr_sectors, sector_t pba, struct app_read_ctx *read_ctx, int print);
 void remove_partial_entries(struct ctx *ctx, struct bio * bio);
 int is_disk_full(struct ctx *ctx);
 struct sit_page * search_sit_kv_store(struct ctx *ctx, sector_t pba, struct rb_node **parent);
 struct sit_page * search_sit_blk(struct ctx *ctx, sector_t blknr);
 void mark_zone_erroneous(struct ctx *ctx, sector_t pba);
 void get_byte_string(char byte, char *str);
+void flush_revmap_bitmap(struct ctx *ctx);
 void flush_checkpoint(struct ctx *ctx);
 void flush_sit_nodes(struct ctx *ctx, struct rb_node *node);
 void remove_gc_cost_nodes(struct ctx *ctx);
@@ -90,8 +94,13 @@ void remove_gc_zone_nodes(struct ctx *ctx);
 u32 calculate_crc(struct ctx *ctx, struct page *page);
 void update_checkpoint(struct ctx *ctx);
 void move_write_frontier(struct ctx *ctx, sector_t s8);
+struct page * read_tm_page(struct ctx * ctx, u64 lba);
 void free_translation_pages(struct ctx *ctx);
 void remove_sit_page(struct ctx *ctx, struct rb_node *node);
+void mark_revmap_bit(struct ctx *ctx, u64 pba);
+void clear_revmap_bit(struct ctx *ctx, u64 pba);
+void revmap_blk_flushed(struct bio *bio);
+int flush_revmap_block_disk(struct ctx * ctx, struct page *page, sector_t revmap_pba);
 void shrink_next_entries(struct ctx *ctx, sector_t lba, sector_t pba, unsigned long len, struct page *page);
 int merge_rev_entries(struct ctx * ctx, sector_t lba, sector_t pba, unsigned long len, struct page *page);
 void write_done(struct kref *kref);
@@ -100,88 +109,41 @@ void sub_write_err(struct work_struct * w);
 void lsdm_clone_endio(struct bio * clone);
 int lsdm_write_checks(struct ctx *ctx, struct bio *bio);
 void fill_bio(struct bio *bio, sector_t pba, sector_t len, struct block_device *bdev, struct lsdm_sub_bioctx * subbio_ctx);
-void fill_subbioctx(struct lsdm_sub_bioctx * subbio_ctx, struct lsdm_bioctx *bioctx, sector_t lba, sector_t pba, sector_t len, uint is_cached_write);
-int prepare_bio(struct bio * clone, sector_t s8, sector_t wf, unsigned int is_cached_write);
+void fill_subbioctx(struct lsdm_sub_bioctx * subbio_ctx, struct lsdm_bioctx *bioctx, sector_t lba, sector_t pba, sector_t len);
+int prepare_bio(struct bio * clone, sector_t s8, sector_t wf);
 struct bio * split_submit(struct bio *clone, sector_t s8, sector_t wf);
-int ls_cache_write(struct ctx *ctx, struct bio *clone);
+int submit_bio_write(struct ctx *ctx, struct bio *clone);
 void lsdm_handle_write(struct ctx *ctx);
-int hybrid_stl_write_io(struct ctx *ctx, struct bio *bio);
+int lsdm_write_io(struct ctx *ctx, struct bio *bio);
 void put_free_zone(struct ctx *ctx, u64 pba);
 struct lsdm_ckpt * read_checkpoint(struct ctx *ctx, unsigned long pba);
 int do_recovery(struct ctx *ctx);
 struct lsdm_ckpt * get_cur_checkpoint(struct ctx *ctx);
 int add_tm_page_kv_store_by_blknr(struct ctx *ctx, struct page *page, int blknr);
+int read_revmap_bitmap(struct ctx *ctx);
+void process_revmap_entries_on_boot(struct ctx *ctx, struct page *page);
+int read_revmap(struct ctx *ctx);
+sector_t get_zone_pba(struct lsdm_sb * sb, unsigned int segnr);
 void lsdm_subread_done(struct bio *clone);
 sector_t get_zone_end(struct lsdm_sb *sb, sector_t pba_start);
-char * allocate_freebitmap(struct ctx *ctx, unsigned int bitmap_bytes);
-struct tm_page *add_rev_tm_page_kv_store(struct ctx *ctx, sector_t lba);
+int allocate_freebitmap(struct ctx *ctx);
 unsigned int get_cb_cost(struct ctx *ctx , u32 nrblks, u64 mtime);
-unsigned int get_cost(struct ctx *ctx, u32 zonenr, u32 nrblks, u64 age, char gc_mode);
+unsigned int get_cost(struct ctx *ctx, u32 nrblks, u64 age, char gc_mode);
 struct gc_zone_node * add_zonenr_gc_zone_tree(struct ctx *ctx, unsigned int zonenr, u32 nrblks);
 int add_sit_page_kv_store_by_blknr(struct ctx *ctx, struct page *page, sector_t sector_nr);
 int read_seg_info_table(struct ctx *ctx);
 struct lsdm_sb * read_superblock(struct ctx *ctx, unsigned long pba);
 int read_metadata(struct ctx * ctx);
-static int hybrid_stl_map_io(struct dm_target *dm_target, struct bio *bio);
-u64 get_wp(struct ctx *ctx, unsigned int zonenr);
-int __init stl_init(void);
-void __exit stl_exit(void);
-void mark_disk_full(struct ctx *ctx);
-static int setup_extent_bio_write(struct ctx *ctx, struct gc_extents *gc_extent);
-struct tm_page *add_tm_page_kv_store(struct ctx *, sector_t);
-int add_rev_translation_entry(struct ctx *, sector_t , sector_t , size_t ); 
-void mark_zone_free(struct ctx *ctx , uint zonenr, char * bitmap, uint bitmap_bytes, uint bitmap_bit, uint *nrfreezones, int resetZone);
-void print_zones_vblocks(struct ctx *ctx);
-void sit_ent_vblocks_incr(struct ctx *ctx, sector_t pba);
-void sit_ent_add_mtime(struct ctx *ctx, sector_t pba);
-void sit_ent_vblocks_incr(struct ctx *ctx, sector_t pba);
-void sit_ent_add_mtime(struct ctx *ctx, sector_t pba);
-void sit_ent_vblocks_decr(struct ctx *ctx, sector_t pba);
-void flush_translation_blocks(struct ctx *ctx);
-void flush_sit(struct ctx *ctx);
-void do_checkpoint(struct ctx *ctx);
-void remove_translation_pages(struct ctx *ctx);
-int get_sit_ent_vblocks(struct ctx *ctx, int zonenr);
-struct sit_page * add_sit_page_kv_store(struct ctx * ctx, sector_t pba, const char * caller);
-void wait_on_zone_barrier(struct ctx *);
-static void add_ckpt_new_wf(struct ctx *, sector_t);
-int mark_zone_occupied(struct ctx *ctx , int zonenr, char *bitmap, uint bitmap_bytes, uint bitmap_bit, uint *nrfreezones);
-void no_op(struct kref *kref) { }
-int is_zone_free(struct ctx *ctx, unsigned int zonenr);
-int remove_zone_from_gc_tree(struct ctx *ctx, unsigned int zonenr);
-void wait_on_refcount(struct ctx *ctx, refcount_t *ref, spinlock_t *lock);
-int remove_rev_translation_entry(struct ctx * ctx, sector_t pba, unsigned int len);
-void flush_tm_nodes(struct rb_node *node, struct ctx *ctx);
-struct page * read_block(struct ctx *, u64 , u64 );
-int update_gc_tree(struct ctx *, unsigned int , u32 , u64 , const char *);
-int read_seg_entries_from_block(struct ctx *ctx, struct lsdm_seg_entry *entry, unsigned int nr_seg_entries, unsigned int *zonenr);
-struct tm_page * search_tm_kv_store(struct ctx *ctx, u64 blknr, struct rb_node **parent);
-void flush_tm_node_page(struct ctx *ctx, struct tm_page * tm_page);
-int read_rev_translation_map(struct ctx *);
-int read_extents_from_block(struct ctx * ctx, struct rev_tm_entry *entry, u64 lba);
-void lsdm_ioidle(struct mykref *kref);
-static int get_next_freezone_nr(struct ctx *ctx, char *bitmap, u32 bitmap_byte, u32 bitmap_bit, uint * nrfreezones);
-static int free_data_zone_list(struct ctx *ctx);
-static int gc_thread_fn(void * data);
-static int zero_fill_clone(struct bio *clone);
-static int hybrid_stl_read_io(struct ctx *ctx, struct bio *bio);
-static int get_new_cache_zone(struct ctx *ctx);
-void remove_gc_nodes(struct ctx *ctx);
-void free_sit_pages(struct ctx *);
-void flush_sit_node_page(struct ctx * ctx, struct rb_node *);
-int remove_zone_from_cost_node(struct ctx *ctx, struct gc_cost_node *cost_node, unsigned int zonenr);
-static void destroy_caches(struct ctx *ctx);
-static int create_caches(struct ctx *ctx);
-static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **argv);
-static void hybrid_stl_dtr(struct dm_target *dm_target);
-int get_new_data_zone(struct ctx *ctx);
-//int remove_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len);
+static void add_revmap_entry(struct ctx * ctx, __le64 lba, __le64 pba, int nrsectors);
+int lsdm_map_io(struct dm_target *dm_target, struct bio *bio);
+int __init ls_dm_init(void);
+void __exit ls_dm_exit(void);
 
 long nrpages;
+
 struct dentry * debug_dir;
 
-#define LSDM_DEBUG 1
-
+void lsdm_ioidle(struct mykref *kref);
 
 static inline void mykref_init(struct mykref *kref)
 {
@@ -220,6 +182,7 @@ static inline int mykref_put(struct mykref *kref, void (*callback)(struct mykref
  * 3) GC
  */
 
+static int get_new_zone(struct ctx *ctx);
 #define IN_MAP 0
 #define IN_CLEANING 1
 #define STALLED_WRITE 2
@@ -245,6 +208,7 @@ static void gcextent_init(struct gc_extents *gce, sector_t lba, sector_t pba, un
 }
 
 void print_extents(struct ctx *ctx);
+void free_gc_extent(struct ctx * ctx, struct gc_extents * gc_extent);
 
 #define MIN_EXTENTS 16
 #define MIN_POOL_PAGES 16
@@ -264,47 +228,25 @@ static sector_t zone_end(struct ctx *ctx, sector_t pba)
 /* zone numbers begin from 0.
  * The freebit map is marked with bit 0 representing zone 0
  */
-static unsigned get_czone_nr(struct ctx *ctx, sector_t sector)
+static unsigned get_zone_nr(struct ctx *ctx, sector_t sector)
 {
 	sector_t zone_begins = zone_start(ctx, sector);
-	//trace_printk("\n %s zone_begins: %llu sb->czone0_pba: %u ctx->nr_lbas_in_zone: %llu", __func__, zone_begins, ctx->sb->czone0_pba, ctx->nr_lbas_in_zone);
-	return ( (zone_begins - ctx->sb->czone0_pba) / ctx->nr_lbas_in_zone);
+	//trace_printk("\n %s zone_begins: %llu sb->zone0_pba: %u ctx->nr_lbas_in_zone: %llu", __func__, zone_begins, ctx->sb->zone0_pba, ctx->nr_lbas_in_zone);
+	return ( (zone_begins - ctx->sb->zone0_pba) / ctx->nr_lbas_in_zone);
 }
 
-static sector_t get_first_pba_for_czone(struct ctx *ctx, unsigned int zonenr)
+static sector_t get_first_pba_for_zone(struct ctx *ctx, unsigned int zonenr)
 {
-	return (ctx->sb->czone0_pba + (zonenr * ctx->nr_lbas_in_zone));
+	return ctx->sb->zone0_pba + (zonenr * ctx->nr_lbas_in_zone);
 }
 
 
-static sector_t get_last_pba_for_czone(struct ctx *ctx, unsigned int zonenr)
+static sector_t get_last_pba_for_zone(struct ctx *ctx, unsigned int zonenr)
 {
-	return ((ctx->sb->czone0_pba + (zonenr * ctx->nr_lbas_in_zone) + ctx->nr_lbas_in_zone) - 1);
+	return (ctx->sb->zone0_pba + (zonenr * ctx->nr_lbas_in_zone) + ctx->nr_lbas_in_zone) - 1;
 }
 
 
-/* zone numbers begin from 0.
- * The freebit map is marked with bit 0 representing zone 0
- */
-/*
-static unsigned get_dzone_nr(struct ctx *ctx, sector_t sector)
-{
-	sector_t zone_begins = zone_start(ctx, sector);
-	//trace_printk("\n %s zone_begins: %llu sb->czone0_pba: %u ctx->nr_lbas_in_zone: %llu", __func__, zone_begins, ctx->sb->czone0_pba, ctx->nr_lbas_in_zone);
-	return ( (zone_begins - ctx->sb->dzone0_pba) / ctx->nr_lbas_in_zone);
-}
-*/
-
-static sector_t get_first_pba_for_dzone(struct ctx *ctx, unsigned int zonenr)
-{
-	return (ctx->sb->dzone0_pba + (zonenr * ctx->nr_lbas_in_zone));
-}
-/*
-static sector_t get_last_pba_for_dzone(struct ctx *ctx, unsigned int zonenr)
-{
-	return ((ctx->sb->dzone0_pba + (zonenr * ctx->nr_lbas_in_zone) + ctx->nr_lbas_in_zone) - 1);
-}
-*/
 
 /************** Extent map management *****************/
 
@@ -359,6 +301,8 @@ static struct extent *lsdm_rb_geq(struct ctx *ctx, off_t lba, int print)
 	return e;
 }
 
+void sit_ent_vblocks_decr(struct ctx *ctx, sector_t pba);
+
 /* TODO: depending on the root decrement the correct nr of extents */
 static void lsdm_rb_remove(struct ctx *ctx, struct extent *e)
 {
@@ -386,12 +330,11 @@ static struct extent *lsdm_rb_prev(struct extent *e)
 }
 
 /* DEBUGGING CODE */
-#if 0
 #ifdef LSDM_DEBUG
 static int check_node_contents(struct rb_node *node)
 {
 	int ret = 0;
-	struct extent *e;
+	struct extent *e, *next, *prev;
 	struct rev_extent *re;
 
 	if (!node)
@@ -470,7 +413,6 @@ static int check_node_contents(struct rb_node *node)
 
 }
 #endif
-#endif
 
 /* Check if we can be merged with the left or the right node */
 static void merge(struct ctx *ctx, struct rb_root *root, struct extent *e)
@@ -483,10 +425,12 @@ static void merge(struct ctx *ctx, struct rb_root *root, struct extent *e)
 	prev = lsdm_rb_prev(e);
 	next = lsdm_rb_next(e);
 	if (prev) {
+		/*
+		printk(KERN_ERR "\n e->lba: %lld e->pba: %lld e->len: %d", e->lba, e->pba, e->len);
+		printk(KERN_ERR "\n prev->lba: %lld prev->pba: %lld prev->len: %d \n", prev->lba, prev->pba, prev->len);
+		*/
 		if((prev->lba + prev->len) == e->lba) {
 			if ((prev->pba + prev->len) == e->pba) {
-				//printk(KERN_ERR "\n MERGE e->lba: %llu e->pba: %llu e->len: %llu", e->lba, e->pba, e->len);
-				//printk(KERN_ERR "\n MERGE prev->lba: %llu prev->pba: %llu prev->len: %llu \n", prev->lba, prev->pba, prev->len);
 				prev->len += e->len;
 				lsdm_rb_remove(ctx, e);
 				kmem_cache_free(ctx->extent_cache, e);
@@ -496,10 +440,12 @@ static void merge(struct ctx *ctx, struct rb_root *root, struct extent *e)
 		}
 	}
 	if (next) {
+		/*
+		printk(KERN_ERR "\n e->lba: %lld e->pba: %lld e->len: %d", e->lba, e->pba, e->len);
+		printk(KERN_ERR "\n next->lba: %lld next->pba: %lld next->len: %d \n", next->lba, next->pba, next->len);
+		*/
 		if (next->lba == (e->lba + e->len)) {
 			if (next->pba == (e->pba + e->len)) {
-				//printk(KERN_ERR "\n MERGE e->lba: %llu e->pba: %llu e->len: %llu", e->lba, e->pba, e->len);
-				//printk(KERN_ERR "\n MERGE next->lba: %llu next->pba: %llu next->len: %llu \n", next->lba, next->pba, next->len);
 				e->len += next->len;
 				lsdm_rb_remove(ctx, next);
 				kmem_cache_free(ctx->extent_cache, next);
@@ -544,7 +490,6 @@ void print_revmap_tree(struct ctx *ctx)
 
 void print_extents(struct ctx *ctx);
 
-/*
 #ifdef LSDM_DEBUG
 static int lsdm_tree_check(struct rb_root *root)
 {
@@ -556,7 +501,6 @@ static int lsdm_tree_check(struct rb_root *root)
 
 }
 #endif
-*/
 
 
 struct rev_extent * lsdm_revmap_find_print(struct ctx *ctx, u64 pba, size_t len, u64 last_pba)
@@ -618,25 +562,60 @@ struct rev_extent * lsdm_rb_revmap_find(struct ctx *ctx, u64 pba, size_t len, u6
 	struct rb_node **link = NULL, *parent = NULL;
 	struct rev_extent *rev_e = NULL, *higher_e = NULL;
 	struct extent * e;
+#ifdef LSDM_DEBUG
+	struct rev_extent *temp;
+	int count = 0, ret = 0;
+#endif
+
 
 	if (!root)  {
 		printk(KERN_ERR "\n Root is NULL! \n");
 		BUG();
 	}
 
+	if (pba > last_pba) {
+		printk(KERN_ERR "\n %s pba: %llu last_pba: %llu caller: %s \n", __func__, pba, last_pba, caller);
+		dump_stack();
+		last_pba = ctx->sb->max_pba;
+		if (last_pba == 0) {
+			last_pba = 65536;
+		}
+	}
+
+	BUG_ON(pba == 0);
+
 	link = &root->rb_node;
 
 	/* Go to the bottom of the tree */
 	while (*link) {
+	#ifdef LSDM_DEBUG
+		count++;
+		if (count > 50) {
+			printk(KERN_ERR "\n %s Stuck while searching pba: %llu, last_pba: %llu \n", __func__, pba, last_pba);
+			printk(KERN_ERR "\n %s On node with pba: %llu", __func__, rev_e->pba);
+			print_revmap_tree(ctx);
+			print_extents(ctx);
+			printk(KERN_ERR "\n %s Stuck while searching pba: %llu, last_pba: %llu \n", __func__, pba, last_pba);
+			printk(KERN_ERR "\n %s Stuck while searching pba: %llu, last_pba: %llu \n", __func__, pba, last_pba);
+			temp = lsdm_revmap_find_print(ctx, pba, len, last_pba);
+			BUG_ON(temp);
+			ret = lsdm_tree_check(&ctx->extent_tbl_root);
+			if (ret < 0) {
+				printk(KERN_ERR "\n lsdm_tree_check failed!! ");
+				BUG();
+			} 
+			BUG_ON(1);
+		}
+	#endif
 		parent = *link;
 		rev_e = rb_entry(parent, struct rev_extent, rb);
 		if (rev_e->pba > pba) {
+			link = &(parent->rb_left);
 			if (!higher_e || (rev_e->pba < higher_e->pba)) {
 				if (rev_e->pba <= last_pba) {
 					higher_e = rev_e;
 				}
 			}
-			link = &(parent->rb_left);
 			continue;
 		} 
 		if (rev_e->pba < pba) {
@@ -647,6 +626,7 @@ struct rev_extent * lsdm_rb_revmap_find(struct ctx *ctx, u64 pba, size_t len, u6
 				/* We find an overlapping pba when the gc_extent was split due to space
 				 * requirements in the gc frontier
 				 */
+				BUG_ON((rev_e->pba + e->len) < (pba + len));
 				return rev_e;
 			}
 			link = &(parent->rb_right);
@@ -700,8 +680,8 @@ struct rev_extent * lsdm_rb_revmap_insert(struct ctx *ctx, struct extent *extent
 				/* We find an overlapping pba when the gc_extent was split due to space
 				 * requirements in the gc frontier
 				 */
-				printk(KERN_ERR "\n %s Error while Inserting pba: %llu, Existing -> pointing to (lba, pba (zone), len): (%llu, %llu (%u), %llu) \n", __func__, r_new->pba, e->lba, e->pba, get_czone_nr(ctx, e->pba), e->len);
-				printk(KERN_ERR "\n %s Error while Inserting pba: %llu, New -> pointing to (lba, pba (zone), len): (%llu, %llu (%u), %llu) \n", __func__, r_new->pba, extent->lba, extent->pba, get_czone_nr(ctx, extent->pba), extent->len);
+				printk(KERN_ERR "\n %s Error while Inserting pba: %llu, Existing -> pointing to (lba, pba (zone), len): (%llu, %llu (%u), %llu) \n", __func__, r_new->pba, e->lba, e->pba, get_zone_nr(ctx, e->pba), e->len);
+				printk(KERN_ERR "\n %s Error while Inserting pba: %llu, New -> pointing to (lba, pba (zone), len): (%llu, %llu (%u), %llu) \n", __func__, r_new->pba, extent->lba, extent->pba, get_zone_nr(ctx, extent->pba), extent->len);
 				BUG_ON("1. Bug while adding revmap entry ! (less than case)");
 			}
 
@@ -713,15 +693,15 @@ struct rev_extent * lsdm_rb_revmap_insert(struct ctx *ctx, struct extent *extent
 				/* We find an overlapping pba when the gc_extent was split due to space
 				 * requirements in the gc frontier
 				 */
-				printk(KERN_ERR "\n %s Error while Inserting pba: %llu, Existing -> pointing to (lba, pba (zone), len): (%llu, %llu (%u), %llu) \n", __func__, r_new->pba, e->lba, e->pba, get_czone_nr(ctx, e->pba), e->len);
-				printk(KERN_ERR "\n %s Error while Inserting pba: %llu, New -> pointing to (lba, pba (zone), len): (%llu, %llu (%u), %llu) \n", __func__, r_new->pba, extent->lba, extent->pba, get_czone_nr(ctx, extent->pba), extent->len);
+				printk(KERN_ERR "\n %s Error while Inserting pba: %llu, Existing -> pointing to (lba, pba (zone), len): (%llu, %llu (%u), %llu) \n", __func__, r_new->pba, e->lba, e->pba, get_zone_nr(ctx, e->pba), e->len);
+				printk(KERN_ERR "\n %s Error while Inserting pba: %llu, New -> pointing to (lba, pba (zone), len): (%llu, %llu (%u), %llu) \n", __func__, r_new->pba, extent->lba, extent->pba, get_zone_nr(ctx, extent->pba), extent->len);
 				BUG_ON("2. Bug while adding revmap entry !");
 			}
 			link = &(parent->rb_right);
 			continue;
 		} 
-		printk(KERN_ERR "\n %s Error while Inserting pba: %llu, Existing -> pointing to (lba, pba (zone), len): (%llu, %llu (%u), %llu) \n", __func__, r_new->pba, e->lba, e->pba, get_czone_nr(ctx, e->pba), e->len);
-		printk(KERN_ERR "\n %s Error while Inserting pba: %llu, New -> pointing to (lba, pba (zone), len): (%llu, %llu (%u), %llu) \n", __func__, r_new->pba, extent->lba, extent->pba, get_czone_nr(ctx, extent->pba), extent->len);
+		printk(KERN_ERR "\n %s Error while Inserting pba: %llu, Existing -> pointing to (lba, pba (zone), len): (%llu, %llu (%u), %llu) \n", __func__, r_new->pba, e->lba, e->pba, get_zone_nr(ctx, e->pba), e->len);
+		printk(KERN_ERR "\n %s Error while Inserting pba: %llu, New -> pointing to (lba, pba (zone), len): (%llu, %llu (%u), %llu) \n", __func__, r_new->pba, extent->lba, extent->pba, get_zone_nr(ctx, extent->pba), extent->len);
 		BUG_ON("3. Bug while adding revmap entry !");
 	}
 	//printk( KERN_ERR "\n %s Inserting pba: %llu, pointing to (lba, len): (%llu, %u)", __func__, r_new->pba, extent->lba, extent->len);
@@ -731,6 +711,9 @@ struct rev_extent * lsdm_rb_revmap_insert(struct ctx *ctx, struct extent *extent
 	return r_new;
 }
 
+int _lsdm_verbose;
+void sit_ent_vblocks_incr(struct ctx *ctx, sector_t pba);
+void sit_ent_add_mtime(struct ctx *ctx, sector_t pba);
 /* 
  * Returns NULL if the new node code be added.
  * Return overlapping extent otherwise (overlapping node already exists)
@@ -740,7 +723,7 @@ static struct extent * lsdm_rb_insert(struct ctx *ctx, struct extent *new)
 	struct rb_root *root = &ctx->extent_tbl_root;
 	struct rb_node **link = NULL, *parent = NULL;
 	struct extent *e = NULL;
-	struct rev_extent *r_e = NULL; 
+	struct rev_extent *r_e = NULL, *r_insert; 
 
 	if (!root || !new) {
 		printk(KERN_ERR "\n Root is NULL! \n");
@@ -756,10 +739,7 @@ static struct extent * lsdm_rb_insert(struct ctx *ctx, struct extent *new)
 		parent = *link;
 		e = rb_entry(parent, struct extent, rb);
 		r_e = e->ptr_to_rev;
-		if (!r_e) {
-			printk(KERN_ERR "\n %s parent->lba: %llu, parent->pba: %llu, parent->len: %llu (No r_e found!) ", __func__, e->lba, e->pba, e->len);
-			BUG_ON(!r_e);
-		}
+		BUG_ON(!r_e);
 		if (e->pba != r_e->pba) {
 			printk(KERN_ERR "\n %s parent->lba: %llu, parent->pba: %llu, parent->len: %llu r_e->pba: %llu", __func__, e->lba, e->pba, e->len, r_e->pba);
 			BUG();
@@ -775,28 +755,22 @@ static struct extent * lsdm_rb_insert(struct ctx *ctx, struct extent *new)
 			return e;
 		}
 	}
-	if (new->pba == 0) {
-		/* we do not have to insert this here. Just free and return */
-		//printk( KERN_ERR "\n %s SEQ write --- NOT Inserting (lba: %llu pba: %llu len: %llu) ", __func__, new->lba, new->pba, new->len);
-		kmem_cache_free(ctx->extent_cache, new);
-		return NULL;
-	}
-	//printk( KERN_ERR "\n %s Inserting (lba: %llu pba: %llu len: %llu) ", __func__, new->lba, new->pba, new->len);
+	//printk( KERN_ERR "\n %s Inserting (lba: %llu pba: %llu len: %u) ", __func__, new->lba, new->pba, new->len);
 	/* Put the new node there */
 	rb_link_node(&new->rb, parent, link);
 	rb_insert_color(&new->rb, root);
-#ifdef LSDM_DEBUG
-	struct rev_extent *r_find, *r_insert;
 	r_insert = lsdm_rb_revmap_insert(ctx, new);
+#ifdef LSDM_DEBUG
+	struct rev_extent *r_find;
 	r_find = lsdm_rb_revmap_find(ctx, new->pba, new->len, ctx->sb->max_pba, __func__);
 	if (r_insert != r_find) {
-		printk(KERN_ERR "\n %s inserted revmap address is different than found one! ", __func__);
+		printk(KERN_ERR "\n %s inserted revmap address is different than found one! ");
 		printk(KERN_ERR "\n revmap_find(): %p, revmap_insert(): %p", r_find, r_insert);
 		printk(KERN_ERR "\n revmap_find()::pba: %llu, revmap_insert()::pba: %llu", r_find->pba, r_insert->pba);
 		BUG();
 	}
 	if (r_insert->pba != r_find->pba) {
-		printk(KERN_ERR "\n %s inserted revmap pba is different than found one! ", __func__);
+		printk(KERN_ERR "\n %s inserted revmap pba is different than found one! ");
 		printk(KERN_ERR "\n revmap_find()::pba: %llu, revmap_insert()::pba: %llu", r_find->pba, r_insert->pba);
 		BUG();
 	}
@@ -814,58 +788,7 @@ static struct extent * lsdm_rb_insert(struct ctx *ctx, struct extent *new)
 	return NULL;
 }
 
-static void find_and_remove_rev_tm(struct ctx *ctx, sector_t lba, unsigned int len)
-{
-	struct extent *e;
-	unsigned overlap, diff;
-	sector_t pba;
 
-	while(1) {
-		e = _lsdm_rb_geq(&ctx->extent_tbl_root, lba, 0);
-		/* case of no overlap */
-		if ((e == NULL) || (e->lba >= (lba + len)) || ((e->lba + e->len) <= lba))  {
-			break;
-		}
-
-		/* Case of Overlap, e always overlaps with bio */
-		if (e->lba > lba) {
-		/*   		 [eeeeeeeeeeee]
-		 *	[---------bio------] 
-		 */
-			diff = e->lba - lba;
-			lba = lba + diff;
-			len = len - diff;
-			/* we fall through as e->lba == lba now */
-		} 
-		//(e->lba <= lba) 
-		/* [eeeeeeeeeeee] eeeeeeeeeeeee]<- could be shorter or longer
-		 */
-		/*  [---------bio------] */
-		overlap = e->lba + e->len - lba;
-		diff = lba - e->lba;
-		BUG_ON(diff < 0);
-		pba = e->pba + diff;
-		//printk(KERN_ERR "\n lba: %llu, pba: %llu, overlap: %d, len: %d", lba, pba, overlap, len);
-		if (overlap >= len) { 
-		/* e is bigger than bio, so overlap >= nr_sectors, no further
-		 * splitting is required. Previous splits if any, are chained
-		 * to the last one as 'clone' is their parent.
-		 */
-			//remove_czone_info(ctx, lba, pba, len);
-			remove_rev_translation_entry(ctx, pba, len);
-			break;
-
-		} else {
-			/* overlap is smaller than nr_sectors remaining. */
-			//remove_czone_info(ctx, lba, pba, overlap);
-			remove_rev_translation_entry(ctx, pba, overlap);
-			/* Since e was smaller, we want to search for the next e */
-			len = len - overlap;
-			lba = lba + overlap;
-		}
-	}
-	return;
-}
 
 
 /* Update mapping. Removes any total overlaps, edits any partial
@@ -881,6 +804,7 @@ static int lsdm_rb_update_range(struct ctx *ctx, sector_t lba, sector_t pba, siz
 	//printk(KERN_ERR "\n Entering %s lba: %llu, pba: %llu, len:%ld ", __func__, lba, pba, len);
 	
 	BUG_ON(len <= 0);
+	BUG_ON(pba == 0);
 	BUG_ON(pba > ctx->sb->max_pba);
 	BUG_ON(lba > ctx->sb->max_pba);
 	new = kmem_cache_alloc(ctx->extent_cache, GFP_KERNEL);
@@ -956,6 +880,8 @@ static int lsdm_rb_update_range(struct ctx *ctx, sector_t lba, sector_t pba, siz
 		}
 		return(0);
 	}
+
+
 
 	/* Start from the smallest node that overlaps*/
 	 while(1) {
@@ -1107,7 +1033,6 @@ static void lsdm_free_rb_tree(struct ctx *ctx)
 	BUG_ON(root->rb_node);
 }
 
-
 static inline int is_lsdm_ioidle(struct ctx *ctx)
 {
 	//printk(KERN_ERR "\n %s nr_app_writes: %lu", __func__, ctx->nr_app_writes);
@@ -1126,6 +1051,15 @@ static inline void * lsdm_malloc(size_t size, gfp_t flags)
 
 	return addr;
 }
+
+void flush_translation_blocks(struct ctx *ctx);
+void flush_sit(struct ctx *ctx);
+
+#define DEF_FLUSH_TIME 10000 /* (milliseconds) */
+#define DEF_GC_TIME	10000000 /*1000 seconds */
+
+void do_checkpoint(struct ctx *ctx);
+void remove_translation_pages(struct ctx *ctx);
 
 static int flush_thread_fn(void * data)
 {
@@ -1205,7 +1139,7 @@ static int select_zone_to_clean(struct ctx *ctx, int mode, const char *func)
 	struct gc_cost_node * cnode = NULL;
 	struct gc_zone_node * znode = NULL;
 
-	//if (mode == FG_GC) {
+	//if (mode == BG_GC) {
 		node = rb_first(&ctx->gc_cost_root);
 		if (!node)
 			return -1;
@@ -1217,102 +1151,15 @@ static int select_zone_to_clean(struct ctx *ctx, int mode, const char *func)
 		}
 
 	//}
-	/* TODO: Mode: BG_GC */
+	/* TODO: Mode: FG_GC */
 	return -1;
 }
-
-int get_cblocks_count(struct ctx *ctx, unsigned int lzonenr)
-{
-	sector_t diff;
-	struct extent *e = NULL;
-	sector_t lba, last_lba, overlap;
-	int count = 0;
-
-	lba = lzonenr * ctx->nr_lbas_in_zone;
-	last_lba = lba + ctx->nr_lbas_in_zone;
-
-	/* Lookup this pba in the reverse table to find the
-	 * corresponding LBA. 
-	 */
-	while(lba <= last_lba) {
-		e = _lsdm_rb_geq(&ctx->extent_tbl_root, lba, 0);
-		if ((e == NULL) || (e->lba >= last_lba)) {  /* this will never happen:  (e->lba + e->len) <= lba) */
-			break;
-		}
-		/* Case of Overlap, e always overlaps with (lba - last_lba) address range,
-		 * higher e returned. The above if ensures that e->lba < last_lba
-		 */
-		if (e->lba > lba) {
-			/*               [eeeeeeeeeeee]
-			 *    (lba)
-			 */
-			lba = e->lba;
-			/* when we fall through to the next case, lba = e->lba */
-		}
-		/* (e->lba <= lba)
-		 *
-		 *		lba-----------last-lba
-		 *	eeeeeeeeeeeeeeeeee[eeeeeeeeeeeeeeeeeeeeeeee]
-		 *
-		 */
-		overlap = e->lba + e->len - lba;
-		diff = lba - e->lba;
-		lba = lba + overlap;
-		count = count + 1;
-	}
-	printk(KERN_ERR "\n Data zonenr: %u has %d blocks in cache \n", lzonenr, count);
-	return 0;
-}
-
-
-
-int create_dzone_list(struct ctx *ctx, unsigned int zonenr);
-#if 0
-static int traverse_gc_victim_tree(struct ctx *ctx)
-{
-	//struct rb_root *root = &ctx->gc_cost_root;
-	struct rb_root *root = &ctx->gc_zone_root;
-	struct rb_node *node;
-	struct gc_zone_node *znode;
-	struct cseg_zone_node *zone_nodep, *next_zone_nodep;
-	int czonenr = 0, dzonenr = 0, count=0;
-
-	node = root->rb_node;
-	if (!node) {
-		printk(KERN_ERR "\n Cost node tree is empty!! ");
-		czonenr = select_zone_to_clean(ctx, BG_GC, __func__);
-		printk(KERN_ERR "\n select_zone_to_clean() returned czonenr: %d ", czonenr);
-	}
-	while(node) {
-		znode = rb_entry(node, struct gc_zone_node, rb);
-		/* We remove znode from the list maintained by cost node. If this is the last node on the list 
-		 * then we have to remove the cost node from the tree
-		 */
-		printk(KERN_ERR "\n %s zone: %d has %d data zones", __func__, znode->zonenr, znode->vblks);
-		czonenr = znode->zonenr;
-		count = create_dzone_list(ctx, czonenr);
-		printk(KERN_ERR "\n %s Cleaning cache zonenr: %d #valid blks: %d nr_data_zones: %d \n", __func__, czonenr, get_sit_ent_vblocks(ctx, czonenr), count);	
-		list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
-			dzonenr = zone_nodep->lzonenr;
-			printk(KERN_ERR "zonenr: %d \n", dzonenr);
-			get_cblocks_count(ctx, dzonenr);
-		}
-		free_data_zone_list(ctx);
-		/* Delete this zone from the cost node list, cost tree and the gc zone tree */
-		remove_zone_from_gc_tree(ctx, czonenr);
-		node = root->rb_node;
-	}
-	return(0);
-}
-#endif
-
-
 
 static int add_extent_to_gclist(struct ctx *ctx, struct extent_entry *e)
 {
 	struct gc_extents *gc_extent;
 	/* maxlen is the maximum number of sectors permitted by BIO */
-	int maxlen = (BIO_MAX_PAGES) << SECTOR_BLK_SHIFT;
+	int maxlen = (BIO_MAX_PAGES >> 1) << SECTOR_BLK_SHIFT;
 	int temp = 0;
 	unsigned int pagecount, s8, count = 0;
 	
@@ -1341,7 +1188,6 @@ static int add_extent_to_gclist(struct ctx *ctx, struct extent_entry *e)
 		gc_extent->bio = NULL;
 		gc_extent->read = 0;
 		s8 = gc_extent->e.len;
-		/* TODO: if s8>2048, split this gc_extent into multiple extents */
 		BUG_ON(s8 > (BIO_MAX_PAGES << SECTOR_BLK_SHIFT));
 		pagecount = (s8 >> SECTOR_BLK_SHIFT);
 		gc_extent->nrpages = pagecount;
@@ -1350,7 +1196,7 @@ static int add_extent_to_gclist(struct ctx *ctx, struct extent_entry *e)
 			printk(KERN_ERR "\n %s could not allocate memory for gc_extent->bio_pages", __func__);
 			return -ENOMEM;
 		}
-		//printk(KERN_ERR "\n %s (lba: %llu, pba: %llu e->len: %llu) maxlen: %d temp: %d", __func__, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len, (maxlen), temp);
+		//printk(KERN_ERR "\n %s (lba: %llu, pba: %llu e->len: %ld) maxlen: %ld temp: %d", __func__, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len, (maxlen), temp);
 		/* 
 		 * We always want to add the extents in a PBA increasing order
 		 */
@@ -1363,28 +1209,6 @@ static int add_extent_to_gclist(struct ctx *ctx, struct extent_entry *e)
 		e->len = temp;
 	}
 	return count;
-}
-
-static int add_zone_to_gclist(struct ctx *ctx, unsigned int zonenr)
-{
-	struct cseg_zone_node *cseg_znode, *next_ptr;
-
-	BUG_ON(zonenr > ctx->sb->zone_count_data);
-	list_for_each_entry_safe(cseg_znode, next_ptr, &ctx->cseg_znodes->list, list) {
-		if (cseg_znode->lzonenr == zonenr) {
-			return 0;
-		}
-	}
-	//printk("\n %s() Adding dzone: %d to the list ", __func__, zonenr);
-	cseg_znode = kmem_cache_alloc(ctx->zones_in_cseg_cache, GFP_KERNEL);
-	if (!cseg_znode) {
-		printk(KERN_ERR "\n Could not allocate memory to gc_extent! ");
-		BUG();
-		return -ENOMEM;
-	}
-	cseg_znode->lzonenr = zonenr;
-	list_add_tail(&cseg_znode->list, &ctx->cseg_znodes->list);
-	return 1;
 }
 
 void read_gcextent_done(struct bio * bio)
@@ -1405,12 +1229,10 @@ static int read_extent_bio(struct ctx *ctx, struct gc_extents *gc_extent)
 	unsigned int s8, pagecount;
 	int i;
 
-	//printk(KERN_ERR "\n %s (lba: %llu, pba: %llu e->len: %llu)", __func__, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len);
 	//refcount_inc(&gc_extent->ref);
 	s8 = gc_extent->e.len;
 	BUG_ON(s8 > (BIO_MAX_PAGES << SECTOR_BLK_SHIFT));
 	pagecount = (s8 >> SECTOR_BLK_SHIFT);
-	BUG_ON(pagecount != gc_extent->nrpages);
 
 	/* create a bio with "nr_pages" bio vectors, so that we can add nr_pages (nrpages is different)
 	 * individually to the bio vectors
@@ -1435,7 +1257,8 @@ static int read_extent_bio(struct ctx *ctx, struct gc_extents *gc_extent)
 	}
 	bio->bi_iter.bi_sector = gc_extent->e.pba;
 	bio_set_dev(bio, ctx->dev->bdev);
-	//bio->bi_private = gc_extent;
+	//bio_set_op_attrs(bio, REQ_OP_READ, 0);
+	bio->bi_private = gc_extent;
 	//bio->bi_end_io = read_gcextent_done;
 	gc_extent->bio = bio;
 #ifdef LSDM_DEBUG
@@ -1447,33 +1270,10 @@ static int read_extent_bio(struct ctx *ctx, struct gc_extents *gc_extent)
 	submit_bio_wait(gc_extent->bio);
 	//refcount_dec(&gc_extent->ref);
 	bio_put(bio);
-	gc_extent->bio = NULL;
 	return 0;
 }
 
-void free_gc_extent(struct ctx * ctx, struct gc_extents * gc_extent)
-{
-	unsigned int pagecount = 0;
-	int i;
 
-	pagecount = gc_extent->nrpages;
-	if (gc_extent->bio_pages) {
-		for (i=0; i<pagecount; i++) {
-			if(gc_extent->bio_pages[i]) {
-				mempool_free(gc_extent->bio_pages[i], ctx->gc_page_pool);
-				gc_extent->bio_pages[i] = NULL;
-			}
-		}
-		kfree(gc_extent->bio_pages);
-		gc_extent->bio_pages = NULL;
-	}
-	gc_extent->nrpages = 0;
-	gcextent_init(gc_extent, 0, 0 , 0);
-	if (gc_extent->bio) {
-	       bio_put(gc_extent->bio);
-	}
-	kmem_cache_free(ctx->gc_extents_cache, gc_extent);
-}
 
 static void free_gc_list(struct ctx *ctx)
 {
@@ -1489,6 +1289,8 @@ static void free_gc_list(struct ctx *ctx)
 	printk(KERN_ERR "\n %s done! \n ", __func__);
 }
 
+void wait_on_refcount(struct ctx *ctx, refcount_t *ref, spinlock_t *lock);
+
 /*
  * TODO: Do  not chain the bios as we do not get notification
  * of what extent reading did not work! We can retry and if
@@ -1499,7 +1301,6 @@ static int read_gc_extents(struct ctx *ctx)
 	struct list_head *pos;
 	struct gc_extents *gc_extent;
 	int count = 0;
-	int len = 0;
 	
 	/* If list is empty we have nothing to do */
 	BUG_ON(list_empty(&ctx->gc_extents->list));
@@ -1516,13 +1317,33 @@ static int read_gc_extents(struct ctx *ctx)
 			printk(KERN_ERR "Low memory! TODO: Write code to free memory from translation tables etc ");
 			BUG();
 		}
-		len = len + gc_extent->e.len;
-		count++;
+		count = count + 1;
 	}
-	trace_printk("\n GC extents submitted for read: %d , #sectors read: %d", count, len);
-	return len;
+	//printk(KERN_ERR "\n GC extents submitted for read: %d ", count);
+	return 0;
 }
 
+/*
+ * We sort on the LBA
+static int cmp_list_nodes(void *priv, struct list_head *lha, struct list_head *lhb)
+{
+	struct gc_extents *ga, *gb;
+
+	ga = list_entry(lha, struct gc_extents, list);
+	gb = list_entry(lhb, struct gc_extents, list);
+
+	BUG_ON(ga->e.lba == gb->e.lba);
+	if (ga->e.lba < gb->e.lba)
+		return -1;
+	return 1;
+}
+ */
+void mark_disk_full(struct ctx *ctx);
+void move_gc_write_frontier(struct ctx *ctx, sector_t sectors_s8);
+
+static int setup_extent_bio_write(struct ctx *ctx, struct gc_extents *gc_extent);
+struct tm_page *add_tm_page_kv_store(struct ctx *, sector_t);
+int add_translation_entry(struct ctx *, sector_t , sector_t , size_t ); 
 /* 
  * The extent that we are about to write will definitely fit into
  * the gc write frontier. No one is writing to the gc frontier
@@ -1533,160 +1354,60 @@ static int read_gc_extents(struct ctx *ctx)
  * from the disk, we are sure that the length is in terms of what is
  * found on disk.
  */
-static int write_metadata_extent(struct ctx *ctx, struct gc_extents *gc_extent, sector_t wp)
+static int write_metadata_extent(struct ctx *ctx, struct gc_extents *gc_extent)
 {
+	struct bio *bio;
+	sector_t s8;
+	int ret;
 
-	gc_extent->e.pba = wp;
+	/*
+	ret = refcount_read(&gc_extent->ref);
+	if (ret > 1) {
+		printk(KERN_ERR "\n waiting on refcount \n");
+		wait_on_refcount(ctx, &gc_extent->ref, &ctx->gc_ref_lock);
+	}*/
+	setup_extent_bio_write(ctx, gc_extent);
+	bio = gc_extent->bio;
+	s8 = bio_sectors(bio);
+
+	//down_write(&ctx->wf_lock);
+	bio->bi_iter.bi_sector = ctx->warm_gc_wf_pba;
+	gc_extent->e.pba = ctx->warm_gc_wf_pba;
+	move_gc_write_frontier(ctx, gc_extent->e.len);
+	//up_write(&ctx->wf_lock);
+
 	//printk(KERN_ERR "\n %s gc_extent: (lba: %d pba: %d len: %d), s8: %d max_pba: %llu", __func__, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len, s8, ctx->sb->max_pba);
-	BUG_ON(gc_extent->e.pba == 0);
+#ifdef LSDM_DEBUG
+	BUG_ON(gc_extent->e.len != s8);
+	BUG_ON(gc_extent->e.pba == 0 );
 	BUG_ON(gc_extent->e.pba >= ctx->sb->max_pba);
 	BUG_ON(gc_extent->e.lba >= ctx->sb->max_pba);
-
-	/* Now reads will work! so we can complete the bio */
-	/* Do this before the RB tree is updated, as we need to remove the old translation entries and adjust the valid blks corresponding to the zone in cache if any */
-	find_and_remove_rev_tm(ctx, gc_extent->e.lba, gc_extent->e.len);
-	lsdm_rb_update_range(ctx, gc_extent->e.lba, 0, gc_extent->e.len);
-	return 0;
-}
-
-
-int write_zero_pages(struct ctx *ctx, int diff, sector_t wp)
-{
-	int i=0;
-	struct bio_vec *bv = NULL;
-	struct page *page;
-	struct bio *bio;
-	struct bvec_iter_all iter_all;
-	int bio_pages, rem_pages;
-
-	BUG_ON(!diff);
-	BUG_ON(diff % NR_SECTORS_IN_BLK);
-	rem_pages = (diff >> SECTOR_BLK_SHIFT);
-
-	while (rem_pages) {
-		bio_pages = rem_pages;
-		if (rem_pages > 256) {
-			bio_pages = 256;
-		}
-		//printk(KERN_ERR "\n %s bio_pages: %d ", __func__, bio_pages);
-		BUG_ON(bio_pages > 256);
-		bio = bio_alloc_bioset(ctx->dev->bdev, bio_pages, REQ_OP_WRITE, GFP_KERNEL, ctx->gc_bs);
-		if (!bio) {
-			printk(KERN_ERR "\n %s could not allocate memory for bio ", __func__);
-			return -ENOMEM;
-		}
-
-		/* bio_add_page sets the bi_size for the bio */
-		for(i=0; i<bio_pages; i++) {
-			page = mempool_alloc(ctx->gc_page_pool, GFP_KERNEL);
-			if ((!page) || ( !bio_add_page(bio, page, PAGE_SIZE, 0))) {
-				printk(KERN_ERR "\n %s Could not add page to the bio ", __func__);
-				printk(KERN_ERR "bio->bi_vcnt: %d bio->bi_iter.bi_size: %d bi_max_vecs: %d \n", bio->bi_vcnt, bio->bi_iter.bi_size, bio->bi_max_vecs);
-				bio_for_each_segment_all(bv, bio, iter_all) {
-					mempool_free(bv->bv_page, ctx->gc_page_pool);
-				}
-				bio_put(bio);
-				return -ENOMEM;
-			}
-		}
-		//printk(KERN_ERR "\n %s bio_sectors(bio): %llu nr_pages: %d", __func__,  bio_sectors(bio), bio_pages);
-		bio_set_dev(bio, ctx->dev->bdev);
-		bio->bi_opf = REQ_OP_WRITE;
-		bio->bi_status = BLK_STS_OK;
-		zero_fill_bio(bio);
-		bio->bi_iter.bi_sector = wp;
-		submit_bio_wait(bio);
-		bio_for_each_segment_all(bv, bio, iter_all) {
-			mempool_free(bv->bv_page, ctx->gc_page_pool);
-		}
-		bio_put(bio);
-		wp = wp + (bio_pages << SECTOR_BLK_SHIFT);
-		rem_pages = rem_pages - bio_pages;
-	}
-	return 0;
-
-}
-
-static int write_valid_gc_extents(struct ctx *ctx, unsigned int lzonenr)
-{
-	struct list_head *pos;
-	struct gc_extents *gc_extent;
-	struct seq_zones_info *szi = &ctx->dzit[lzonenr];
-	struct bio_vec *bv = NULL;
-	struct bvec_iter_all iter_all;
-	struct bio * bio;
-	int pzonenr;
-	sector_t wp;
-	int count  = 0, offset = 0;
-	sector_t last_pba = 0;
-	int nr_sectors = 0;
+#endif
+	bio->bi_status = BLK_STS_OK;
 	
-	/* If list is empty we have nothing to do */
-	BUG_ON(list_empty(&ctx->gc_extents->list));
-	pzonenr = get_new_data_zone(ctx);
-	//printk(KERN_ERR "\n %s Allocated a new pzonenr: %d ", __func__, pzonenr);
-	BUG_ON(pzonenr > ctx->sb->zone_count);
-	wp = get_first_pba_for_dzone(ctx, pzonenr);
-	last_pba = wp + ctx->nr_lbas_in_zone;
-	int current_offset = 0, diff = 0;
-	/* setup the bio for the first gc_extent */
-	list_for_each(pos, &ctx->gc_extents->list) {
-		gc_extent = list_entry(pos, struct gc_extents, list);
-		offset = gc_extent->e.lba % ctx->nr_lbas_in_zone;
-		current_offset = wp % ctx->nr_lbas_in_zone;
-		BUG_ON(offset < current_offset);
-		if (offset > current_offset) {
-			diff = offset - current_offset;
-			if (write_zero_pages(ctx, diff, wp)) {
-				printk(KERN_ERR "\n Could not complete cache zone cleaning due to resources ");
-				return -ENOMEM;
-			}
-			wp = wp + diff;
-			nr_sectors += diff;
-			trace_printk("(zero pages) lzonenr: %u, pzonenr: %d wp: %llu last_pba: %llu nr_sectors: %d ", lzonenr, pzonenr, wp, last_pba, nr_sectors);
-			BUG_ON(nr_sectors > ctx->nr_lbas_in_zone);
-			BUG_ON(wp > last_pba);
-		}
-		gc_extent->bio = NULL;
-		/* next function will set up the bio */
-		setup_extent_bio_write(ctx, gc_extent);
-		//printk(KERN_ERR "\n %s (lba: %llu, pba: %llu e->len: %llu)", __func__, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len);
-		bio = gc_extent->bio;
-		bio->bi_iter.bi_sector = wp;
-		submit_bio_wait(gc_extent->bio);
-		write_metadata_extent(ctx, gc_extent, wp);
-		trace_printk("\n (extent write) lzonenr: %u, pzonenr: %d wp: %llu last_pba: %llu nr_sectors: %d gc_extent->(lba: %llu, len: %llu) ", lzonenr, pzonenr, wp, last_pba, nr_sectors, gc_extent->e.lba, gc_extent->e.len);
-		wp = wp + gc_extent->e.len;
-		nr_sectors += gc_extent->e.len;
-		BUG_ON(nr_sectors > ctx->nr_lbas_in_zone);
-		BUG_ON(wp > last_pba);
-		bio_for_each_segment_all(bv, gc_extent->bio, iter_all) {
-			mempool_free(bv->bv_page, ctx->gc_page_pool);
-		}
-		bio_put(gc_extent->bio);
-		kfree(gc_extent->bio_pages);
-		gc_extent->bio_pages = NULL;
-		count++;
-	}
-	/* We have to free the old physical data zone explicitly. Cache zone not data zone is freed in sit_ent_vblocks_decr()
-	 */
-	if (szi->wp) {
-		/* No data zone lies in the CMR zone, so no need to check */
-		mark_zone_free(ctx, szi->pzonenr, ctx->free_dzone_bitmap, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit, &ctx->nr_free_data_zones, 1);
-	}
-	szi->pzonenr = pzonenr;
-	szi->wp = wp;
-	trace_printk("\n #GC extents written to disk: %d logical zonenr: %d, new physical zone: %d", count, lzonenr, pzonenr);
+	down_write(&ctx->lsdm_rev_lock);
+	/*---------------------*/
+	add_revmap_entry(ctx, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len);
+	/*---------------------*/
+	up_write(&ctx->lsdm_rev_lock);
+	add_translation_entry(ctx, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len);
+	//printk(KERN_ERR "\n %s About to add: lba: %llu pba: %llu , len: %llu e.len: %u" , __func__, gc_extent->e.lba, gc_extent->e.pba, s8, gc_extent->e.len);
+	ret = lsdm_rb_update_range(ctx, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len);
+	//printk(KERN_ERR "\n %s Added rb entry ! lba: %llu pba: %llu , len: %llu e.len: %u" , __func__, gc_extent->e.lba, gc_extent->e.pba, s8, gc_extent->e.len);
 	return 0;
 }
+
+static void mark_zone_free(struct ctx *ctx , int zonenr, int resetZone);
+
+
 
 static int setup_extent_bio_write(struct ctx *ctx, struct gc_extents *gc_extent)
 {
 	int i=0, s8;
 	struct bio_vec *bv = NULL;
-	struct bvec_iter_all iter_all;
 	struct page *page;
 	struct bio *bio;
+	struct bvec_iter_all iter_all;
 	int bio_pages;
 
 	s8 = gc_extent->e.len;
@@ -1725,44 +1446,267 @@ static int setup_extent_bio_write(struct ctx *ctx, struct gc_extents *gc_extent)
 	//printk(KERN_ERR "\n %s bio_sectors(bio): %llu nr_pages: %d", __func__,  bio_sectors(bio), bio_pages);
 	bio_set_dev(bio, ctx->dev->bdev);
 	bio->bi_opf = REQ_OP_WRITE;
-	bio->bi_status = BLK_STS_OK;
 	//bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
 	gc_extent->bio = bio;
 	return 0;
 }
 
+void free_gc_extent(struct ctx * ctx, struct gc_extents * gc_extent)
+{
+	unsigned int pagecount = 0;
+	int i;
+
+	list_del(&gc_extent->list);
+	pagecount = gc_extent->nrpages;
+	if (gc_extent->bio_pages) {
+		for (i=0; i<pagecount; i++) {
+			if(gc_extent->bio_pages[i]) {
+				mempool_free(gc_extent->bio_pages[i], ctx->gc_page_pool);
+				gc_extent->bio_pages[i] = NULL;
+			}
+		}
+		kfree(gc_extent->bio_pages);
+		gc_extent->bio_pages = NULL;
+	}
+	gc_extent->nrpages = 0;
+	gcextent_init(gc_extent, 0, 0 , 0);
+	if (gc_extent->bio) {
+		bio_put(gc_extent->bio);
+	}
+	kmem_cache_free(ctx->gc_extents_cache, gc_extent);
+}
+
+
+int add_block_based_translation(struct ctx *ctx, struct page *page, const char * caller);
+
+int complete_revmap_blk_flush(struct ctx * ctx, struct page *page)
+{
+	struct bio * bio;
+	unsigned int revmap_entry_nr, revmap_sector_nr;	
+	sector_t pba;
+	
+	down_write(&ctx->lsdm_rev_lock);
+	pba = ctx->revmap_pba;
+	revmap_entry_nr = atomic_read(&ctx->revmap_entry_nr);
+	revmap_sector_nr = atomic_read(&ctx->revmap_sector_nr);
+	//printk(KERN_ERR "\n %s entry_nr: %d sector_nr: %d page: %p", __func__, revmap_entry_nr, revmap_sector_nr, page_address(page));
+	if ((revmap_entry_nr == 0) && (revmap_sector_nr == 0)) {
+		up_write(&ctx->lsdm_rev_lock);
+		return 0;
+	}
+	atomic_set(&ctx->revmap_entry_nr, 0);
+	atomic_set(&ctx->revmap_sector_nr, 0);
+	up_write(&ctx->lsdm_rev_lock);
+
+	bio = bio_alloc(ctx->dev->bdev, 1, REQ_OP_WRITE, GFP_KERNEL);
+	if (!bio) {
+		return -ENOMEM;
+	}
+	
+	if( PAGE_SIZE > bio_add_page(bio, page, PAGE_SIZE, 0)) {
+		bio_put(bio);
+		return -EFAULT;
+	}
+
+	bio->bi_iter.bi_sector = pba;
+	//printk(KERN_ERR "%s Flushing revmap blk at pba:%llu ctx->revmap_pba: %llu", __func__, bio->bi_iter.bi_sector, ctx->revmap_pba);
+	bio->bi_opf = REQ_OP_WRITE;
+	//bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+	bio_set_dev(bio, ctx->dev->bdev);
+	BUG_ON(ctx->revmap_pba > ctx->sb->max_pba);
+	submit_bio_wait(bio);
+	mark_revmap_bit(ctx, pba);
+	bio_put(bio);
+	__free_pages(page, 0);
+	nrpages--;
+	return 0;
+}
+
+int print_gc_extents(struct ctx *ctx, int zonenr);
+int get_sit_ent_vblocks(struct ctx *ctx, int zonenr);
 /* Since our read_extents call, overwrites could have made
  * the blocks in this zone invalid. Thus we now take a 
  * write lock and then re-read the extents metadata; else we
  * will end up writing invalid blocks and loosing the
  * overwritten data
  */
+static int write_valid_gc_extents(struct ctx *ctx, int zonenr)
+{
+	struct extent *e = NULL;
+	struct rev_extent *rev_e = NULL;
+	struct gc_extents *gc_extent, *temp_ptr, *newgc_extent, *next_ptr;
+	sector_t diff;
+	sector_t nr_sectors, s8, len;
+	int count = 0, pagecount = 0, diffcount = 0;
+	int i, j, total_vblks = 0;
+	u64 last_pba_read;
+	u64 gc_writes = 0;
+	//int total = 0;
+
+	
+	total_vblks = get_sit_ent_vblocks(ctx, zonenr);
+	last_pba_read = get_last_pba_for_zone(ctx, zonenr);
+	list_for_each_entry_safe(gc_extent, next_ptr, &ctx->gc_extents->list, list) {
+		/* Reverse map stores PBA as e->lba and LBA as e->pba
+		 * This was done for code reuse between map and revmap
+		 * Thus e->lba is actually the PBA
+		 */
+		gc_extent->bio = NULL;
+		//printk(KERN_ERR "\n %s gc_extent::(lba: %llu, pba: %llu, len: %d) last_pba_read: %llu", __func__, gc_extent->e.lba, gc_extent->e.pba, gc_extent->e.len, last_pba_read);
+		down_write(&ctx->lsdm_rb_lock);
+		/* You cannot use rb_next here as pba ie the key, changes when we write to a new frontier,
+		 * so the node is removed and rewritten at a different place, so the next is the new next 
+		 */
+		rev_e = lsdm_rb_revmap_find(ctx, gc_extent->e.pba, gc_extent->e.len, last_pba_read, __func__);
+		if (!rev_e) {
+			up_write(&ctx->lsdm_rb_lock);
+			/* snip all the gc_extents from this onwards */
+			list_for_each_entry_safe_from(gc_extent, temp_ptr, &ctx->gc_extents->list, list) {
+				gc_extent->bio = NULL;
+				free_gc_extent(ctx, gc_extent);
+			}
+			break;
+		}
+		e = rev_e->ptr_to_tm;
+		/* entire extent is lost by interim overwrites */
+		if (e->pba >= (gc_extent->e.pba + gc_extent->e.len)) {
+			//printk(KERN_ERR "\n %s:%d entire extent is lost! \n", __func__, __LINE__);
+			up_write(&ctx->lsdm_rb_lock);
+			gc_extent->bio = NULL;
+			free_gc_extent(ctx, gc_extent);
+			continue;
+		}
+		/* extents are partially snipped at the front*/
+		if (e->pba > gc_extent->e.pba) {
+			//printk(KERN_ERR "\n %s:%d extent is snipped! \n", __func__, __LINE__);
+			diff = e->pba - gc_extent->e.pba;
+			gc_extent->e.lba = e->lba;
+			gc_extent->e.pba = e->pba;
+			gc_extent->e.len = gc_extent->e.len - diff;
+			BUG_ON(!gc_extent->e.len);
+			pagecount = gc_extent->e.len >> SECTOR_BLK_SHIFT;
+			BUG_ON(!pagecount);
+			diffcount = gc_extent->nrpages - pagecount;
+			BUG_ON(!diffcount);
+			/* free the extra pages */
+			for(i=0; i<diffcount; i++) {
+				/* free the front pages already read */
+				mempool_free(gc_extent->bio_pages[i], ctx->gc_page_pool);
+			}
+			for(j=diffcount, i=0; i<pagecount; i++, j++) {
+				/* copy from back (j) to the front (i) */
+				gc_extent->bio_pages[i] = gc_extent->bio_pages[j];
+				/* free the back */
+				gc_extent->bio_pages[j] = NULL;
+			}
+			gc_extent->nrpages = pagecount;
+		}
+		/* Now we adjust the gc_extent such that it can be  written in the available
+		 * space in the gc segment. If less space is available than is required by a
+		 * bio, we split that bio. Else we write it as it is.
+		 */
+		nr_sectors = gc_extent->e.len;
+		BUG_ON(!nr_sectors);
+		s8 = round_up(nr_sectors, NR_SECTORS_IN_BLK);
+#ifdef LSDM_DEBUG
+		BUG_ON(nr_sectors != s8);
+		BUG_ON(ctx->free_sectors_in_gc_wf < NR_SECTORS_IN_BLK);
+#endif
+		if (nr_sectors > ctx->free_sectors_in_gc_wf) {
+			//BUG_ON(!ctx->free_sectors_in_gc_wf);
+			//printk(KERN_ERR "\n %s nr_sectors: %llu, ctx->free_sectors_in_gc_wf: %llu gc_extent->nrpages: %d", __func__, nr_sectors, ctx->free_sectors_in_gc_wf, gc_extent->nrpages);
+			newgc_extent = kmem_cache_alloc(ctx->gc_extents_cache, GFP_KERNEL);
+			if(!newgc_extent) {
+				up_write(&ctx->lsdm_rb_lock);
+				printk(KERN_ERR "\n Could not allocate memory to new gc_extent! ");
+				BUG();
+				return -1;
+			}
+			gcextent_init(newgc_extent, 0, 0 , 0);
+			gc_extent->e.len = ctx->free_sectors_in_gc_wf;
+			gc_extent->nrpages = gc_extent->e.len >> SECTOR_BLK_SHIFT;
+			newgc_extent->e.lba = gc_extent->e.lba + ctx->free_sectors_in_gc_wf;
+			newgc_extent->e.pba = gc_extent->e.pba + ctx->free_sectors_in_gc_wf;
+			len = nr_sectors - ctx->free_sectors_in_gc_wf;
+			newgc_extent->e.len = len;
+			/* pagecount: page count of newgc_extent */
+			pagecount = len >> SECTOR_BLK_SHIFT;
+			BUG_ON(!pagecount);
+			newgc_extent->nrpages = pagecount;
+			newgc_extent->bio_pages = kmalloc(pagecount * sizeof(void *), GFP_KERNEL);
+			if (!newgc_extent->bio_pages) {
+				up_write(&ctx->lsdm_rb_lock);
+				printk(KERN_ERR "\n %s could not allocate memory for newgc_extent->bio_pages", __func__);
+				BUG();
+				return -ENOMEM;
+			}
+			j = gc_extent->nrpages;
+			BUG_ON(!j);
+			/* Copy the remaining pages from gc_extent to newgc_extent */
+			for(i=0; i<pagecount; i++, j++) {
+				newgc_extent->bio_pages[i] = gc_extent->bio_pages[j];
+				gc_extent->bio_pages[j] = NULL;
+			}
+			list_add(&newgc_extent->list, &gc_extent->list);
+			next_ptr = newgc_extent;
+			//printk(KERN_ERR "\n %s gc_extent::len: %d newgc_extent::len: %d ", __func__, gc_extent->e.len, newgc_extent->e.len);
+		}
+
+		/* Now you verify all this after holding a lock */
+		write_metadata_extent(ctx, gc_extent);
+		up_write(&ctx->lsdm_rb_lock);
+		//total += gc_extent->e.len;
+		/* We do not want to do disk I/O with a lock held. So we write the metadata
+		 * and then submit_bio. Now we can have a read on this, before the write completes.
+		 * We need to take care of that - such a read will have to wait.
+		 * TODO: fix this - read the same block that is about to be written by GC problem.
+		 * Mark such a read.
+		 */
+		submit_bio_wait(gc_extent->bio);
+		ctx->nr_gc_writes += s8;
+		gc_writes += s8;
+		//flush_workqueue(ctx->tm_wq);
+		free_gc_extent(ctx, gc_extent);
+		count++;
+		/*
+#ifdef LSDM_DEBUG
+		int vblks;
+		vblks = get_sit_ent_vblocks(ctx, zonenr);
+		BUG_ON(vblks > (total_vblks - (gc_extent->e.len >> SECTOR_BLK_SHIFT)));
+		printk(KERN_ERR "\n %s validblks: %d ", __func__, vblks);
+#endif
+		*/
+	}
+	/*
+#ifdef LSDM_DEBUG
+	printk(KERN_ERR "\n %s All %d extents written, total: %d , flushing workqueue now! Segment cleaned! \n", __func__, count, total);
+	vblks = get_sit_ent_vblocks(ctx, zonenr);
+	//printk(KERN_ERR "\n %s validblks: %d ", __func__, vblks);
+	if (vblks != 0) {
+		print_gc_extents(ctx, zonenr);
+		BUG_ON(1);
+	}
+#endif
+	flush_workqueue(ctx->tm_wq);
+	*/
+	/* last revmap blk may not be full, we write the partial revmap blk */
+	/* clear the revmap bitmap */
+	return gc_writes;
+}
+
 static int free_gc_extents(struct ctx *ctx)
 {
 	struct gc_extents *gc_extent, *next_ptr;
-	int count = 0;
 	
 	list_for_each_entry_safe(gc_extent, next_ptr, &ctx->gc_extents->list, list) {
-		list_del(&gc_extent->list);
-		gc_extent->nrpages = 0;
-		gcextent_init(gc_extent, 0, 0 , 0);
-		kmem_cache_free(ctx->gc_extents_cache, gc_extent);
-		count = count + 1;
-	}
-	//printk(KERN_ERR "\n gc extents freed %d", count);
-	return 0;
-}
-
-static int free_data_zone_list(struct ctx *ctx)
-{
-	struct cseg_zone_node *cseg_znode, *next_ptr;
-
-	list_for_each_entry_safe(cseg_znode, next_ptr, &ctx->cseg_znodes->list, list) {
-		list_del(&cseg_znode->list);
-		kmem_cache_free(ctx->zones_in_cseg_cache, cseg_znode);
+		gc_extent->bio = NULL;
+		free_gc_extent(ctx, gc_extent);
 	}
 	return 0;
 }
+
+
+struct sit_page * add_sit_page_kv_store(struct ctx * ctx, sector_t pba, const char * caller);
 
 int verify_gc_zone(struct ctx *ctx, int zonenr, sector_t pba)
 {
@@ -1780,7 +1724,7 @@ int verify_gc_zone(struct ctx *ctx, int zonenr, sector_t pba)
 	mutex_unlock(&ctx->sit_kv_store_lock);
 
 	ptr = (struct lsdm_seg_entry *) page_address(sit_page->page);
-	if (zonenr != get_czone_nr(ctx, pba))
+	if (zonenr != get_zone_nr(ctx, pba))
 		BUG_ON(1);
 
 	index = zonenr % SIT_ENTRIES_BLK; 
@@ -1794,6 +1738,8 @@ int verify_gc_zone(struct ctx *ctx, int zonenr, sector_t pba)
 	return 0;
 }
 
+int remove_zone_from_gc_tree(struct ctx *ctx, unsigned int zonenr);
+
 void print_memory_usage(struct ctx *ctx, const char *action)
 {
 	__kernel_ulong_t freeram, available;
@@ -1806,19 +1752,21 @@ void print_memory_usage(struct ctx *ctx, const char *action)
 	printk(KERN_ERR "\n %s : available memory: %lu mB", action, available);
 }
 
-int create_dzone_list(struct ctx *ctx, unsigned int zonenr)
+int print_gc_extents(struct ctx *ctx, int zonenr)
 {
 	sector_t diff;
-	struct extent *e = NULL, temp;
+	struct extent *e = NULL;
 	struct rev_extent *rev_e = NULL;
+	struct extent_entry temp;
+	long total_len = 0;
 	sector_t pba, last_pba; 
-	int count = 0, ret = 0;
+	int vblks;
+	struct rb_node *node;
 
-	pba = get_first_pba_for_czone(ctx, zonenr);
-	last_pba = get_last_pba_for_czone(ctx, zonenr);
-	INIT_LIST_HEAD(&ctx->cseg_znodes->list);
-
-	//printk(KERN_ERR "\n %s zonenr: %u first_pba: %llu, last_pba: %llu", __func__, zonenr, pba, last_pba);
+	pba = get_first_pba_for_zone(ctx, zonenr);
+	last_pba = get_last_pba_for_zone(ctx, zonenr);
+	vblks = get_sit_ent_vblocks(ctx, zonenr);
+	INIT_LIST_HEAD(&ctx->gc_extents->list);
 
 	//print_memory_usage(ctx, "Before GC");
 	/* Lookup this pba in the reverse table to find the
@@ -1828,42 +1776,143 @@ int create_dzone_list(struct ctx *ctx, unsigned int zonenr)
 	 * not need to perform GC on this segment.
 	 */
 
+	temp.pba = 0;
+	temp.lba = 0;
+	temp.len = 0;
+	printk(KERN_ERR "\n %s zonenr: %d first_pba: %llu last_pba: %llu #valid blks: %d", __func__, zonenr, pba, last_pba, vblks);
+	rev_e = lsdm_rb_revmap_find(ctx, pba, 0, last_pba, __func__);
+	if (!rev_e) {
+		return 0;
+	}
+	e = rev_e->ptr_to_tm;
 	while(pba <= last_pba) {
-		rev_e = lsdm_rb_revmap_find(ctx, pba, 0, last_pba, __func__);
-		//BUG_ON(NULL == rev_e);
-		if (!rev_e) {
-			//printk(KERN_ERR "\n %s did not find more extents! breaking out", __func__);
+		e = rev_e->ptr_to_tm;
+		printk(KERN_ERR "\n %s Looking for pba: %llu! Found e, LBA: %llu, PBA: %llu, len: %llu e->(pba+len): %llu, remaining: %llu", __func__, pba, e->lba, e->pba, e->len, e->pba + e->len, last_pba -(e->pba + e->len));
+		
+		/* Don't change e directly, as e belongs to the
+		 * reverse map rb tree and we have the node address
+		 */
+		if (e->pba > last_pba) {
+			//printk(KERN_ERR "\n %s Found bigger pba than last_pba: %llu , last_found_pba: %llu", __func__, last_pba, e->pba);
 			break;
 		}
-		e = rev_e->ptr_to_tm;
-		BUG_ON(rev_e->pba != e->pba);
-		BUG_ON((e->pba + e->len) < e->pba);
-		if((e->pba + e->len) < pba) {
-			printk(KERN_ERR "\n %s BUG: (GC) considering pba: %llu, found: (lba: %llu, pba: %llu len: %llu) last_pba: %llu", __func__, pba, e->lba, e->pba, e->len, last_pba);
-			BUG();
-		}
-		if (e->pba > last_pba) {
-			/* Should not happen */
-			//printk(KERN_ERR "\n %s Found bigger pba than last_pba: %llu , last_found_pba: %llu", __func__, last_pba, e->pba);
-			BUG();
-		}
-		e = rev_e->ptr_to_tm;
-		//printk(KERN_ERR "\n %s Looking for pba: %llu! Found e, LBA: %llu, PBA: %llu, len: %llu e->(pba+len): %llu, remaining: %llu", __func__, pba, e->lba, e->pba, e->len, e->pba + e->len, last_pba -(e->pba + e->len));
 		if (e->pba < pba) {
 			/* 
 			 * Overlapping e found
 			 * e-------
 			 * 	pba
 			 */
+			BUG_ON((e->pba + e->len) < pba);
 			diff = pba - e->pba;
 			temp.pba = pba;
 			temp.lba = e->lba + diff;
 			temp.len = e->len - diff;
+			BUG_ON(!temp.len);
+			printk(KERN_ERR "\n %s Adjusted pba (lba: %llu, pba: %llu len: %llu) last_pba: %lld", __func__, temp.lba, temp.pba, temp.len, last_pba);
 		} else {
-			/* e->pba >= pba
+			/*
 			 * 	e------
 			 * pba
 			 */
+			temp.pba = e->pba;
+			temp.lba = e->lba;
+			temp.len = e->len;
+			printk(KERN_ERR "\n %s Copied e (lba: %llu, pba: %llu len: %llu) last_pba: %lld", __func__, temp.lba, temp.pba, temp.len, last_pba);
+		}
+		/* if start is 0, len is 4, then you want to read 4 sectors. If last_pba is
+		 * 3, you want len to be 4.
+		 */
+		if (temp.pba + temp.len >= last_pba + 1) {
+			temp.len = last_pba - temp.pba + 1;
+			printk(KERN_ERR "\n %s Adjusted len: (lba: %llu, pba: %llu len: %llu) last_pba: %lld", __func__, temp.lba, temp.pba, temp.len, last_pba);
+		}
+		total_len = total_len + temp.len;
+		pba = temp.pba + temp.len;
+		node = rb_next(&rev_e->rb);
+		if (NULL == node) {
+			printk(KERN_ERR "\n %s Found NULL! No next node!! last_pba: %llu , last_found_pba: %llu", __func__, last_pba, e->pba);
+			break;
+		}
+		rev_e = container_of(node, struct rev_extent, rb);
+	}
+	printk(KERN_ERR "\n %s total_len: %ld vblks: %d \n", __func__, total_len, vblks);
+	return 0;
+}
+
+
+int create_gc_extents(struct ctx *ctx, int zonenr)
+{
+	sector_t diff;
+	struct extent *e = NULL;
+	struct rev_extent *rev_e = NULL;
+	struct extent_entry temp;
+	long total_len = 0, total_extents = 0;
+	int count;
+	sector_t pba, last_pba; 
+	int vblks;
+
+	pba = get_first_pba_for_zone(ctx, zonenr);
+	last_pba = get_last_pba_for_zone(ctx, zonenr);
+	vblks = get_sit_ent_vblocks(ctx, zonenr);
+	INIT_LIST_HEAD(&ctx->gc_extents->list);
+
+	//print_memory_usage(ctx, "Before GC");
+	/* Lookup this pba in the reverse table to find the
+	 * corresponding LBA. 
+	 * TODO: If the valid blocks are sequential, we need to keep
+	 * this segment as an open segment that can append data. We do
+	 * not need to perform GC on this segment.
+	 */
+
+	temp.pba = 0;
+	temp.lba = 0;
+	temp.len = 0;
+	while(pba <= last_pba) {
+		//printk(KERN_ERR "\n %s zonenr: %d first_pba: %llu last_pba: %llu #valid blks: %d", __func__, zonenr, pba, last_pba, vblks);
+		rev_e = lsdm_rb_revmap_find(ctx, pba, 0, last_pba, __func__);
+		//BUG_ON(NULL == rev_e);
+		if (!rev_e) {
+			/* this zone could be emptied by concurrent i/o */
+			break;
+		}
+		e = rev_e->ptr_to_tm;
+		BUG_ON(rev_e->pba != e->pba);
+		BUG_ON((e->pba + e->len) < e->pba);
+		e = rev_e->ptr_to_tm;
+		//printk(KERN_ERR "\n %s Looking for pba: %llu! Found e, LBA: %llu, PBA: %llu, len: %u e->(pba+len): %llu, remaining: %d", __func__, pba, e->lba, e->pba, e->len, e->pba + e->len, last_pba -(e->pba + e->len));
+		
+		/* Don't change e directly, as e belongs to the
+		 * reverse map rb tree and we have the node address
+		 */
+		if (e->pba > last_pba) {
+			//printk(KERN_ERR "\n %s Found bigger pba than last_pba: %llu , last_found_pba: %llu", __func__, last_pba, e->pba);
+			break;
+		}
+		if (e->pba < pba) {
+			/* 
+			 * Overlapping e found
+			 * e-------
+			 * 	pba
+			 */
+			if((e->pba + e->len) < pba) {
+				printk(KERN_ERR "\n %s BUG: (GC) considering pba: %llu, found: (lba: %llu, pba: %llu len: %llu) last_pba: %llu", __func__, pba, e->lba, e->pba, e->len, last_pba);
+				BUG();
+			}
+			diff = pba - e->pba;
+			temp.pba = pba;
+			temp.lba = e->lba + diff;
+			temp.len = e->len - diff;
+			if (!temp.len) {
+				printk(KERN_ERR "\n %s BUG: (GC) considering pba: %llu, found: (lba: %llu, pba: %llu len: %llu) last_pba: %llu", __func__, pba, e->lba, e->pba, e->len, last_pba);
+				BUG_ON(!temp.len);
+			}
+		} else {
+			/*
+			 * 	e------
+			 * pba
+			 */
+			if (e->pba > last_pba)
+				break;
 			temp.pba = e->pba;
 			temp.lba = e->lba;
 			temp.len = e->len;
@@ -1872,149 +1921,29 @@ int create_dzone_list(struct ctx *ctx, unsigned int zonenr)
 		/* if start is 0, len is 4, then you want to read 4 sectors. If last_pba is
 		 * 3, you want len to be 4.
 		 */
-		if (temp.pba + temp.len > last_pba) {
+		if (temp.pba + temp.len >= last_pba + 1) {
 			temp.len = last_pba - temp.pba + 1;
 			//printk(KERN_ERR "\n %s Adjusted len: (lba: %llu, pba: %llu len: %ld) last_pba: %lld", __func__, temp.lba, temp.pba, temp.len, last_pba);
 		}
-		BUG_ON(!temp.len);
-		u32 zonenr = temp.lba / ctx->nr_lbas_in_zone;
-		ret = add_zone_to_gclist(ctx, zonenr);
-		if (ret < 0) {
-			return -ENOMEM;
-		}
-		count = count + ret;
-		pba = temp.pba + temp.len;
-	}
-	printk(KERN_ERR "\n Number of data zones in this cache zone: %d  is: %d", zonenr, count);
-	return count;
-}
-
-
-int create_gc_extents(struct ctx *ctx, unsigned int lzonenr)
-{
-	sector_t diff;
-	struct extent *e = NULL;
-	struct extent_entry temp;
-	sector_t pba, lba, last_lba, zerolen, overlap;
-	struct seq_zones_info *szi = &ctx->dzit[lzonenr];
-	int count = 0;
-	struct lsdm_sb * sb = ctx->sb;
-	unsigned int pzonenr;
-	int cacheblks = 0;
-
-	/* TODO: ensure wp belongs to the same pzonenr */
-	if (szi->pzonenr < sb->zone_count) {
-		pzonenr = szi->pzonenr;
-		/*
-		pzonenr = get_dzone_nr(ctx, szi->wp);
-		if (pzonenr != szi->pzonenr) {
-			printk(KERN_ERR "\n %s pzonenr: %d, szi->pzonenr: %d, szi->wp: %llu", __func__, pzonenr, szi->pzonenr, szi->wp);
-		}
-		BUG_ON(szi->wp > get_last_pba_for_dzone(ctx, pzonenr));
-		*/
-	}
-	lba = lzonenr * ctx->nr_lbas_in_zone;
-	last_lba = lba + ctx->nr_lbas_in_zone;
-
-	INIT_LIST_HEAD(&ctx->gc_extents->list);
-
-	//printk(KERN_ERR "\n %s() :: first lba: %llu, last lba: %llu", __func__, lba, last_lba);
-
-	//print_memory_usage(ctx, "Before GC");
-	/* Lookup this pba in the reverse table to find the
-	 * corresponding LBA. 
-	 * TODO: If the valid blocks are sequential, we need to keep
-	 * this segment as an open segment that can append data. We do
-	 * not need to perform GC on this segment.
-	 */
-	temp.pba = 0;
-	temp.lba = 0;
-	temp.len = 0;
-	while(lba < last_lba) {
-		e = _lsdm_rb_geq(&ctx->extent_tbl_root, lba, 0);
-		if ((e == NULL) || (e->lba >= last_lba)) {  /* this will never happen:  (e->lba + e->len) <= lba) */
-			/* Not found in the cache. Now check if this can be seen in the actual data zone */
-			if (pzonenr < sb->zone_count) {
-				pba = get_first_pba_for_dzone(ctx, pzonenr) + lba % ctx->nr_lbas_in_zone;
-				if (pba < szi->wp) {
-					temp.pba = pba;
-					temp.lba = lba;
-					temp.len = szi->wp - pba;
-					add_extent_to_gclist(ctx, &temp);
-					count = count + temp.len;
-				}
-			}
+		if (!temp.len) {
+			printk(KERN_ERR "\n %s !!!!!! Copied e (lba: %llu, pba: %llu len: %llu) last_pba: %llu", __func__, e->lba, e->pba, e->len, last_pba);
 			break;
 		}
-		/* Case of Overlap, e always overlaps with (lba - last_lba) address range,
-		 * higher e returned. The above if ensures that e->lba < last_lba
-		 */
-		if (e->lba > lba) {
-			/*               [eeeeeeeeeeee]
-			 *    (lba)
-			 */
-			zerolen = e->lba - lba;
-			// BUG_ON(e->lba >= last_lba);
-			if (pzonenr < sb->zone_count) {
-				pba = get_first_pba_for_dzone(ctx, pzonenr) + lba % ctx->nr_lbas_in_zone;
-				if (pba < szi->wp) {
-					temp.pba = pba;
-					temp.lba = lba;
-					temp.len = zerolen;
-					if (zerolen > (szi->wp - pba))
-						temp.len = szi->wp - pba;
-					add_extent_to_gclist(ctx, &temp);
-					count = count + temp.len;
-				}
-			}
-			lba = e->lba;
-			//BUG_ON(lba >= last_lba);
-			/* when we fall through to the next case, lba = e->lba */
-		}
-		/* (e->lba <= lba)
-		 *
-		 *		lba-----------last-lba
-		 *	eeeeeeeeeeeeeeeeee[eeeeeeeeeeeeeeeeeeeeeeee]
-		 *
-		 */
-		overlap = e->lba + e->len - lba;
-		diff = lba - e->lba;
-		temp.pba = e->pba + diff;
-		temp.lba = lba;
-		if (lba + overlap >= last_lba) {
-			temp.len =  last_lba - lba;
-			/* add this temp to the list */
-		} else {
-			temp.len = overlap;
-		}
-		add_extent_to_gclist(ctx, &temp);
-		lba = lba + overlap;
-		cacheblks = cacheblks + 1;
+		total_len = total_len + temp.len;
+		pba = temp.pba + temp.len;
+		count = add_extent_to_gclist(ctx, &temp);
+		total_extents = total_extents + count;
 	}
-	//printk(KERN_ERR "\n %s number of sectors from the data zone(%d): %d ", __func__, szi->pzonenr, count);
-	//printk(KERN_ERR "\n Returning from : %s ", __func__);
-	return cacheblks;
+#ifdef LSDM_DEBUG
+	printk(KERN_ERR "\n %s Total extents: %llu, total_len: %llu vblks: %d \n", __func__, total_extents, total_len, vblks);
+	if ((total_len >> SECTOR_BLK_SHIFT) < vblks) {
+		print_gc_extents(ctx, zonenr);
+	}
+#endif
+	return total_extents;
 }
 
-void get_zone_lock(struct ctx * ctx, unsigned int zonenr)
-{
-	struct seq_zones_info *szone = &ctx->dzit[zonenr];
-	mutex_lock(&szone->zone_lock);
-}
 
-void free_zone_lock(struct ctx *ctx, unsigned int zonenr)
-{
-	struct seq_zones_info * szone = &ctx->dzit[zonenr];
-	mutex_unlock(&szone->zone_lock);
-}
-
-u64 get_wp(struct ctx *ctx, unsigned int zonenr)
-{
-	struct seq_zones_info * szone = &ctx->dzit[zonenr];
-	return szone->wp;
-}
-
-//static int traverse_gc_victim_tree(struct ctx *ctx);
 /*
  * TODO: write code for FG_GC
  *
@@ -2024,16 +1953,15 @@ u64 get_wp(struct ctx *ctx, unsigned int zonenr)
  * remaining blocks from this zone and write to the destn_zone.
  *
  */
-int evict_cache_data(struct ctx *ctx, int gc_mode, int err_flag)
+static int lsdm_gc(struct ctx *ctx, int gc_mode, int err_flag)
 {
 	int zonenr;
-	u64 gc_count = 0;
-	int count, cacheblks = 0;
-	struct cseg_zone_node *zone_nodep, *next_zone_nodep;
-	u32 lzonenr, zones_cleaned = 0;
+	int ret;
+	struct lsdm_ckpt *ckpt = NULL;
 	struct lsdm_gc_thread *gc_th = ctx->gc_th;
-	u64 start_t, end_t, interval = 0;
-	u64 cstart_t, cend_t, cinterval = 0;
+	wait_queue_head_t *wq = &gc_th->lsdm_gc_wait_queue;
+	u64 start_t, end_t, interval = 0, gc_count = 0;
+	u64 gc_writes = 0;
 
 	//printk(KERN_ERR "\a %s * GC thread polling after every few seconds! gc_mode: %d \n", __func__, gc_mode);
 	
@@ -2041,138 +1969,164 @@ int evict_cache_data(struct ctx *ctx, int gc_mode, int err_flag)
 	 * started in parallel.
 	 */
 	if (!mutex_trylock(&ctx->gc_lock)) {
-		//printk(KERN_ERR "\n 1. GC is already running! \n");
+		printk(KERN_ERR "\n 1. GC is already running! \n");
 		return -1;
 	}
 again:
 	if (kthread_should_stop()) {
 		printk(KERN_ERR "\n kthread needs to stop ");
-		mutex_unlock(&ctx->gc_lock);
-		if (gc_th->gc_wake) {
-			gc_th->gc_wake = 0;
-			wake_up_all(&ctx->gc_th->fggc_wq);
-		}
-		return gc_count;
+		goto failed;
 	}
-	/*
-	int ret = traverse_gc_victim_tree(ctx);
-	printk(KERN_ERR "\n DONE , returning lock!! ");
-	printk(KERN_ERR "\n......................\n");
-	mutex_unlock(&ctx->gc_lock);
-	return (ret);
-	*/
+	interval = 0;
+	start_t = ktime_get_ns();	
 	zonenr = select_zone_to_clean(ctx, gc_mode, __func__);
 	if (zonenr < 0) {
 		printk(KERN_ERR "\n No zone found for cleaning!! \n");
-		mutex_unlock(&ctx->gc_lock);
-		if (gc_th->gc_wake) {
-			gc_th->gc_wake = 0;
-			wake_up_all(&ctx->gc_th->fggc_wq);
+		if (!gc_count) {
+			gc_count = -1;
 		}
-		if (gc_count)
-			printk(KERN_ERR "\n Cleaned cache zones, resuming writes!!");
-		return gc_count;
+		goto failed;
+	}
+	//flush_workqueue(ctx->tm_wq);
+	//flush_workqueue(ctx->writes_wq);
+	//printk(KERN_ERR "\n Running GC!! zone_to_clean: %u  mode: %d", zonenr, gc_mode);
+	if (unlikely(!list_empty(&ctx->gc_extents->list))) {
+		free_gc_extents(ctx);
+		printk(KERN_ERR "\n %s ************ extent list is not empty! Line: %d ", __func__, __LINE__);
 	}
 
-	//down_write(&ctx->wf_lock);
-	cstart_t = ktime_get_ns();
-	count = create_dzone_list(ctx, zonenr);
-	if (count <= 0) {
-		printk(KERN_ERR "\n No data zone found for merging!! \n");
-		mutex_unlock(&ctx->gc_lock);
-		if (gc_th->gc_wake) {
-			gc_th->gc_wake = 0;
-			wake_up_all(&ctx->gc_th->fggc_wq);
-		}
-		if (gc_count)
-			printk(KERN_ERR "\n Cleaned cache zones, resuming writes!!");
-		return gc_count;
+	if (kthread_should_stop()) {
+		printk(KERN_ERR "\n kthread needs to stop ");
+		goto failed;
 	}
-	printk(KERN_ERR "\n %s Cleaning cache zonenr: %d #valid blks: %d nr_data_zones: %d \n", __func__, zonenr, get_sit_ent_vblocks(ctx, zonenr), count);	
-	int test_count = 0;
-	int len = 0;
-	list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
-		lzonenr = zone_nodep->lzonenr;
-		//printk(KERN_ERR "\n Checking data zonenr zonenr: %d ", lzonenr);
-		test_count = test_count + 1;
-	}
-	BUG_ON(test_count != count);
-	list_for_each_entry_safe(zone_nodep, next_zone_nodep, &ctx->cseg_znodes->list, list) {
-		lzonenr = zone_nodep->lzonenr;
-		trace_printk("\n Merging data zonenr zonenr: %d ", lzonenr);
-		get_zone_lock(ctx, lzonenr);
-		down_write(&ctx->lsdm_rb_lock);
-		start_t = ktime_get_ns();
-		/* Collect all the extents - either from the cache zone or the data zone, a block can only exist in either of them */
-		cacheblks = create_gc_extents(ctx, lzonenr);
-		if (list_empty(&ctx->gc_extents->list)) {
-			up_write(&ctx->lsdm_rb_lock);
-			free_zone_lock(ctx, lzonenr);
-			list_del(&zone_nodep->list);
-			kmem_cache_free(ctx->zones_in_cseg_cache, zone_nodep);
-			trace_printk("\n lzonenr is empty: %d ", lzonenr);
-			continue;
-		}
-		//printk(KERN_ERR "\n Created GC extents, about to read them \n");
-		if (kthread_should_stop()) {
-			trace_printk("\n GC kthread needs to stop ");
-			up_write(&ctx->lsdm_rb_lock);
-			free_zone_lock(ctx, lzonenr);
-			goto stop;
-		}
-		len = read_gc_extents(ctx);
-		if (kthread_should_stop()) {
-			trace_printk("\n GC kthread needs to stop - after reading extents");
-			up_write(&ctx->lsdm_rb_lock);
-			free_zone_lock(ctx, lzonenr);
-			goto stop;
-		}
-		//wake_up_nr(&ctx->gc_th->fggc_wq, 1);
-		//printk(KERN_ERR "\n GC extents read, about to write them to a new zone ");
-		if (write_valid_gc_extents(ctx, lzonenr)) {
-			trace_printk("\n Could not merge (aka write) data zone %d ", lzonenr);
-			up_write(&ctx->lsdm_rb_lock);
-			free_zone_lock(ctx, lzonenr);
-			goto stop;
-		}
-		up_write(&ctx->lsdm_rb_lock);
-		end_t = ktime_get_ns();
-		interval = (end_t - start_t) / 1000000;
-		free_zone_lock(ctx, lzonenr);
-		trace_printk("\n Data zone: %u merged in %llu milliseconds, #freed: %d ", lzonenr, interval, len);
-		free_gc_extents(ctx);
-		wake_up_nr(&ctx->gc_th->fggc_wq, cacheblks);
-		list_del(&zone_nodep->list);
-		kmem_cache_free(ctx->zones_in_cseg_cache, zone_nodep);
-	}
-	//up_write(&ctx->wf_lock);
-	free_data_zone_list(ctx);
-	//do_checkpoint(ctx);
-	zones_cleaned++;
-	cend_t = ktime_get_ns();
-	cinterval = (cend_t - cstart_t)/1000000;
-	printk(KERN_ERR "\n Cache zone: %u emptied, evicted %d datazones in %llu milliseconds", zonenr, test_count, cinterval);
-	if ((gc_mode == FG_GC) && (ctx->nr_free_cache_zones <= ctx->middle_watermark)) {
+
+	create_gc_extents(ctx, zonenr);
+
+	//print_memory_usage(ctx, "After extents");
+	if (list_empty(&ctx->gc_extents->list)) {
+		/* Nothing to do, sit_ent_vblocks_decr() is playing catch up with gc cost tree */
+		remove_zone_from_gc_tree(ctx, zonenr);	
 		goto again;
 	}
+
+	//printk(KERN_ERR "\n %s zonenr: %d about to be read, vblocks: %d  \n", __func__, zonenr, get_sit_ent_vblocks(ctx, zonenr));
+	ret = read_gc_extents(ctx);
+	if (ret)
+		goto failed;
+
+	//print_memory_usage(ctx, "After read");
+	if (gc_mode != FG_GC) {
+		if (ctx->nr_freezones < ctx->middle_watermark) {
+			/* while gc thread was running, urgent mode triggered */
+			gc_mode = FG_GC;
+			gc_th->gc_wake = 1;
+		}
+	}
+	/* if we are in concurrent mode, we can afford to let the application i/o go ahead */
+	if (gc_mode == CONC_GC) {
+		gc_th->gc_wake = 0;
+		wait_event_interruptible_timeout(*wq,
+			kthread_should_stop() || freezing(current) ||
+			gc_th->gc_wake,
+			msecs_to_jiffies(gc_th->urgent_sleep_time));
+                if (gc_th->gc_wake) {
+			if (ctx->nr_freezones <= ctx->middle_watermark) {
+				gc_mode = FG_GC;
+			}
+		}
+		gc_th->gc_wake = 1;
+	}
+	else if (gc_mode == BG_GC) {
+	       	if (!is_lsdm_ioidle(ctx)) {
+                	if (!gc_th->gc_wake) {
+				/* BG_GC mode and not idle */
+				wait_event_interruptible_timeout(*wq,
+					kthread_should_stop() || freezing(current) ||
+					gc_th->gc_wake,
+					msecs_to_jiffies(gc_th->urgent_sleep_time));
+			}
+			if (ctx->nr_freezones <= ctx->higher_watermark) {
+				gc_mode = CONC_GC;
+				if (ctx->nr_freezones <= ctx->middle_watermark) {
+					gc_mode = FG_GC;
+				}
+				gc_th->gc_wake = 1;
+			}
+		} /* else, we are in BG GC and are io idle, so do not wait, continue */
+	}
+	if (kthread_should_stop()) {
+		printk(KERN_ERR "\n kthread needs to stop ");
+		goto failed;
+	}
+
+	//printk(KERN_ERR "\n %s zonenr: %d about to be written, vblocks: %d  \n", __func__, zonenr, get_sit_ent_vblocks(ctx, zonenr));
+	ret = write_valid_gc_extents(ctx, zonenr);
+	if (ret < 0) { 
+		printk(KERN_ERR "\n write_valid_gc_extents() failed, ret: %d ", ret);
+		goto failed;
+	}
+	gc_writes += ret;
+	//print_memory_usage(ctx, "After write");
+
+	ckpt = (struct lsdm_ckpt *)page_address(ctx->ckpt_page);
+	ckpt->clean = 0;
+	do_checkpoint(ctx);
+	end_t = ktime_get_ns();	
+	interval += (end_t - start_t)/1000000;
+	gc_count++;
+	ctx->gc_total += interval;
+	ctx->gc_count += gc_count;
+	ctx->gc_average = ctx->gc_total/ ctx->gc_count;
+	printk(KERN_ERR "\n %s gc_count: %llu total time: %llu (milliseconds) gc_writes: %llu gc_mode:%d ", __func__, gc_count, interval, gc_writes, gc_mode);
+	gc_writes = 0;
+	//printk(KERN_ERR "\n %s zonenr: %d cleaned! #valid blks: %d \n", __func__, zonenr, get_sit_ent_vblocks(ctx, zonenr));
+	/* while gc thread was running, urgent mode triggered */
+	if (ctx->nr_freezones <= ctx->higher_watermark) {
+		gc_mode = CONC_GC;
+		if (ctx->nr_freezones <= ctx->middle_watermark) {
+			gc_mode = FG_GC;
+		}
+	}
+
+	/* TODO: Mode: FG_GC */
+	drain_workqueue(ctx->tm_wq);
+	if (gc_mode == FG_GC) {
+		wake_up_all(&ctx->gc_th->fggc_wq);
+		io_schedule();
+		if (ctx->nr_freezones <= ctx->middle_watermark) {
+			goto again;
+		}
+		/* else: Paused GC mode */
+		gc_mode = CONC_GC;
+		io_schedule();
+	} 
+	if (gc_mode == CONC_GC) {
+		/* if we are in concurrent mode, we can afford to let the application i/o go ahead */
+		wait_event_interruptible_timeout(*wq,
+			kthread_should_stop() || freezing(current) ||
+			gc_th->gc_wake,
+			msecs_to_jiffies(gc_th->urgent_sleep_time));
+		if (ctx->nr_freezones <= ctx->middle_watermark) {
+			gc_mode = FG_GC;
+		}
+		if (ctx->nr_freezones <= ctx->higher_watermark) {
+			goto again;
+		}
+		// else, you dont need to do CONC_GC or FG_GC any more;
+	}
+	else if (gc_mode == BG_GC) {
+		if (is_lsdm_ioidle(ctx))
+			goto again;
+		/* else we need to stop */
+	}
+failed:
+	free_gc_extents(ctx);
+	mutex_unlock(&ctx->gc_lock);
 	if (gc_th->gc_wake) {
-                gc_th->gc_wake = 0;
+		gc_th->gc_wake = 0;
 		wake_up_all(&ctx->gc_th->fggc_wq);
 	}
-	mutex_unlock(&ctx->gc_lock);
-	return zones_cleaned;
-stop:
-	trace_printk("\n Stopping GC thread ! \n");
-	if (gc_th->gc_wake) {
-                gc_th->gc_wake = 0;
-                wake_up_all(&ctx->gc_th->fggc_wq);
-        }
-	//up_write(&ctx->wf_lock);
-	mutex_unlock(&ctx->gc_lock);
-	free_gc_extents(ctx);
-	free_data_zone_list(ctx);
-	return zones_cleaned;
-
+	return gc_count;
 }
 
 /* printing in order */
@@ -2208,7 +2162,7 @@ void print_extents(struct ctx *ctx)
  * REQ_OP_ZONE_RESET
  *
  */
-int gc_thread_fn(void * data)
+static int gc_thread_fn(void * data)
 {
 
 	struct ctx *ctx = (struct ctx *) data;
@@ -2242,7 +2196,13 @@ int gc_thread_fn(void * data)
 		//print_extents(ctx);
 		 /* give it a try one time */
                 if (gc_th->gc_wake) {
+			if (ctx->nr_freezones < ctx->lower_watermark) {
+				/* concurrent GC, no pauses */
 				mode = FG_GC;
+			} else {
+				/* concurrent, intermittent GC */
+				mode = CONC_GC;
+			}
 		}
 		else if(mode == BG_GC) {
 			if (!is_lsdm_ioidle(ctx)) {
@@ -2260,7 +2220,7 @@ int gc_thread_fn(void * data)
 		}
 		ctx->flush_th->sleep_time = DEF_GC_TIME;
 		/* Doing this for now! ret part */
-		ret = evict_cache_data(ctx, mode, 0);
+		ret = lsdm_gc(ctx, mode, 0);
 		ctx->flush_th->sleep_time = DEF_FLUSH_TIME;
 		if (mode == BG_GC) {
 			end_t = ktime_get_ns();
@@ -2334,9 +2294,9 @@ int lsdm_gc_thread_start(struct ctx *ctx)
 
 int lsdm_gc_thread_stop(struct ctx *ctx)
 {
-	wake_up_all(&ctx->gc_th->fggc_wq);
 	kthread_stop(ctx->gc_th->lsdm_gc_task);
 	printk(KERN_ERR "\n GC thread stopped! ");
+	wake_up_all(&ctx->gc_th->fggc_wq);
 	kvfree(ctx->gc_th);
 	return 0;
 }
@@ -2362,25 +2322,42 @@ void lsdm_ioidle(struct mykref *kref)
 }
 
 
+void no_op(struct kref *kref) { }
+int is_zone_free(struct ctx *ctx, unsigned int zonenr);
+
 void lsdm_subread_done(struct bio *clone)
 {
 	struct app_read_ctx *read_ctx = clone->bi_private;
 	struct ctx *ctx = read_ctx->ctx;
 	struct bio * bio = read_ctx->bio;
+	u64 zonenr;
 
+	if (read_ctx->pba < ctx->sb->max_pba) {
+		zonenr = get_zone_nr(ctx, read_ctx->pba);
+		if ((zonenr > 0) && (zonenr < ctx->sb->zone_count)) {
+			if (is_zone_free(ctx, zonenr)) {
+				/* fail this read */
+				bio->bi_status = BLK_STS_AGAIN;
+			}
+		}
+	}
+	//printk(KERN_ERR "\n %s read lba: %llu ! \n", __func__, read_ctx->lba);
 	bio_endio(bio);
 	mykref_put(&ctx->ongoing_iocount, lsdm_ioidle);
 	bio_put(clone);
-	//printk(KERN_ERR "\n %s read lba: %llu ! \n", __func__, read_ctx->lba);
 	kmem_cache_free(ctx->app_read_ctx_cache, read_ctx);
 }
 
-int zero_fill_clone(struct bio *clone) 
+static int zero_fill_clone(struct ctx *ctx, struct app_read_ctx *read_ctx, struct bio *clone) 
 {
-	//printk(KERN_ERR "\n %s Zero filling the entire bio", __func__);
+	bio_set_dev(clone, ctx->dev->bdev);
 	zero_fill_bio(clone);
-	/* This bio could be the parent of other chained bios. Its necessary to call
-	 * bio_endio and not the endio function directly
+	clone->bi_private = read_ctx;
+	clone->bi_end_io = lsdm_subread_done;
+	/* This bio could be the parent of other
+	 * chained bios. Its necessary to call
+	 * bio_endio and not the endio function
+	 * directly
 	 */
 	bio_endio(clone);
 	return 0;
@@ -2392,10 +2369,9 @@ void complete_small_reads(struct bio *clone)
 	struct bvec_iter iter;
 	char * todata = NULL, *fromdata = NULL;
 	struct app_read_ctx *readctx = clone->bi_private;
-	//sector_t lba = round_down(readctx->lba, NR_SECTORS_IN_BLK);
-	sector_t lba = readctx->lba;
+	sector_t lba = round_down(readctx->lba, NR_SECTORS_IN_BLK);
 	sector_t nrsectors = readctx->nrsectors;
-	//unsigned long diff = 0;
+	unsigned long diff = 0;
 
 	if (clone->bi_status != BLK_STS_OK) {
 		readctx->clone->bi_status = clone->bi_status;
@@ -2408,18 +2384,16 @@ void complete_small_reads(struct bio *clone)
 		goto free;
 		//BUG();
 	}
-	//diff = (readctx->lba - lba) << LOG_SECTOR_SIZE;
-	//printk(KERN_ERR "\n %s 1. diff: %lu nrsectors: %llu \n", __func__, diff, nrsectors);
+	diff = (readctx->lba - lba) << LOG_SECTOR_SIZE;
+	//printk(KERN_ERR "\n %s 1. diff: %llu nrsectors: %d \n", __func__, diff, nrsectors);
 	bio_for_each_segment(bv, readctx->clone, iter) {
 		todata = page_address(bv.bv_page);
-		//printk(KERN_ERR "\n %s 1) (orig clone) data: %p bv.bv_offset: %u", __func__, todata, bv.bv_offset);
 		todata = todata + bv.bv_offset;
-		//printk(KERN_ERR "\n %s 2) (orig clone) data: %p bv.bv_offset: %u", __func__, todata, bv.bv_offset);
+		break;
 	}
 	fromdata = readctx->data;
-	//memcpy(todata, fromdata + diff, (nrsectors << LOG_SECTOR_SIZE));
-	memcpy(todata, fromdata, (nrsectors << LOG_SECTOR_SIZE));
-	//printk(KERN_ERR "\n %s todata: %p, fromdata: %p diff: %lu  bytes: %llu \n", __func__, todata, fromdata, diff, (nrsectors << LOG_SECTOR_SIZE));
+	memcpy(todata, fromdata + diff, (nrsectors << LOG_SECTOR_SIZE));
+	//printk(KERN_ERR "\n %s todata: %p, fromdata: %p diff: %d  bytes: %d \n", __func__, todata, fromdata, diff, (nrsectors << LOG_SECTOR_SIZE));
 free:
 	readctx->clone->bi_end_io = lsdm_subread_done;
 	bio_endio(readctx->clone);
@@ -2463,16 +2437,16 @@ struct bio * construct_smaller_bios(struct ctx * ctx, sector_t pba, struct app_r
 		page = bv.bv_page;
 		data = page_address(page);
 		data = data + bv.bv_offset;
-		//printk(KERN_ERR "\n %s (new small bio) data: %p bv.bv_offset: %u", __func__, data, bv.bv_offset);
+		//printk(KERN_ERR "\n %s (new small bio) data: %p ", __func__, data);
 		readctx->data = data;
 	}
 	bio->bi_opf = REQ_OP_READ;
 	//bio_set_op_attrs(bio, REQ_OP_READ, 0);
 	bio_set_dev(bio, ctx->dev->bdev);
 	bio->bi_iter.bi_sector = pba;
-	//printk(KERN_ERR "\n %s Reading from pba: %llu", __func__, pba);
 	bio->bi_end_io = complete_small_reads;
 	bio->bi_private = readctx;
+	readctx->pba = pba;
 	return bio;
 }
 
@@ -2495,56 +2469,77 @@ void request_start_unaligned(struct ctx *ctx, struct bio *clone, struct app_read
 	/* We have to make sure that complete_smaller_bio() gets called */
 }
 
-struct bio * handle_partial_overlap(struct ctx *ctx, struct bio *clone, sector_t overlap, struct app_read_ctx *read_ctx, sector_t pba)
+
+int zero_fill_inital_bio(struct ctx *ctx, struct bio *bio, struct bio *clone, sector_t zerolen, struct app_read_ctx *read_ctx)
+{
+	struct bio * split = clone;
+	sector_t nr_sectors = bio_sectors(clone);
+
+	if (zerolen < nr_sectors) {
+		//printk(KERN_ERR "\n 1.  %s lba: %llu > pba: 0 len: %d \n", __func__, lba, 0, zerolen);
+		split = bio_split(clone, zerolen, GFP_NOIO, &fs_bio_set);
+		if (!split) {
+			printk(KERN_ERR "\n Could not split the clone! ERR ");
+			bio->bi_status = -ENOMEM;
+			clone->bi_status = BLK_STS_RESOURCE;
+			zero_fill_clone(ctx, read_ctx, clone);
+			return -ENOMEM;
+		}
+		bio_chain(split, clone);
+	}
+	ctx->nr_reads += zerolen;
+	zero_fill_bio(split);
+	bio_endio(split);
+	return 0;
+}
+
+int handle_partial_overlap(struct ctx *ctx, struct bio * bio, struct bio *clone, sector_t overlap, struct app_read_ctx *read_ctx, sector_t pba)
 {
 	struct bio * split;
-	struct bio *bio = read_ctx->bio;
 
-	BUG_ON(pba > ctx->sb->max_pba);
-	trace_printk("\n <READ> %s lba: %llu pba: %llu, clone::nr_sectors: %d len:%llu", __func__, clone->bi_iter.bi_sector, pba, bio_sectors(clone), overlap);
+	//printk(KERN_ERR "\n clone: %p clone::nr_sectors: %d len: %d ", clone, bio_sectors(clone), overlap);
 	split = bio_split(clone, overlap, GFP_KERNEL, &fs_bio_set);
 	if (!split) {
 		printk(KERN_INFO "\n Could not split the clone! ERR ");
 		bio->bi_status = -ENOMEM;
 		clone->bi_status = BLK_STS_RESOURCE;
-		zero_fill_clone(clone);
-		return NULL;
+		zero_fill_clone(ctx, read_ctx, clone);
+		return -ENOMEM;
 	}
 	ctx->nr_reads += overlap;
+	//printk(KERN_ERR "\n 2. (SPLIT) %s lba: %llu, pba: %llu nr_sectors: %d ", __func__, split->bi_iter.bi_sector, pba, bio_sectors(split));
 	bio_chain(split, clone);
 	split->bi_iter.bi_sector = pba;
+	read_ctx->pba = pba;
 	bio_set_dev(split, ctx->dev->bdev);
+	BUG_ON(pba > ctx->sb->max_pba);
+	//printk(KERN_ERR "\n %s submitted split! ", __func__);
 	submit_bio_noacct(split);
-	return clone;
+	return 0;
 }
 
 
-int handle_full_overlap(struct ctx *ctx, struct bio *clone, sector_t nr_sectors, sector_t pba, struct app_read_ctx *read_ctx, int print)
+int handle_full_overlap(struct ctx *ctx, struct bio * bio, struct bio *clone, sector_t nr_sectors, sector_t pba, struct app_read_ctx *read_ctx, int print)
 {
 	sector_t s8;
-	struct bio *split, *bio;
+	struct bio *split;
 	BUG_ON(pba > ctx->sb->max_pba);
 
-	print = 0;
-
-	bio = read_ctx->bio;
-	if (print) {
-		//printk(KERN_ERR "\n %s lba: %llu pba: %llu len: %llu \n", __func__, clone->bi_iter.bi_sector, pba, nr_sectors);
-		trace_printk(KERN_ERR "\n <READ> %s lba: %llu pba: %llu len: %llu \n", __func__, clone->bi_iter.bi_sector, pba, nr_sectors);
-	}
+	if (print)
+		printk(KERN_ERR "\n %s pba: %llu len: %llu \n", __func__, pba, nr_sectors);
 
 	s8 = round_down(nr_sectors, NR_SECTORS_IN_BLK);
 	if (nr_sectors == s8) {
 		if (print)
 			printk(KERN_ERR "\n %s aligned read \n", __func__);
 		ctx->nr_reads += s8;
-		read_ctx->clone = clone;
 		clone->bi_end_io = lsdm_subread_done;
 		clone->bi_iter.bi_sector = pba;
-		clone->bi_private = read_ctx;
+		read_ctx->pba = pba;
 		bio_set_dev(clone, ctx->dev->bdev);
+		if (print)
+			printk(KERN_ERR "\n %s aligned read submitting....\n", __func__);
 		submit_bio_noacct(clone);
-	//	printk(KERN_ERR "\n %s done ! \n", __func__);
 	} else {
 		if (print)
 			printk(KERN_ERR "\n %s Unaligned read \n", __func__);
@@ -2556,11 +2551,12 @@ int handle_full_overlap(struct ctx *ctx, struct bio *clone, sector_t nr_sectors,
 				printk(KERN_INFO "\n Could not split the clone! ERR ");
 				bio->bi_status = -ENOMEM;
 				clone->bi_status = BLK_STS_RESOURCE;
-				zero_fill_clone(clone);
+				zero_fill_clone(ctx, read_ctx, clone);
 				return -ENOMEM;
 			}
 			bio_chain(split, clone);
 			split->bi_iter.bi_sector = pba;
+			read_ctx->pba = pba;
 			bio_set_dev(split, ctx->dev->bdev);
 			BUG_ON(pba > ctx->sb->max_pba);
 			submit_bio_noacct(split);
@@ -2572,12 +2568,12 @@ int handle_full_overlap(struct ctx *ctx, struct bio *clone, sector_t nr_sectors,
 		read_ctx->nrsectors = nr_sectors;
 		read_ctx->lba = clone->bi_iter.bi_sector;
 		read_ctx->clone = clone;
+		read_ctx->pba = pba;
 		ctx->nr_reads += nr_sectors;
 		clone = construct_smaller_bios(ctx, pba, read_ctx);
 		if (clone  == NULL) {
 			printk(KERN_ERR "\n %s could not construct smaller bio! \n", __func__);
 			bio_endio(read_ctx->clone);
-			return -1;
 		}
 		if (print)
 			printk(KERN_ERR "\n %s (smaller read) -> lba: %llu pba:%llu len:%llu", __func__, read_ctx->lba, clone->bi_iter.bi_sector, nr_sectors);
@@ -2585,146 +2581,6 @@ int handle_full_overlap(struct ctx *ctx, struct bio *clone, sector_t nr_sectors,
 	}	
 	return 0;
 }
-
-int read_from_zone(struct ctx *ctx, struct bio * clone)
-{
-	struct bio *split = clone;
-	unsigned nr_sectors, validSectors;
-	sector_t lba, pba, wp;
-	u32 lzonenr, pzonenr;
-
-	do {
-		lba = clone->bi_iter.bi_sector;
-		lzonenr = lba / ctx->nr_lbas_in_zone;
-		pzonenr = ctx->dzit[lzonenr].pzonenr;
-		if (pzonenr > ctx->sb->zone_count) {
-			zero_fill_clone(clone);
-			break;
-		}
-		pba = get_first_pba_for_dzone(ctx, pzonenr) + lba % ctx->nr_lbas_in_zone;
-		wp = ctx->dzit[lzonenr].wp;
-		BUG_ON(wp == 0);
-		BUG_ON(pba > ctx->sb->max_pba);
-		if (wp <= pba) {
-			zero_fill_clone(clone);
-			break;
-		}
-		validSectors = wp - pba;
-		nr_sectors = bio_sectors(clone);
-		split = clone;
-		//printk(KERN_ERR "\n %s origlba: %llu pba: %llu wp: %llu validSectors: %d, nr_sectors: %d", __func__, lba, pba, wp, validSectors, nr_sectors);
-		if (validSectors < nr_sectors) {
-			if (!(split = bio_split(clone, validSectors, GFP_NOIO, &fs_bio_set))){
-				printk("\n %s failed at bio_split! ", __func__);
-				return -1;
-			}
-			bio_chain(split, clone);
-		}
-		split->bi_iter.bi_sector = pba;
-		bio_set_dev(split, ctx->dev->bdev);
-		submit_bio_noacct(split);
-		//printk(KERN_ERR "\n %s submitted split! ", __func__);
-		if (validSectors < nr_sectors) {
-			zero_fill_clone(clone);
-			break;
-		}
-	} while(split != clone);
-	return 0;
-}
-
-
-struct bio *handle_initial_zerolen(struct ctx *ctx, struct bio *clone, int zerolen, struct app_read_ctx *read_ctx)
-{
-	struct bio *split, *bio;
-	int ret;
-
-	bio = read_ctx->bio;
-	BUG_ON(!zerolen);
-	//printk(KERN_ERR "\n %s origlba: %llu pzonenr: %d pba: %llu wp: %llu zerolen: %d, nr_sectors: %d", __func__, lba, pzonenr, pba, wp, zerolen, nr_sectors);
-	split = bio_split(clone, zerolen, GFP_NOIO, &fs_bio_set);
-	if (!split) {
-		printk(KERN_ERR "\n Could not split the clone! ERR ");
-		bio->bi_status = -ENOMEM;
-		clone->bi_status = BLK_STS_RESOURCE;
-		zero_fill_clone(clone);
-		return NULL;
-	}
-	bio_chain(split, clone);
-	ret = read_from_zone(ctx, split);
-	ctx->nr_reads += zerolen;
-	return clone;
-
-}
-
-int handle_read(struct ctx *ctx, struct bio *clone, struct app_read_ctx *read_ctx)
-{
-	sector_t lba, pba, wp;
-	struct extent *e;
-	unsigned nr_sectors, overlap, diff, zerolen, lzonenr, pzonenr;
-	int print = 0, ret = 0;
-
-	while(1) {
-		nr_sectors = bio_sectors(clone);
-		clone->bi_private = read_ctx;
-		clone->bi_end_io = lsdm_subread_done;
-		read_ctx->clone = clone;
-		lba = clone->bi_iter.bi_sector;
-		pba = lba;
-		trace_printk("\n %s Read bio::lba: %llu bio::nrsectors: %d", __func__, clone->bi_iter.bi_sector, bio_sectors(clone));
-		wp = 0;
-		lzonenr = lba / ctx->nr_lbas_in_zone;
-		pzonenr = ctx->dzit[lzonenr].pzonenr;
-		if (pzonenr < ctx->sb->zone_count) {
-			pba = get_first_pba_for_dzone(ctx, pzonenr) + lba % ctx->nr_lbas_in_zone;
-			wp = ctx->dzit[lzonenr].wp;
-		}
-		e = lsdm_rb_geq(ctx, lba, print);
-		/* case of no overlap */
-		if ((e == NULL) || (e->lba >= (lba + nr_sectors)) || ((e->lba + e->len) <= lba))  {
-			ret = read_from_zone(ctx, clone);
-			break;
-		}
-		if (e->lba > lba) {
-		/*   	        [eeeeeeeeeeee]
-		 *[---------bio------] 
-		 */
-			zerolen = e->lba - lba;
-			clone = handle_initial_zerolen(ctx, clone, zerolen, read_ctx);
-			if (!clone) {
-				return -ENOMEM;
-			}
-			lba = clone->bi_iter.bi_sector;
-			nr_sectors = bio_sectors(clone);
-			BUG_ON(lba != e->lba);
-			/* we fall through as e->lba == lba now */
-		} 
-		/* Case of Overlap, e always overlaps with bio */
-		//(e->lba <= lba) 
-		/* [eeeeeeeeeeee] eeeeeeeeeeeee]<- could be shorter or longer
-		 *
-		 * [---------bio------] */
-		overlap = e->lba + e->len - lba;
-		diff = lba - e->lba;
-		BUG_ON(diff < 0);
-		pba = e->pba + diff;
-		if (overlap >= nr_sectors) { 
-		/* e is bigger than bio, so overlap >= nr_sectors, no further splitting is required. */
-			ret = handle_full_overlap(ctx, clone, nr_sectors, pba, read_ctx, 1);
-			if (ret < 0)
-				return ret;
-			break;
-
-		}
-		/* overlap is smaller than nr_sectors remaining. */
-		clone = handle_partial_overlap(ctx, clone, overlap, read_ctx, pba);
-		if (!clone)
-			return ret;
-		/* Since e was smaller, we want to search for the next e */
-	}
-	return 0;
-
-}
-
 
 /*
  * This is an asynchronous read, i.e we submit the request
@@ -2735,15 +2591,16 @@ int handle_read(struct ctx *ctx, struct bio *clone, struct app_read_ctx *read_ct
  *
  * TODO: if read is beyond the disk, return -EINVAL
  */
-int hybrid_stl_read_io(struct ctx *ctx, struct bio *bio)
+static int lsdm_read_io(struct ctx *ctx, struct bio *bio)
 {
 	struct bio *split = NULL;
-	sector_t lba;
-	unsigned nr_sectors;
+	sector_t lba, pba, origlba;
+	struct extent *e;
+	unsigned nr_sectors, overlap, diff, zerolen;
 
 	struct app_read_ctx *read_ctx;
 	struct bio *clone;
-	int maxlen = 2048;
+	int print = 0, ret = 0;
 
 	read_ctx = kmem_cache_alloc(ctx->app_read_ctx_cache, GFP_KERNEL);
 	if (!read_ctx) {
@@ -2766,32 +2623,75 @@ int hybrid_stl_read_io(struct ctx *ctx, struct bio *bio)
 		bio_endio(bio);
 		return -ENOMEM;
 	}
+	//printk(KERN_ERR "\n %s Read bio::lba: %llu bio::nrsectors: %d", __func__, clone->bi_iter.bi_sector, bio_sectors(clone));
 
+	clone->bi_private = read_ctx;
 	bio_set_dev(clone, ctx->dev->bdev);
 	split = NULL;
-	lba = clone->bi_iter.bi_sector;
-	read_ctx->lba = lba;
-	read_ctx->clone = clone;
-	while(1) {
+	origlba = clone->bi_iter.bi_sector;
+	read_ctx->lba = origlba;
+	while(split != clone) {
 		nr_sectors = bio_sectors(clone);
-		clone->bi_private = read_ctx;
-		clone->bi_end_io = lsdm_subread_done;
-		split = clone;
-		if (nr_sectors > maxlen) {
-			split = bio_split(clone, maxlen, GFP_NOIO, &fs_bio_set);
-			if (!split) {
-				bio->bi_status = BLK_STS_RESOURCE;
-				zero_fill_clone(clone);
-				return -ENOMEM;
-			}
-			//printk(KERN_ERR "\b %s LARGE Read requested (%d), splitting!", __func__, nr_sectors);
-			nr_sectors = maxlen;
-			bio_chain(split, clone);
+		origlba = clone->bi_iter.bi_sector;
+		lba = round_down(origlba, NR_SECTORS_IN_BLK);
+		e = lsdm_rb_geq(ctx, lba, print);
 
-		}
-		handle_read(ctx, split, read_ctx);
-		if (clone == split) {
+		/* case of no overlap */
+		if ((e == NULL) || (e->lba >= (lba + nr_sectors)) || ((e->lba + e->len) <= lba))  {
+			zero_fill_clone(ctx, read_ctx, clone);
 			break;
+		}
+		/* e is greater than LBA */
+		if (e->lba > lba) {
+		/*   		 [eeeeeeeeeeee]
+		 * (LBA)	
+		 */
+			zerolen = e->lba - lba;
+			if (zerolen > nr_sectors) {
+				zerolen = nr_sectors;
+			}
+			ret = zero_fill_inital_bio(ctx, bio, clone, zerolen, read_ctx);
+			if (!ret)
+				return ret;
+			/* bio is front filled with zeroes, but we need to compare 'clone' now with
+			 * the same e
+			 */
+			if (zerolen == nr_sectors)
+				break;
+			lba = lba + zerolen;
+			nr_sectors = bio_sectors(clone);
+			BUG_ON(lba != e->lba);
+			/* we fall through as e->lba == lba now */
+		} 
+		/* Case of Overlap, e always overlaps with bio */
+		//(e->lba <= lba) 
+		/* [eeeeeeeeeeee] eeeeeeeeeeeee]<- could be shorter or longer
+		 */
+		/*  [---------bio------] */
+		overlap = e->lba + e->len - lba;
+		diff = lba - e->lba;
+		BUG_ON(diff < 0);
+		pba = e->pba + diff;
+		if (overlap >= nr_sectors) { 
+		/* e is bigger than bio, so overlap >= nr_sectors, no further
+		 * splitting is required. Previous splits if any, are chained
+		 * to the last one as 'clone' is their parent.
+		 */
+			ret = handle_full_overlap(ctx, bio, clone, nr_sectors, pba, read_ctx, 0);
+			//printk(KERN_ERR "\n 1) ret: %d \n", ret);
+			if (ret)
+				return ret;
+			break;
+
+		} else {
+			/* overlap is smaller than nr_sectors remaining. */
+			//printk(KERN_ERR "\n clone: %p clone::nr_sectors: %d e->len: %d overlap: %d", clone, bio_sectors(clone), e->len, overlap);
+			ret = handle_partial_overlap(ctx, bio, clone, overlap, read_ctx, pba);
+			//printk(KERN_ERR "\n 2) ret: %d clone::lba: %llu", ret, clone->bi_iter.bi_sector);
+			if (ret)
+				return ret;
+			/* Since e was smaller, we want to search for the next e */
+			lba = lba + overlap;  //for the next search
 		}
 	}
 	//printk(KERN_INFO "\t %s end \n", __func__);
@@ -2823,12 +2723,12 @@ void mark_disk_full(struct ctx *ctx)
 	struct lsdm_ckpt *ckpt = ctx->ckpt;
 	printk(KERN_ERR "\n %s marking disk full! ", __func__);
 	dump_stack();
-	ckpt->nr_free_cache_zones  = 0;
+	ckpt->nr_free_zones  = 0;
 }
 
 int is_disk_full(struct ctx *ctx)
 {
-	return !(ctx->ckpt->nr_free_cache_zones);
+	return !(ctx->ckpt->nr_free_zones);
 }
 
 /* 
@@ -2849,7 +2749,7 @@ struct sit_page * search_sit_kv_store(struct ctx *ctx, sector_t pba, struct rb_n
 	struct rb_node *node = NULL;
 	struct sit_page *node_ent;
 
-	u64 zonenr = get_czone_nr(ctx, pba);
+	u64 zonenr = get_zone_nr(ctx, pba);
 	u64 blknr = zonenr / SIT_ENTRIES_BLK;
 	//trace_printk("\n %s pba: %llu zonenr: %lld blknr: %lld", __func__, pba, zonenr, blknr);
 	
@@ -2911,7 +2811,7 @@ void mark_zone_erroneous(struct ctx *ctx, sector_t pba)
 	struct sit_page *sit_page;
 	struct lsdm_seg_entry *ptr;
 	int index, ret;
-	int zonenr;  
+	int zonenr, destn_zonenr;
 	struct lsdm_sb * sb = ctx->sb;
 
 	//mutex_lock(&ctx->sit_kv_store_lock);
@@ -2925,7 +2825,7 @@ void mark_zone_erroneous(struct ctx *ctx, sector_t pba)
 	//mutex_unlock(&ctx->sit_kv_store_lock);
 
 	ptr = (struct lsdm_seg_entry *) page_address(sit_page->page);
-	zonenr = get_czone_nr(ctx, pba);
+	zonenr = get_zone_nr(ctx, pba);
 	index = zonenr % SIT_ENTRIES_BLK; 
 	ptr = ptr + index;
 	ptr->vblocks = 1 << (sb->log_zone_size - sb->log_block_size);
@@ -2934,14 +2834,14 @@ void mark_zone_erroneous(struct ctx *ctx, sector_t pba)
 	//mutex_lock(&ctx->bm_lock);
 	/*-----------------------------------------------*/
 	ctx->nr_invalid_zones++;
-	ret = get_new_cache_zone(ctx);
+	ret = get_new_zone(ctx);
 	/*-----------------------------------------------*/
 	//mutex_unlock(&ctx->bm_lock);
 	if (ret > pba) {
 		printk(KERN_INFO "No more disk space available for writing!");
 		return;
 	}
-	//destn_zonenr = get_czone_nr(ctx, ctx->hot_wf_pba);
+	destn_zonenr = get_zone_nr(ctx, ctx->hot_wf_pba);
 	//copy_blocks(zonenr, destn_zonenr); 
 }
 
@@ -2955,17 +2855,17 @@ int is_zone_free(struct ctx *ctx, unsigned int zonenr)
 		panic("This is a ctx bug");
 	}
 		
-	bitmap = ctx->free_czone_bitmap;
+	bitmap = ctx->freezone_bitmap;
 	bytenr = zonenr / BITS_IN_BYTE;
 	bitnr = zonenr % BITS_IN_BYTE;
 	//printk(KERN_ERR "\n %s zonenr: %lu, bytenr: %d bitnr: %d bitmap[%d]: %d ", __func__, zonenr, bytenr, bitnr,  bytenr, bitmap[bytenr]);
 
-	if(unlikely(bytenr >= ctx->czone_bitmap_bytes)) {
-		panic("bytenr: %d > czone_bitmap_bytes: %d", bytenr, ctx->czone_bitmap_bytes);
+	if(unlikely(bytenr >= ctx->bitmap_bytes)) {
+		panic("bytenr: %d > bitmap_bytes: %d", bytenr, ctx->bitmap_bytes);
 	}
 
-	if(unlikely((bytenr == (ctx->czone_bitmap_bytes-1)) && (bitnr > ctx->czone_bitmap_bit))) {
-		panic("bytenr: %d, bitnr: %d > czone_bitmap_bytes: %d, bitnr: %d", bytenr, bitnr, ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit);
+	if(unlikely((bytenr == (ctx->bitmap_bytes-1)) && (bitnr > ctx->bitmap_bit))) {
+		panic("bytenr: %d, bitnr: %d > bitmap_bytes: %d, bitnr: %d", bytenr, bitnr, ctx->bitmap_bytes, ctx->bitmap_bit);
 	}
 
 	if (unlikely(NULL == bitmap)) {
@@ -3007,10 +2907,11 @@ void get_byte_string(char byte, char *str)
  *
  * Zone numbers start from 0
  */
-void mark_zone_free(struct ctx *ctx , uint zonenr, char * bitmap, uint bitmap_bytes, uint bitmap_bit, uint *nrfreezones, int resetZone)
+static void mark_zone_free(struct ctx *ctx , int zonenr, int resetZone)
 {	
+	char *bitmap;
 	int bytenr, bitnr, ret = 0;
-	char str[10];
+	//char str[9];
 
 	if (unlikely(NULL == ctx)) {
 		printk(KERN_ERR "\n ctx is null! ");
@@ -3018,40 +2919,38 @@ void mark_zone_free(struct ctx *ctx , uint zonenr, char * bitmap, uint bitmap_by
 	}
 	/* zone is not marked free yet, so will not be selected for writing */
 
+	bitmap = ctx->freezone_bitmap;
 	bytenr = zonenr / BITS_IN_BYTE;
 	bitnr = zonenr % BITS_IN_BYTE;
 
 
 	if (unlikely(NULL == bitmap)) {
-		printk(KERN_ERR "\n This is a ctx freezone bitmap bug! \n");
+		printk(KERN_ERR "\n This is a ctx freezone bitmap bug!");
 		return;
 	}
 
-	if(unlikely(bytenr >= bitmap_bytes)) {
-		printk(KERN_ERR "\n 1) BUG %s zonenr: %d, bytenr: %d bitnr: %d bitmap[%d]: %d  bitmap_bytes: %d \n", __func__, zonenr, bytenr, bitnr,  bytenr, bitmap[bytenr], bitmap_bytes);
+	if(unlikely(bytenr >= ctx->bitmap_bytes)) {
+		printk(KERN_ERR "\n 1) BUG %s zonenr: %d, bytenr: %d bitnr: %d bitmap[%d]: %d  bitmap_bytes: %d", __func__, zonenr, bytenr, bitnr,  bytenr, bitmap[bytenr], ctx->bitmap_bytes);
 		return;
 	}
 
-	if(unlikely((bytenr == bitmap_bytes) && (bitnr > bitmap_bit))) {
-		printk(KERN_ERR "\n 2) BUG %s zonenr: %d, bytenr: %d bitnr: %d bitmap[%d]: %d  bitmap_bytes: %d \n", __func__, zonenr, bytenr, bitnr,  bytenr, bitmap[bytenr], bitmap_bytes);
+	if(unlikely((bytenr == ctx->bitmap_bytes) && (bitnr > ctx->bitmap_bit))) {
+		printk(KERN_ERR "\n 2) BUG %s zonenr: %d, bytenr: %d bitnr: %d bitmap[%d]: %d  bitmap_bytes: %d", __func__, zonenr, bytenr, bitnr,  bytenr, bitmap[bytenr], ctx->bitmap_bytes);
 		return;
 	}
 
 	if ((bitmap[bytenr] & (1 << bitnr)) == (1<<bitnr)) {
 		/* This bit was 1 and hence already free*/
 		printk(KERN_ERR "\n BUG Trying to free an already free zone! ");
-		printk(KERN_ERR "\n %s zonenr: %d, bytenr: %d bitnr: %d bitmap[%d]: %d  bitmap_bytes: %d \n", __func__, zonenr, bytenr, bitnr,  bytenr, bitmap[bytenr], bitmap_bytes);
+		printk(KERN_ERR "\n %s zonenr: %d, bytenr: %d bitnr: %d bitmap[%d]: %d  bitmap_bytes: %d", __func__, zonenr, bytenr, bitnr,  bytenr, bitmap[bytenr], ctx->bitmap_bytes);
 		return;
 	}
 
-	if (resetZone) {
+	if (resetZone && (zonenr > ctx->sb->nr_cmr_zones)) {
 		//printk(KERN_ERR "\n %s reset zone: %d  \n ", __func__, zonenr);
-		/* always a data zone - is a shingled zone - and so get_first_pba_for_dzone */
-		if (bdev_is_zoned(ctx->dev->bdev)) {
-			ret = blkdev_zone_mgmt(ctx->dev->bdev, REQ_OP_ZONE_RESET, get_first_pba_for_dzone(ctx, zonenr), ctx->sb->nr_lbas_in_zone, GFP_NOIO);
-			if (ret ) {
-				printk(KERN_ERR "\n Failed to reset zonenr: %d, retvalue: %d", zonenr, ret);
-			}
+		ret = blkdev_zone_mgmt(ctx->dev->bdev, REQ_OP_ZONE_RESET, get_first_pba_for_zone(ctx, zonenr), ctx->sb->nr_lbas_in_zone, GFP_NOIO);
+		if (ret ) {
+			printk(KERN_ERR "\n Failed to reset zonenr: %d, retvalue: %d", zonenr, ret);
 		}
 	}
 
@@ -3059,17 +2958,19 @@ void mark_zone_free(struct ctx *ctx , uint zonenr, char * bitmap, uint bitmap_by
 	 * 1 to set it
 	 */
 	bitmap[bytenr] = bitmap[bytenr] | (1 << bitnr);
-	*nrfreezones = *nrfreezones + 1;
-	get_byte_string(bitmap[bytenr], str);
+	ctx->nr_freezones = ctx->nr_freezones + 1;
+	//get_byte_string(bitmap[bytenr], str);
 	//printk(KERN_ERR "\n %s Freed zonenr: %d, bytenr: %d, bitnr: %d byte:%s", __func__, zonenr, bytenr, bitnr, str);
 	/* we need to reset the  zone that we are about to use */
 }
 
-int get_next_freezone_nr(struct ctx *ctx, char *bitmap, u32 bitmap_bytes, u32 bitmap_bit, uint * nrfreezones)
+static int mark_zone_occupied(struct ctx *, int );
+static int get_next_freezone_nr(struct ctx *ctx)
 {
+	char *bitmap = ctx->freezone_bitmap;
 	int bytenr, bitnr;
 	unsigned char allZeroes = 0;
-	int zonenr = 0;
+	int zonenr;
 
 	bytenr = 0;
 	/* 1 indicates that a zone is free. 
@@ -3077,9 +2978,9 @@ int get_next_freezone_nr(struct ctx *ctx, char *bitmap, u32 bitmap_bytes, u32 bi
 	while(bitmap[bytenr] == allZeroes) {
 		/* All these zones are occupied */
 		bytenr = bytenr + 1;
-		if (unlikely(bytenr == (bitmap_bytes + 1))) {
+		if (unlikely(bytenr == ctx->bitmap_bytes)) {
 		/* no freezones available */
-			//printk(KERN_ERR "\n No free zone available, disk is full! \n");
+			printk(KERN_ERR "\n No free zone available, disk is full! \n");
 			return -1;
 		}
 	}
@@ -3092,52 +2993,38 @@ int get_next_freezone_nr(struct ctx *ctx, char *bitmap, u32 bitmap_bytes, u32 bi
 			break;
 		}
 		bitnr = bitnr + 1;
-		if(unlikely((bytenr == (bitmap_bytes)) && (bitnr == (bitmap_bit + 1)))) {
+		if(unlikely((bytenr == (ctx->bitmap_bytes-1)) && (bitnr == ctx->bitmap_bit))) {
 			printk(KERN_ERR "\n 2) No free zone available, disk is full! \n");
 			return -1;
 		}
 		if (bitnr == BITS_IN_BYTE) {
-			printk(KERN_ERR "\n 2) No free zone available, disk is full! \n");
-			return -1;
+			panic ("Wrong byte calculation!");
 		}
 	}
 	zonenr = (bytenr * BITS_IN_BYTE) + bitnr;
-	if (mark_zone_occupied(ctx, zonenr, bitmap, bitmap_bytes, bitmap_bit, nrfreezones))
+	if (mark_zone_occupied(ctx, zonenr))
 		BUG();
 
 	return zonenr;
 }
 
-
-int get_new_data_zone(struct ctx *ctx)
-{
-	int pzonenr;
-	pzonenr = get_next_freezone_nr(ctx, ctx->free_dzone_bitmap, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit, &ctx->nr_free_data_zones);
-	return pzonenr;
-}
+void wait_on_zone_barrier(struct ctx *);
+static void add_ckpt_new_wf(struct ctx *, sector_t);
+static void add_ckpt_new_gc_wf(struct ctx * ctx, sector_t wf);
 
 /* moves the write frontier, returns the LBA of the packet trailer
  * Always called with the ctx->wf_lock held.
 */
-int get_new_cache_zone(struct ctx *ctx)
+static int get_new_zone(struct ctx *ctx)
 {
 	int zone_nr;
 	int trial;
 
 	trial = 0;
 try_again:
-	zone_nr = get_next_freezone_nr(ctx, ctx->free_czone_bitmap, ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit, &ctx->nr_free_cache_zones);
+	zone_nr = get_next_freezone_nr(ctx);
 	if (zone_nr < 0) {
-		printk(KERN_ERR "\n Could not find a clean cache zone for writing. Calling lsdm_gc \n");
-		printk(KERN_ERR "\n 1. ctx->nr_free_cache_zones: %d, ctx->middle_watermark: %d. Starting GC.....\n", ctx->nr_free_cache_zones, ctx->middle_watermark);
-		ctx->gc_th->gc_wake = 1;
-		wake_up(&ctx->gc_th->lsdm_gc_wait_queue);
-		DEFINE_WAIT(wait);
-		prepare_to_wait(&ctx->gc_th->fggc_wq, &wait,
-					TASK_UNINTERRUPTIBLE);
-		/* setting gc_wake=1 and the next wakeup will trigger lsdm_gc(ctx, FG_GC, 0) by waking up a sleeping gc thread */
-		io_schedule();
-		finish_wait(&ctx->gc_th->fggc_wq, &wait);
+		printk(KERN_ERR "\n Could not find a clean zone for writing. Calling lsdm_gc \n");
 		if (0 == trial) {
 			trial++;
 			goto try_again;
@@ -3152,11 +3039,64 @@ try_again:
 	/* get_next_freezone_nr() starts from 0. We need to adjust
 	 * the pba with that of the actual first PBA of data segment 0
 	 */
-	ctx->hot_wf_pba = get_first_pba_for_czone(ctx, zone_nr);
-	ctx->hot_wf_end = get_last_pba_for_czone(ctx, zone_nr);
-	ctx->free_sectors_in_wf = ctx->nr_lbas_in_zone; 
-	//printk(KERN_ERR "\n %s() NEW CACHE ZONE: zone_nr: %d  ctx->free_sectors_in_wf: %llu", __func__, zone_nr, ctx->free_sectors_in_wf);
+	ctx->hot_wf_pba = get_first_pba_for_zone(ctx, zone_nr);
+	ctx->hot_wf_end = get_last_pba_for_zone(ctx, zone_nr);
+
+	//printk(KERN_ERR "\n !!get_new_zone():: zone0_pba: %u zone_nr: %d hot_wf_pba: %llu, wf_end: %llu ctx->warm_wf_pba: %llu \n", ctx->sb->zone0_pba, zone_nr, ctx->hot_wf_pba, ctx->hot_wf_end, ctx->warm_gc_wf_pba);
+	if (ctx->hot_wf_pba > ctx->hot_wf_end) {
+		panic("wf > wf_end!!, nr_free_sectors: %lld", ctx->free_sectors_in_wf );
+	}
+	ctx->free_sectors_in_wf = ctx->hot_wf_end - ctx->hot_wf_pba + 1;
+	//printk(KERN_ERR "\n %s zone_nr: %d  ctx->nr_freezones: %llu", __func__, zone_nr, ctx->nr_freezones);
 	add_ckpt_new_wf(ctx, ctx->hot_wf_pba);
+	return 0;
+}
+
+void print_zones_vblocks(struct ctx *ctx);
+
+/*
+ * moves the write frontier, returns the LBA of the packet trailer
+ * We know that only one GC thread is working at a time. Thus we take a 
+ * lock only while getting a free zone as that can clash with writes moving
+ * the frontier and asking for a new zone. We dont want to end up with the same zones
+ * for both! get_next_freezone_nr() also marks a zone as not free. We want to do that
+ * under a lock. 
+*/
+static int get_new_gc_zone(struct ctx *ctx)
+{
+	int zone_nr;
+	int trial;
+
+	trial = 0;
+again:
+	mutex_lock(&ctx->bm_lock);
+	zone_nr = get_next_freezone_nr(ctx);
+	mutex_unlock(&ctx->bm_lock);
+	if (zone_nr < 0) {
+		trial++;
+		flush_workqueue(ctx->tm_wq);
+		if (trial < 2) 
+			goto again;
+		print_zones_vblocks(ctx);
+		mark_disk_full(ctx);
+		printk(KERN_ERR "No more disk space available for writing!");
+		ctx->warm_gc_wf_pba = ~0;
+		BUG_ON(1);
+		return -1;
+	}
+
+	/* get_next_freezone_nr() starts from 0. We need to adjust
+	 * the pba with that of the actual first PBA of data segment 0
+	 */
+	ctx->warm_gc_wf_pba = get_first_pba_for_zone(ctx, zone_nr);
+	ctx->warm_gc_wf_end = get_last_pba_for_zone(ctx, zone_nr);
+	if (ctx->warm_gc_wf_pba > ctx->warm_gc_wf_end) {
+		panic("wf > wf_end!!, nr_free_sectors: %llu", ctx->free_sectors_in_wf );
+	}
+	BUG_ON(ctx->warm_gc_wf_end > ctx->sb->max_pba);
+	ctx->free_sectors_in_gc_wf = ctx->warm_gc_wf_end - ctx->warm_gc_wf_pba + 1;
+	add_ckpt_new_gc_wf(ctx, ctx->warm_gc_wf_pba);
+	//printk("\n %s zone0_pba: %llu zone_nr: %d warm_gc_wf_pba: %llu, gc_wf_end: %llu", __func__,  ctx->sb->zone0_pba, zone_nr, ctx->warm_gc_wf_pba, ctx->warm_gc_wf_end);
 	return 0;
 }
 
@@ -3192,10 +3132,67 @@ try_again:
  * The later one belong to the current wf
  */
 
-void add_ckpt_new_wf(struct ctx * ctx, sector_t wf)
+static void add_ckpt_new_wf(struct ctx * ctx, sector_t wf)
 {
 	struct lsdm_ckpt *ckpt = ctx->ckpt;
 	ckpt->hot_frontier_pba = wf;
+}
+
+static void add_ckpt_new_gc_wf(struct ctx * ctx, sector_t wf)
+{
+	struct lsdm_ckpt *ckpt = ctx->ckpt;
+	ckpt->warm_gc_frontier_pba = wf;
+}
+
+/*
+ * Since bitmap can be created in case of a crash, we do not 
+ * wait for the bitmap to be flushed.
+ * We only initiate the flush for the bitmap.
+ * DO not free revmap_bitmap_page. Do it exit function.
+ */
+void flush_revmap_bitmap(struct ctx *ctx)
+{
+	struct bio * bio;
+	struct page *page;
+	sector_t pba;
+
+	page = ctx->revmap_bm;
+	if (!page)
+		return;
+
+	bio = bio_alloc(ctx->dev->bdev, 1, REQ_OP_WRITE, GFP_KERNEL);
+	if (!bio) {
+		return;
+	}
+	/* bio_add_page sets the bi_size for the bio */
+	if( PAGE_SIZE > bio_add_page(bio, page, PAGE_SIZE, 0)) {
+		bio_put(bio);
+		return;
+	}
+	//trace_printk("\n %s flushing revmap bitmap at pba: %u", __func__, ctx->sb->revmap_bm_pba);
+	pba = ctx->sb->revmap_bm_pba;
+	bio->bi_iter.bi_sector = pba;
+	bio->bi_opf = REQ_OP_WRITE;
+	//bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+	bio_set_dev(bio, ctx->dev->bdev);
+	/* Not doing this right now as the conventional zones are too little.
+	 * we need to log structurize the metadata
+	 */
+	BUG_ON(ctx->sb->revmap_bm_pba > ctx->sb->max_pba);
+	submit_bio_wait(bio);
+
+	switch(bio->bi_status) {
+		case BLK_STS_OK:
+			/* bio_alloc, hence bio_put */
+			bio_put(bio);
+			break;
+		default:
+			/*TODO: do something, for now panicing */
+			//trace_printk("\n Could not flush revmap bitmap");
+			panic("IO error while flushing revmap block! Handle this better");
+			break;
+	}
+	return;
 }
 
 /* We initiate a flush of a checkpoint,
@@ -3206,6 +3203,7 @@ void flush_checkpoint(struct ctx *ctx)
 	struct bio * bio;
 	struct page *page;
 	sector_t pba;
+	struct lsdm_ckpt * ckpt;
 
 	page = ctx->ckpt_page;
 	if (!page) {
@@ -3213,6 +3211,7 @@ void flush_checkpoint(struct ctx *ctx)
 		return;
 	}
 
+	ckpt = (struct lsdm_ckpt *)page_address(page);
 	/* TODO: GC will not change the checkpoint, but will change
 	 * the SIT Info.
 	 */
@@ -3263,6 +3262,10 @@ void flush_checkpoint(struct ctx *ctx)
 	return;
 }
 
+
+void flush_sit_node_page(struct ctx * ctx, struct rb_node *);
+
+
 void flush_sit_nodes(struct ctx *ctx, struct rb_node *node)
 {	
 	if (!node) {
@@ -3276,6 +3279,9 @@ void flush_sit_nodes(struct ctx *ctx, struct rb_node *node)
 	if (node->rb_right)
 		flush_sit_nodes(ctx, node->rb_right);
 }
+
+void free_sit_pages(struct ctx *);
+
 
 /*
  * We need to maintain the sit entries in some pages and keep the
@@ -3350,7 +3356,7 @@ void remove_gc_zone_nodes(struct ctx *ctx)
 	}
 }
 
-void remove_gc_nodes(struct ctx *ctx)
+static void remove_gc_nodes(struct ctx *ctx)
 {
 	remove_gc_cost_nodes(ctx);
 	remove_gc_zone_nodes(ctx);
@@ -3401,15 +3407,21 @@ void update_checkpoint(struct ctx *ctx)
 	}
 	ckpt = (struct lsdm_ckpt *) page_address(page);
 	//trace_printk("\n Inside %s ckpt: %p", __func__, ckpt);
+	if (ckpt->clean == 1) {
+		//trace_printk("\n ckpt has not changed since last flush!");
+		return;
+	}
 	ckpt->user_block_count = ctx->user_block_count;
 	ckpt->version += 1;
 	//printk(KERN_ERR "\n %s ckpt->user_block_count = %lld version: %d ", __func__, ctx->user_block_count, ckpt->version);
 	ckpt->nr_invalid_zones = ctx->nr_invalid_zones;
 	ckpt->hot_frontier_pba = ctx->hot_wf_pba;
 	//trace_printk("\n %s, ckpt->hot_frontier_pba: %llu version: %lld", __func__, ckpt->hot_frontier_pba, ckpt->version);
-	ckpt->nr_free_cache_zones = ctx->nr_free_cache_zones;
-	//printk(KERN_ERR "\n %s ckpt->nr_free_cache_zones: %llu, ctx->nr_free_cache_zones: %llu", __func__, ckpt->nr_free_cache_zones, ctx->nr_free_cache_zones);
+	ckpt->warm_gc_frontier_pba = ctx->warm_gc_wf_pba;
+	ckpt->nr_free_zones = ctx->nr_freezones;
+	//printk(KERN_ERR "\n %s ckpt->nr_free_zones: %llu, ctx->nr_freezones: %llu", __func__, ckpt->nr_free_zones, ctx->nr_freezones);
 	ckpt->elapsed_time = get_elapsed_time(ctx);
+	ckpt->clean = 1;
 	return;
 	//ckpt->crc = calculate_crc(ctx, page);
 }
@@ -3433,18 +3445,21 @@ void move_write_frontier(struct ctx *ctx, sector_t s8)
 		BUG();
 	}
 
-	//printk(KERN_ERR "\n %s() CACHE-WRITE ctx->hot_wf_pba: %llu s8: %llu ctx->free_sectors_in_wf: %llu \n", __func__, ctx->hot_wf_pba, s8, ctx->free_sectors_in_wf);
+	//printk(KERN_ERR "\n %s ctx->hot_wf_pba: %llu ctx->free_sectors_in_wf: %llu \n", __func__, ctx->hot_wf_pba, ctx->free_sectors_in_wf);
 	ctx->hot_wf_pba = ctx->hot_wf_pba + s8;
 	ctx->free_sectors_in_wf = ctx->free_sectors_in_wf - s8;
 	ctx->user_block_count -= s8 / NR_SECTORS_IN_BLK;
-
 	if (ctx->free_sectors_in_wf < NR_SECTORS_IN_BLK) {
 		//printk(KERN_INFO "Num of free sect.: %llu, about to call get_new_zone() \n", ctx->free_sectors_in_wf);
 		if ((ctx->hot_wf_pba - 1) != ctx->hot_wf_end) {
 			printk(KERN_INFO "kernel wf before BUG: %llu - %llu\n", ctx->hot_wf_pba, ctx->hot_wf_end);
 			BUG_ON(ctx->hot_wf_pba != (ctx->hot_wf_end + 1));
 		}
-		ret = get_new_cache_zone(ctx);
+		//int zonenr = get_zone_nr(ctx, ctx->hot_wf_pba - 2);
+		//trace_printk("\n %s zone: %d #valid blks: %d ", __func__, zonenr, get_sit_ent_vblocks(ctx, zonenr));
+		//mutex_lock(&ctx->bm_lock);
+		ret = get_new_zone(ctx);
+		//mutex_unlock(&ctx->bm_lock);
 		if (ret) {
 			printk(KERN_ERR "\n No more disk space available for writing!");
 			BUG();
@@ -3452,6 +3467,38 @@ void move_write_frontier(struct ctx *ctx, sector_t s8)
 	}
 }
 
+/* Always called with the ctx->lock held
+ */
+void move_gc_write_frontier(struct ctx *ctx, sector_t s8)
+{
+	/* We should have adjusted sectors_s8 to accomodate
+	 * for the rooms in the zone before calling this function.
+	 * Its how we split the bio
+	 */
+	if (ctx->free_sectors_in_gc_wf < s8) {
+		panic("Wrong manipulation of gc wf; used unavailable sectors in a log");
+	}
+
+	BUG_ON(!s8);
+	
+	//printk(KERN_ERR "\n %s ctx->warm_gc_wf: %llu ctx->free_sectors_in_gc_wf: %llu \n", __func__, ctx->warm_gc_wf_pba, ctx->free_sectors_in_gc_wf);
+	ctx->warm_gc_wf_pba = ctx->warm_gc_wf_pba + s8;
+	ctx->free_sectors_in_gc_wf = ctx->free_sectors_in_gc_wf - s8;
+	if (ctx->free_sectors_in_gc_wf < NR_SECTORS_IN_BLK) {
+		if ((ctx->warm_gc_wf_pba - 1) != ctx->warm_gc_wf_end) {
+			printk(KERN_INFO "kernel wf before BUG: %llu - %llu\n", ctx->warm_gc_wf_pba, ctx->warm_gc_wf_end);
+			BUG_ON(ctx->warm_gc_wf_pba != (ctx->warm_gc_wf_end + 1));
+		}
+		if (get_new_gc_zone(ctx)) {
+			panic("No more disk space available for writing!");
+		}
+	}
+}
+
+int is_revmap_block_available(struct ctx *ctx, u64 pba);
+void flush_tm_nodes(struct rb_node *node, struct ctx *ctx);
+
+struct page * read_block(struct ctx *, u64 , u64 );
 /*
  * pba: stored in the LBA - PBA translation.
  * This is the PBA of some data block. This PBA belongs to some zone.
@@ -3463,12 +3510,13 @@ void move_write_frontier(struct ctx *ctx, sector_t s8)
 struct sit_page * add_sit_page_kv_store(struct ctx * ctx, sector_t pba, const char * caller)
 {
 	sector_t sit_blknr;
-	u64 zonenr = get_czone_nr(ctx, pba);
+	u64 zonenr = get_zone_nr(ctx, pba);
 	struct rb_root *root = &ctx->sit_rb_root;
 	struct rb_node *parent = NULL;
 	struct sit_page *parent_ent;
 	struct sit_page *new;
 	struct page *page;
+	struct lsdm_seg_entry *ptr;
 	static int count = 0;
 
 
@@ -3500,6 +3548,7 @@ struct sit_page * add_sit_page_kv_store(struct ctx * ctx, sector_t pba, const ch
 	new->flag = NEEDS_FLUSH;
 	new->blknr = sit_blknr;
 	new->page = page;
+	ptr = (struct lsdm_seg_entry *) page_address(page);
 	if (parent) {
 		/* Add this page to a RB tree based KV store.
 		 * Key is: blknr for this corresponding block
@@ -3529,6 +3578,8 @@ struct sit_page * add_sit_page_kv_store(struct ctx * ctx, sector_t pba, const ch
 	return new;
 }
 
+int update_gc_tree(struct ctx *, unsigned int , u32 , u64 , const char *);
+
 int get_sit_ent_vblocks(struct ctx *ctx, int zonenr)
 {
 
@@ -3537,13 +3588,13 @@ int get_sit_ent_vblocks(struct ctx *ctx, int zonenr)
 	sector_t pba;
 	int index;
 
-	pba = get_first_pba_for_czone(ctx, zonenr);
+	pba = get_first_pba_for_zone(ctx, zonenr);
 	sit_page = add_sit_page_kv_store(ctx, pba, __func__);
 	if (!sit_page) {
 		return -1;
 	}
 	ptr = (struct lsdm_seg_entry *) page_address(sit_page->page);
-	zonenr = get_czone_nr(ctx, pba);
+	zonenr = get_zone_nr(ctx, pba);
 	index = zonenr % SIT_ENTRIES_BLK; 
 	ptr = ptr + index;
 	return ptr->vblocks;
@@ -3569,6 +3620,7 @@ void sit_ent_vblocks_decr(struct ctx *ctx, sector_t pba)
 	sector_t zonenr;
 	int index;
 
+	BUG_ON(pba == 0);
 	BUG_ON(pba > ctx->sb->max_pba);
 
 	//mutex_lock(&ctx->sit_kv_store_lock);
@@ -3580,7 +3632,7 @@ void sit_ent_vblocks_decr(struct ctx *ctx, sector_t pba)
 	}
 
 	ptr = (struct lsdm_seg_entry *) page_address(sit_page->page);
-	zonenr = get_czone_nr(ctx, pba);
+	zonenr = get_zone_nr(ctx, pba);
 	index = zonenr % SIT_ENTRIES_BLK; 
 	ptr = ptr + index;
 	if (!ptr->vblocks) {
@@ -3593,7 +3645,8 @@ void sit_ent_vblocks_decr(struct ctx *ctx, sector_t pba)
 	 * the older cost which is stored in the tree. The newer ones
 	 * on the other hand are used to modify the tree
 	 */
-	if (zonenr != get_czone_nr(ctx, ctx->ckpt->hot_frontier_pba)) {
+	if ((zonenr != get_zone_nr(ctx, ctx->ckpt->hot_frontier_pba)) &&
+		    (zonenr != get_zone_nr(ctx, ctx->ckpt->warm_gc_frontier_pba))) {
 		//trace_printk("\n %s done! zone: %u vblocks: %d pba: %lu, index: %d , ptr: %p", __func__, zonenr, ptr->vblocks, pba, index, ptr);
 		/* add mtime here */
 		ptr->mtime = get_elapsed_time(ctx);
@@ -3601,12 +3654,16 @@ void sit_ent_vblocks_decr(struct ctx *ctx, sector_t pba)
 			ctx->max_mtime = ptr->mtime;
 		update_gc_tree(ctx, zonenr, ptr->vblocks, ptr->mtime, __func__);
 		if (!ptr->vblocks) {
-			printk(KERN_ERR "\n %s Freeing zone: %llu \n", __func__, zonenr);
-			mark_zone_free(ctx, zonenr, ctx->free_czone_bitmap, ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit, &ctx->nr_free_cache_zones, 0);
+			//printk(KERN_ERR "\n %s Freeing zone: %llu \n", __func__, zonenr);
+			mark_zone_free(ctx , zonenr, 1);
+			
 		}
 	}
 	//mutex_unlock(&ctx->sit_kv_store_lock);
 }
+
+
+int read_seg_entries_from_block(struct ctx *ctx, struct lsdm_seg_entry *entry, unsigned int nr_seg_entries, unsigned int *zonenr);
 
 /*
  * pba: from the LBA-PBA pair. Of a data block
@@ -3625,6 +3682,7 @@ void sit_ent_vblocks_incr(struct ctx *ctx, sector_t pba)
 	long vblocks = 0;
 	struct lsdm_sb * sb = ctx->sb;
 
+	BUG_ON(pba == 0);
 	BUG_ON(pba > ctx->sb->max_pba);
 
 	//mutex_lock(&ctx->sit_kv_store_lock);
@@ -3636,21 +3694,17 @@ void sit_ent_vblocks_incr(struct ctx *ctx, sector_t pba)
 		//panic("Low memory, could not allocate sit_entry");
 	}
 
-	zonenr = get_czone_nr(ctx, pba);
+	zonenr = get_zone_nr(ctx, pba);
 	//trace_printk("\n %s: pba: %llu zonenr: %llu", __func__, pba, zonenr);
 	index = zonenr % SIT_ENTRIES_BLK; 
 	ptr = (struct lsdm_seg_entry *) page_address(sit_page->page);
 	ptr = ptr + index;
 	ptr->vblocks = ptr->vblocks + 1;
 	vblocks = ptr->vblocks;
-	/* we compare with the pba of the last block in the zone*/
-	if (pba == (zone_end(ctx, pba) + 1 - NR_SECTORS_IN_BLK)) {
+	if (pba == zone_end(ctx, pba)) {
 		ptr->mtime = get_elapsed_time(ctx);
 		if (ctx->max_mtime < ptr->mtime)
 			ctx->max_mtime = ptr->mtime;
-		/* TODO: Add the zone to the GC tree if the vblocks < 65536 */
-		//printk(KERN_ERR "\n %s Adding zone: %llu to GC tree \n", __func__, zonenr);
-		update_gc_tree(ctx, zonenr, ptr->vblocks, ptr->mtime, __func__);
 	}
 	//mutex_unlock(&ctx->sit_kv_store_lock);
 	if(vblocks > (1 << (sb->log_zone_size - sb->log_block_size))) {
@@ -3674,6 +3728,7 @@ void sit_ent_add_mtime(struct ctx *ctx, sector_t pba)
 	sector_t zonenr;
 	int index;
 
+	BUG_ON(pba == 0);
 	BUG_ON(pba > ctx->sb->max_pba);
 
 	//mutex_lock(&ctx->sit_kv_store_lock);
@@ -3683,7 +3738,7 @@ void sit_ent_add_mtime(struct ctx *ctx, sector_t pba)
 		panic("Low memory, could not allocate sit_entry");
 	}
 	ptr = (struct lsdm_seg_entry*) page_address(sit_page->page);
-	zonenr = get_czone_nr(ctx, pba);
+	zonenr = get_zone_nr(ctx, pba);
 	index = zonenr % SIT_ENTRIES_BLK; 
 	ptr = ptr + index;
 	/* Send the older vblocks, mtime along with the new vblocks,mtime to this
@@ -3697,264 +3752,179 @@ void sit_ent_add_mtime(struct ctx *ctx, sector_t pba)
 	//mutex_unlock(&ctx->sit_kv_store_lock);
 }
 
-#if 0
-/* The pba - len is in the same zone.
- * We are trying to find out the number of dzones in a czone
+struct tm_page * search_tm_kv_store(struct ctx *ctx, u64 blknr, struct rb_node **parent);
+/*
+ * If this length cannot be accomodated in this page
+ * search and add another page for this next
+ * lba. Remember this translation table will
+ * go on the disk and is block based and not 
+ * extent based
+ *
+ * Depending on the location within a page, add the lba.
  */
-int add_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len)
+int add_translation_entry(struct ctx * ctx, sector_t lba, sector_t pba, size_t len) 
 {
-	int czonenr = get_czone_nr(ctx, pba);
-	struct czone_info *czinfo = ctx->czonenr_list[czonenr], *next_node, *new, *last;
-	struct list_head *list_head;
-	int lzonenr = lba / ctx->nr_lbas_in_zone;
-	struct lsdm_seg_entry *ptr;
-	struct sit_page *sit_page;
-	int index;
-
-	sit_page = add_sit_page_kv_store(ctx, pba, __func__);
-	if (!sit_page) {
-		/* TODO: do something, low memory */
-		print_memory_usage(ctx, "During sit_ent_vblocks_incr");
-		BUG_ON(1);
-		//panic("Low memory, could not allocate sit_entry");
-	}
-
-	index = czonenr % SIT_ENTRIES_BLK; 
-	ptr = (struct lsdm_seg_entry *) page_address(sit_page->page);
-	ptr = ptr + index;
-
-	if (!czinfo) {
-		czinfo = kmem_cache_alloc(ctx->czinfo_cache, GFP_KERNEL);
-		if (!czinfo) {
-			return -1;
-		}
-		czinfo->lzone = lzonenr;
-		czinfo->count = 1;
-		INIT_LIST_HEAD(&czinfo->list);
-		ptr->lzones = 1;
-		ctx->czonenr_list[czonenr] = czinfo;
-		return 0;
-	}
-	list_head = &czinfo->list;
-	list_for_each_entry_safe(czinfo, next_node, list_head, list) {
-		last = czinfo;
-		if (czinfo->lzone < lzonenr) {
-			continue;
-		}
-		if(czinfo->lzone == lzonenr) {
-			czinfo->count += 1;
-			if (lzonenr < ((lba + len) / ctx->nr_lbas_in_zone)) {
-				lzonenr = lzonenr + 1;
-				continue;
-			}
-			return 0;
-		}
-		break;
-	}
-	new = kmem_cache_alloc(ctx->czinfo_cache, GFP_KERNEL);
-	if (!new) {
-		return -1;
-	}
-	new->lzone = lzonenr;
-	new->count = 1;
-	INIT_LIST_HEAD(&new->list);
-	if (czinfo) 
-		list_add_tail(&new->list, &czinfo->list);
-	else 
-		list_add(&new->list, &last->list);
-	/* New lzone added to this cache zone */
-	ptr->lzones += 1;
-	return 0;
-}
-#endif
-
-#if 0
-int remove_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len)
-{
-	int czonenr = get_czone_nr(ctx, pba);
-	struct czone_info *czinfo = ctx->czonenr_list[czonenr], *next_node;
-	struct list_head *list_head;
-	int lzonenr = lba / ctx->nr_lbas_in_zone;
-	struct sit_page *sit_page;
-	struct lsdm_seg_entry *ptr;
-	int index;
-
-	sit_page = add_sit_page_kv_store(ctx, pba, __func__);
-	if (!sit_page) {
-		/* TODO: do something, low memory */
-		print_memory_usage(ctx, "During sit_ent_vblocks_incr");
-		BUG_ON(1);
-		//panic("Low memory, could not allocate sit_entry");
-	}
-
-	index = czonenr % SIT_ENTRIES_BLK; 
-	ptr = (struct lsdm_seg_entry *) page_address(sit_page->page);
-	ptr = ptr + index;
-
-	BUG_ON(!czinfo);
-	list_head = &czinfo->list;
-	//printk(KERN_ERR "\n searching for lzonenr: %d \n", lzonenr);
-	list_for_each_entry_safe(czinfo, next_node, list_head, list) {
-		//printk(KERN_ERR "\n lzone: %d ", czinfo->lzone);
-		if (czinfo->lzone < lzonenr) {
-			continue;
-		}
-		if(czinfo->lzone == lzonenr) {
-			czinfo->count -= 1;
-			ptr->lzones = ptr->lzones - 1;
-			if (!czinfo->count) {
-				ptr->lzones = 0;
-				/* Remove this lzone */
-				list_del(&czinfo->list);
-			}
-			if (lzonenr < ((lba + len) / ctx->nr_lbas_in_zone)) {
-				lzonenr = lzonenr + 1;
-				continue;
-			}
-			return 0;
-		}
-	}
-	//printk(KERN_ERR "\n Error!! lzonenr: %d", lzonenr);
-	return 0;
-}
-#endif
-
-int add_rev_translation_entry(struct ctx * ctx, sector_t lba, sector_t pba, size_t len) 
-{
-	struct rev_tm_entry * ptr;
-	int index, i, blknr;
+	struct tm_entry * ptr;
+	int index, i, zonenr = 0, blknr;
 	int nrblks = len >> SECTOR_BLK_SHIFT;
-	struct tm_page * rev_tm_page = NULL;
+	struct tm_page * tm_page = NULL;
 	struct page *page;
 
 	BUG_ON(len < 0);
 	BUG_ON(nrblks == 0);
+	BUG_ON(pba == 0);
 	mutex_lock(&ctx->tm_kv_store_lock);
-	rev_tm_page = add_rev_tm_page_kv_store(ctx, pba);
-	if (!rev_tm_page) {
+	tm_page = add_tm_page_kv_store(ctx, lba);
+	if (!tm_page) {
 		mutex_unlock(&ctx->tm_kv_store_lock);
 		printk(KERN_ERR "%s NO memory! ", __func__);
 		BUG();
 	}
-	rev_tm_page->flag = NEEDS_FLUSH;
+	tm_page->flag = NEEDS_FLUSH;
 	/* Call this under the kv store lock, else it will race with removal/flush code
 	 */
-	page = rev_tm_page->page;
-	ptr = (struct rev_tm_entry *) page_address(page);
+	page = tm_page->page;
+	ptr = (struct tm_entry *) page_address(page);
 	/* Do not modify the lba, we will need it later */
 	/* lba is sector addressable, whereas translation entry is per block
 	 * so we first convert the address to a blk nr and then find out the
 	 * position in the page using that blknr
 	 */
-	blknr = ((pba - ctx->sb->czone0_pba) >> SECTOR_BLK_SHIFT);
-	index = blknr %  REV_TM_ENTRIES_BLK;
+	blknr = (lba >> SECTOR_BLK_SHIFT);
+	index = blknr %  TM_ENTRIES_BLK;
 	ptr = ptr + index;
-
-	//printk(KERN_ERR "\n %s Cache write!! COMPLETED: lba: %llu, pba: %llu, len: %lu nrblks: %d ", __func__, lba, pba, len, nrblks);
+	BUG_ON(ctx->sb->max_pba == 0);
+	//trace_printk("\n %s zonenr: %d lba: %llu, pba: %llu, len: %zu nrblks: %d", __func__, get_zone_nr(ctx, pba), lba, pba, len, nrblks);
 	for(i=0; i<nrblks; i++) {
-		if (lba > ctx->sb->max_pba) {
+		if (pba > ctx->sb->max_pba) {
 			printk(KERN_ERR "\n %s lba: %llu pba: %llu max_pba: %llu len: %zu i: %d", __func__, lba, pba, ctx->sb->max_pba, len, i);
 			mutex_unlock(&ctx->tm_kv_store_lock);
 			BUG();
 			return -ENOMEM;
 		}
 		/*-----------------------------------------------*/
-		if (ptr->lba == lba) {
-			printk(KERN_ERR "\n 1. lba: %llu, ptr->pba: %llu pba: %llu", pba, ptr->lba, lba);
+		if (ptr->pba == pba) {
+			printk(KERN_ERR "\n 1. lba: %llu, ptr->pba: %llu pba: %llu", lba, ptr->pba, pba);
 			/* repeated entry - retrieved either from on-disk tm  */
 			/* for now we are not flushing, so this should not be here */
 			mutex_unlock(&ctx->tm_kv_store_lock);
 			BUG_ON(1);
 			return -ENOMEM;
 		}
-		/* we need to incr the vblocks always */
+		/* lba can be 0, but pba cannot be, so this entry is empty! */
+		if (ptr->pba != 0) {
+			/* decrement vblocks for the segment that has
+			 * the stale block
+			 */
+			zonenr = get_zone_nr(ctx, ptr->pba);
+			//trace_printk("\n %s Overwrite a block at LBA: %llu, orig PBA: %llu origzone: %d new PBA: %llu ", __func__, lba, ptr->pba, zonenr, pba);
+			sit_ent_vblocks_decr(ctx, ptr->pba);
+		}
+		ptr->pba = pba;
 		sit_ent_vblocks_incr(ctx, pba);
-		ptr->lba = lba;
 		pba = pba + NR_SECTORS_IN_BLK;
 		lba = lba + NR_SECTORS_IN_BLK;
 		index = index + 1;
-		if (index < REV_TM_ENTRIES_BLK) {
+		if (index < TM_ENTRIES_BLK) {
 			ptr++;
 			continue;
 		} 
-		rev_tm_page = add_rev_tm_page_kv_store(ctx, pba);
-		if (!rev_tm_page) {
+		tm_page = add_tm_page_kv_store(ctx, lba);
+		if (!tm_page) {
 			printk(KERN_ERR "%s NO memory! ", __func__);
 			mutex_unlock(&ctx->tm_kv_store_lock);
 			BUG_ON(1);
 			return -ENOMEM;
 		}
-		rev_tm_page->flag = NEEDS_FLUSH;
-		page = rev_tm_page->page;
-		ptr = (struct rev_tm_entry *) page_address(page);
+		tm_page->flag = NEEDS_FLUSH;
+		page = tm_page->page;
+		ptr = (struct tm_entry *) page_address(page);
 		index = 0;
 	}
 	mutex_unlock(&ctx->tm_kv_store_lock);
 	return 0;	
 }
 
-int remove_rev_translation_entry(struct ctx * ctx, sector_t pba, unsigned int len) 
+/* We are reading the lba from the lsdm tree in memory.
+ * We will have a problem when the tree becomes so big that
+ * it cannot be held in memory
+ * But  for now this works! Will have to convert the the block
+ * based translation entry to an extent based one. 
+ *
+ * TODO: Will have to convert the the block
+ * based translation entry to an extent based one.
+ */
+struct page * read_tm_page(struct ctx * ctx, u64 lba)
 {
-	struct rev_tm_entry * ptr;
-	int index, i, blknr;
-	int nrblks = len >> SECTOR_BLK_SHIFT;
-	struct tm_page * rev_tm_page = NULL;
-	struct page *page;
+	u64 last_lba; 
+	int index = 0;
+	struct page * page;
+	struct tm_entry * ptr;
+	struct extent * e = NULL;
+	u64 e_pba = 0;
+	u32 nrsectors = (TM_ENTRIES_BLK * NR_SECTORS_IN_BLK);
 
-	BUG_ON(len < 0);
-	BUG_ON(nrblks == 0);
-	mutex_lock(&ctx->tm_kv_store_lock);
-	rev_tm_page = add_rev_tm_page_kv_store(ctx, pba);
-	if (!rev_tm_page) {
-		mutex_unlock(&ctx->tm_kv_store_lock);
-		printk(KERN_ERR "%s NO memory! ", __func__);
-		BUG();
-	}
-	rev_tm_page->flag = NEEDS_FLUSH;
-	/* Call this under the kv store lock, else it will race with removal/flush code
-	 */
-	page = rev_tm_page->page;
-	ptr = (struct rev_tm_entry *) page_address(page);
-	/* Do not modify the lba, we will need it later */
-	/* lba is sector addressable, whereas translation entry is per block
-	 * so we first convert the address to a blk nr and then find out the
-	 * position in the page using that blknr
-	 */
-	blknr = ((pba - ctx->sb->czone0_pba) >> SECTOR_BLK_SHIFT);
-	index = blknr %  REV_TM_ENTRIES_BLK;
-	ptr = ptr + index;
-	BUG_ON(ctx->sb->max_pba == 0);
-	for(i=0; i<nrblks; i++) {
-		if (pba > ctx->sb->dzone0_pba) {
-			printk(KERN_ERR "\n %s pba: %llu max_pba: %llu len: %u i: %d", __func__, pba, ctx->sb->max_pba, len, i);
-			mutex_unlock(&ctx->tm_kv_store_lock);
-			BUG();
-			return -ENOMEM;
+	/* blknr = lba / nrsectors */
+	lba = ((lba / nrsectors) * nrsectors);
+	last_lba = lba + nrsectors;
+
+    	page = alloc_page(__GFP_ZERO|GFP_KERNEL);
+	if (!page )
+		return NULL;
+
+	nrpages++;
+
+	//printk(KERN_ERR "\n %s nrpages: %llu lba: %llu \n", __func__, nrpages, lba);
+
+	ptr = (struct tm_entry *) page_address(page);
+	
+	while (lba <= last_lba) {
+		/* metadata lock held in the calling function add_revmap_entry */
+		e = _lsdm_rb_geq(&ctx->extent_tbl_root, lba, 0);
+		/* Case of no overlap */
+		if ((e == NULL) || (e->lba >= lba + nrsectors))  {
+			while (index < TM_ENTRIES_BLK) {
+				ptr->pba = 0;
+				ptr++;
+				index++;
+				nrsectors = nrsectors - NR_SECTORS_PER_BLK;
+			}
+			lba = last_lba;
+			break;
 		}
-		/*-----------------------------------------------*/
-		sit_ent_vblocks_decr(ctx, pba);
-		//# This is how we denote INVALID LBA
-		ptr->lba = (ctx->sb->max_pba + 1);
-		pba = pba + NR_SECTORS_IN_BLK;
-		index = index + 1;
-		if (index < REV_TM_ENTRIES_BLK) {
+
+		/* some partial overlap, front part does not have a mapping*/
+		while ((e->lba > lba) && (e->lba + e->len < lba)){
+			ptr->pba = 0;
 			ptr++;
-			continue;
-		} 
-		rev_tm_page = add_rev_tm_page_kv_store(ctx, pba);
-		if (!rev_tm_page) {
-			printk(KERN_ERR "%s NO memory! ", __func__);
-			mutex_unlock(&ctx->tm_kv_store_lock);
-			BUG_ON(1);
-			return -ENOMEM;
+			lba =  lba + NR_SECTORS_PER_BLK;
+			index = index + NR_SECTORS_PER_BLK;
+			if (index == TM_ENTRIES_BLK) {
+				break;
+			}
+			nrsectors = nrsectors - NR_SECTORS_PER_BLK;
 		}
-		rev_tm_page->flag = NEEDS_FLUSH;
-		page = rev_tm_page->page;
-		ptr = (struct rev_tm_entry *) page_address(page);
-		index = 0;
+
+		if (index == TM_ENTRIES_BLK) {
+			break;
+		}
+
+
+		/* e->lba <= lba */
+		e_pba = e->pba;
+		while ((e->lba <= lba) && (e->lba + e->len > lba)) {
+			ptr->pba = e_pba;
+			ptr++;
+			lba = lba + NR_SECTORS_PER_BLK;
+			e_pba = e_pba + NR_SECTORS_PER_BLK;
+			index = index + NR_SECTORS_PER_BLK;
+			if (index == TM_ENTRIES_BLK) {
+				break;
+			}
+			nrsectors = nrsectors - NR_SECTORS_PER_BLK;
+		}
 	}
-	mutex_unlock(&ctx->tm_kv_store_lock);
-	return 0;	
+	return page;
 }
 
 /*
@@ -4019,7 +3989,7 @@ struct page * read_block(struct ctx *ctx, u64 base, u64 sectornr)
  */
 struct tm_page * search_tm_kv_store(struct ctx *ctx, u64 blknr, struct rb_node **parent)
 {
-	struct rb_root *root = &ctx->rev_tm_rb_root;
+	struct rb_root *root = &ctx->tm_rb_root;
 	struct rb_node *node = NULL;
 
 	struct tm_page *node_ent;
@@ -4041,10 +4011,13 @@ struct tm_page * search_tm_kv_store(struct ctx *ctx, u64 blknr, struct rb_node *
 	return NULL;
 }
 
+void flush_tm_node_page(struct ctx *ctx, struct tm_page * tm_page);
+
+
 void remove_translation_pages(struct ctx *ctx)
 {
 	struct tm_page *tm_page;
-	struct rb_root *root = &ctx->rev_tm_rb_root;
+	struct rb_root *root = &ctx->tm_rb_root;
 	struct rb_node *node = root->rb_node;
 
 	//printk(KERN_ERR "\n Inside %s ", __func__);
@@ -4071,7 +4044,7 @@ void remove_translation_pages(struct ctx *ctx)
 
 void free_translation_pages(struct ctx *ctx)
 {
-	struct rb_root *root = &ctx->rev_tm_rb_root;
+	struct rb_root *root = &ctx->tm_rb_root;
 	struct rb_node *node;
 
 	node = root->rb_node;
@@ -4158,10 +4131,10 @@ void flush_tm_node_page(struct ctx *ctx, struct tm_page * tm_page)
 	/* blknr is the relative blknr within the translation blocks.
 	 * We convert it to sector number as bio_submit expects that.
 	 */
-	pba = (tm_page->blknr * NR_SECTORS_IN_BLK) + ctx->sb->rtm_pba;
-	BUG_ON(pba > (ctx->sb->rtm_pba + (ctx->sb->blk_count_rtm << NR_SECTORS_IN_BLK)));
+	pba = (tm_page->blknr * NR_SECTORS_IN_BLK) + ctx->sb->tm_pba;
+	BUG_ON(pba > (ctx->sb->tm_pba + (ctx->sb->blk_count_tm << NR_SECTORS_IN_BLK)));
 
-	//printk(KERN_ERR "\n %s Flushing TM page: %p at pba: %llu blknr:%llu max_tm_blks:%u", __func__,  page_address(page), pba,  tm_page->blknr, ctx->sb->blk_count_rtm);
+	//printk(KERN_ERR "\n %s Flushing TM page: %p at pba: %llu blknr:%llu max_tm_blks:%u", __func__,  page_address(page), pba,  tm_page->blknr, ctx->sb->blk_count_tm);
 
 	bio->bi_opf = REQ_OP_WRITE;
 	//bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
@@ -4206,13 +4179,15 @@ void flush_tm_nodes(struct rb_node *node, struct ctx *ctx)
 	return;
 }
 
+int read_translation_map(struct ctx *);
+
 /* This function waits for all the translation blocks to be flushed to
  * the disk by calling wait_for_ckpt_completion and tm_ref
  * The non blocking call is flush_tm_nodes
  */
 void flush_translation_blocks(struct ctx *ctx)
 {
-	struct rb_root *root = &ctx->rev_tm_rb_root;
+	struct rb_root *root = &ctx->tm_rb_root;
 	//struct blk_plug plug;
 
 	//printk(KERN_ERR "\n Inside %s ", __func__);
@@ -4299,6 +4274,8 @@ void flush_sit_node_page(struct ctx *ctx, struct rb_node *node)
 	bio_put(bio);
 }	
 
+int read_extents_from_block(struct ctx * ctx, struct tm_entry *entry, u64 lba);
+
 /*
  * lba: from the LBA-PBA pair of a data block.
  * Should be called with
@@ -4315,10 +4292,11 @@ void flush_sit_node_page(struct ctx *ctx, struct rb_node *node)
  */
 struct tm_page *add_tm_page_kv_store(struct ctx *ctx, sector_t lba)
 {
-	struct rb_root *root = &ctx->rev_tm_rb_root;
+	struct rb_root *root = &ctx->tm_rb_root;
 	struct rb_node *parent = NULL, **link = &root->rb_node;
 	struct tm_page *new_tmpage, *parent_ent;
 	u64 blknr, lba_blk;
+	u64 addr;
 	/* convert the sector lba to a blknr and then find out the relative
 	 * blknr where we find the translation entry from the first
 	 * translation block.
@@ -4326,12 +4304,12 @@ struct tm_page *add_tm_page_kv_store(struct ctx *ctx, sector_t lba)
 	 */
 	BUG_ON(lba > ctx->sb->max_pba);
 	lba_blk = lba >> SECTOR_BLK_SHIFT;
-	blknr = lba_blk/REV_TM_ENTRIES_BLK;
-	BUG_ON(blknr > ctx->sb->blk_count_rtm);
+	blknr = lba_blk/TM_ENTRIES_BLK;
+	BUG_ON(blknr > ctx->sb->blk_count_tm);
 
 	new_tmpage = search_tm_kv_store(ctx, blknr, &parent);
 	if (new_tmpage) {
-		//trace_printk("\n %s 1) lba: %llu, tm blk: %d, page: %p tm_entries_blk: #REV_TM_ENTRIES_BLK", __func__, lba, blknr, new_tmpage);
+		//trace_printk("\n %s 1) lba: %llu, tm blk: %d, page: %p tm_entries_blk: #TM_ENTRIES_BLK", __func__, lba, blknr, new_tmpage);
 		return new_tmpage;
 	}
 
@@ -4356,18 +4334,19 @@ struct tm_page *add_tm_page_kv_store(struct ctx *ctx, sector_t lba)
 	
 	RB_CLEAR_NODE(&new_tmpage->rb);
 
-	//printk("\n %s lba: %llu blknr: %d tm_pba: %llu \n", __func__, lba, blknr, ctx->sb->rtm_pba);
+	//printk("\n %s lba: %llu blknr: %d tm_pba: %llu \n", __func__, lba, blknr, ctx->sb->tm_pba);
 
-	//new_tmpage->page = read_block(ctx, ctx->sb->rtm_pba, (blknr * NR_SECTORS_IN_BLK));
+	//new_tmpage->page = read_block(ctx, ctx->sb->tm_pba, (blknr * NR_SECTORS_IN_BLK));
 	new_tmpage->page = alloc_page(__GFP_ZERO|GFP_KERNEL);
 	if (!new_tmpage->page) {
 		printk(KERN_ERR "\n %s read_block  failed! could not allocate page! \n", __func__);
 		kmem_cache_free(ctx->tm_page_cache, new_tmpage);
 		return NULL;
 	}
-	//trace_printk("\n %s 2) Added new! lba: %llu, tm blk: %d, page: %p tm_entries_blk: #REV_TM_ENTRIES_BLK", __func__, lba, blknr, new_tmpage);
+	addr = (unsigned long) page_address(new_tmpage->page);
+	//trace_printk("\n %s 2) Added new! lba: %llu, tm blk: %d, page: %p tm_entries_blk: #TM_ENTRIES_BLK", __func__, lba, blknr, new_tmpage);
 	new_tmpage->blknr = blknr;
-	//printk("\n %s: lba: %llu blknr: %llu  NR_SECTORS_IN_BLK * REV_TM_ENTRIES_BLK: %ld \n", __func__, lba, blknr, NR_SECTORS_IN_BLK * REV_TM_ENTRIES_BLK);
+	//printk("\n %s: lba: %llu blknr: %llu  NR_SECTORS_IN_BLK * TM_ENTRIES_BLK: %ld \n", __func__, lba, blknr, NR_SECTORS_IN_BLK * TM_ENTRIES_BLK);
 	/* Add this page to a RB tree based KV store.
 	 * Key is: blknr for this corresponding block
 	 */
@@ -4380,71 +4359,163 @@ struct tm_page *add_tm_page_kv_store(struct ctx *ctx, sector_t lba)
 	return new_tmpage;
 }
 
-struct tm_page *add_rev_tm_page_kv_store(struct ctx *ctx, sector_t pba)
+
+/* Make the length in terms of sectors or blocks?
+ * 
+ * page is revmap page!
+ */
+int add_block_based_translation(struct ctx *ctx, struct page *page, const char * func)
 {
-	struct rb_root *root = &ctx->rev_tm_rb_root;
-	struct rb_node *parent = NULL, **link = &root->rb_node;
-	struct tm_page *new_rev_tmpage, *parent_ent;
-	u64 blknr, pba_blk;
-	/* convert the sector lba to a blknr and then find out the relative
-	 * blknr where we find the translation entry from the first
-	 * translation block.
-	 *
-	 */
-	BUG_ON(pba > ctx->sb->dzone0_pba);
-	pba = pba - ctx->sb->czone0_pba;
-	pba_blk = pba >> SECTOR_BLK_SHIFT;
-	blknr = pba_blk/REV_TM_ENTRIES_BLK;
-	BUG_ON(blknr > ctx->sb->blk_count_rtm);
-
-	new_rev_tmpage = search_tm_kv_store(ctx, blknr, &parent);
-	if (new_rev_tmpage) {
-		//trace_printk("\n %s 1) lba: %llu, tm blk: %d, page: %p tm_entries_blk: #REV_TM_ENTRIES_BLK", __func__, lba, blknr, new_tmpage);
-		return new_rev_tmpage;
-	}
-
-	if (parent) {
-		parent_ent = rb_entry(parent, struct tm_page, rb);
-		BUG_ON (blknr == parent_ent->blknr);
-		if (blknr < parent_ent->blknr) {
-			/* Attach new node to the left of parent */
-			link = &parent->rb_left;
-		}
-		else { 
-			/* Attach new node to the right of parent */
-			link = &parent->rb_right;
-		}
-	} 
-
-	new_rev_tmpage = kmem_cache_alloc(ctx->tm_page_cache, GFP_KERNEL);
-	if (!new_rev_tmpage) {
-		printk(KERN_ERR "\n %s cannot allocate new_tmpage ", __func__);
-		return NULL;
-	}
 	
-	RB_CLEAR_NODE(&new_rev_tmpage->rb);
+	struct lsdm_revmap_entry_sector * ptr;
+	int i, j;
+	unsigned len = 0;
+	sector_t lba, pba;
 
-	//printk("\n %s lba: %llu blknr: %d tm_pba: %llu \n", __func__, lba, blknr, ctx->sb->rtm_pba);
+	ptr = (struct lsdm_revmap_entry_sector *)page_address(page);
+	//printk(KERN_ERR "%s revmap_page address is: %p ", __func__, page_address(page));
+	i = 0;
 
-	//new_tmpage->page = read_block(ctx, ctx->sb->rtm_pba, (blknr * NR_SECTORS_IN_BLK));
-	new_rev_tmpage->page = alloc_page(__GFP_ZERO|GFP_KERNEL);
-	if (!new_rev_tmpage->page) {
-		printk(KERN_ERR "\n %s read_block  failed! could not allocate page! \n", __func__);
-		kmem_cache_free(ctx->tm_page_cache, new_rev_tmpage);
-		return NULL;
+/*-------------------------------------------------------------*/
+	for(i=0; i < NR_SECTORS_IN_BLK; i++, ptr = ptr + 1) {
+		for(j=0; j < NR_EXT_ENTRIES_PER_SEC; j++) {
+			if (0 == ptr->extents[j].pba) {
+				//printk(KERN_ERR "\n %s ptr: %p ptr->extents[%d].pba: 0 ", __func__, ptr, j);
+				break;
+			}
+			lba = ptr->extents[j].lba;
+			pba = ptr->extents[j].pba;
+			len = ptr->extents[j].len;
+			if ((lba > ctx->sb->max_pba) || (pba > ctx->sb->max_pba)) {
+				printk(KERN_ERR "\n %s ptr: %p, i: %d , j: %d, lba: %llu, pba: %llu, len: %u caller: %s", __func__,ptr, i, j, lba, pba, len, func);
+				BUG();
+			}
+			if ((len <= 0) || (len % 8)) {
+				printk(KERN_ERR "\n %s ptr: %p, i: %d , j: %d, lba: %llu, pba: %llu, len: %u caller: %s", __func__,ptr, i, j, lba, pba, len, func);
+				BUG();
+			}
+			/* Call this under the kv store lock, else it will race with removal/flush code
+			 */
+			add_translation_entry(ctx, lba, pba, len);
+			//printk(KERN_ERR "\n %s Adding TM entry: ptr: %p ptr->extents[j].lba: %llu, ptr->extents[j].pba: %llu, ptr->extents[j].len: %u", __func__, ptr, lba, pba, len);
+		}
 	}
-	new_rev_tmpage->blknr = blknr;
-	//printk("\n %s: lba: %llu blknr: %llu  NR_SECTORS_IN_BLK * REV_TM_ENTRIES_BLK: %ld \n", __func__, lba, blknr, NR_SECTORS_IN_BLK * REV_TM_ENTRIES_BLK);
-	/* Add this page to a RB tree based KV store.
-	 * Key is: blknr for this corresponding block
-	 */
+/*-------------------------------------------------------------*/
+	printk(KERN_ERR "\n %s BYE lba: %llu pba: %llu len: %d!", __func__, lba, pba, len);
+	return 0;
+}
 
-	rb_link_node(&new_rev_tmpage->rb, parent, link);
-	/* Balance the tree after node is addded to it */
-	rb_insert_color(&new_rev_tmpage->rb, root);
-	atomic_inc(&ctx->nr_tm_pages);
-    	atomic_inc(&ctx->tm_flush_count);
-	return new_rev_tmpage;
+/*
+ * Revmap bitmap: 0 indicates that a block is available for reuse.
+ * 1 indicates that the entries on that revblock are not yet flushed
+ * at its correct location in the translation map.
+ * The map is stored at sector pba=sb->revmap. 
+ * Revmap store 2 * 655536 entries that is equal to the number
+ * of blocks in 2 zones. Each entry is 80 bytes and each sector
+ * of 512 bytes stores 6 such entries. To store 131072 entries we need
+ * 21845 sectors, that is 2731 blocks. Thus our bitmap should have
+ * 2731 bits i.e 342 bytes. Thus the bitmap spans one sector on disk
+ */
+
+/*
+ * Mark a block in use: set appropriate bit to 1
+ */
+void mark_revmap_bit(struct ctx *ctx, u64 pba)
+{
+	char *ptr;
+	int bytenr;
+	int bitnr;
+	unsigned char mask = 0;
+	struct page *page;
+
+	pba = pba - ctx->sb->revmap_pba;
+	pba = pba/NR_SECTORS_IN_BLK;
+	if (pba < 0) {
+		//trace_printk("\n WRONG PBA!!");
+		panic("Bad PBA for revmap block!");
+	}
+	bytenr = pba/BITS_IN_BYTE;
+	bitnr = pba % BITS_IN_BYTE;
+	//trace_printk("\n %s pba: %llu bytenr: %d bitnr: %d", __func__, pba, bytenr, bitnr);
+	mask = (1 << bitnr);
+	/* Only one revmap bm block is stored. */
+	if (bytenr >= 4096) {
+		panic("revmap bm calculations are wrong!");
+	}
+	page = ctx->revmap_bm;
+	ptr = page_address(page);
+
+	ptr = ptr + bytenr;
+	*ptr = *ptr | mask;
+}
+
+/* 
+ * Make a block available for reuse
+ *
+ * When a block is available, bit is set to 0
+ */
+void clear_revmap_bit(struct ctx *ctx, u64 pba)
+{
+	char *ptr;
+	int bytenr;
+	int bitnr;
+	unsigned char mask;
+	struct page *page;
+
+	pba = pba - ctx->sb->revmap_pba;
+	pba = pba/NR_SECTORS_IN_BLK;
+	bytenr = pba/BITS_IN_BYTE;
+	bitnr = pba % BITS_IN_BYTE;
+	//trace_printk("\n %s pba: %llu bytenr: %d bitnr: %d", __func__, pba, bytenr, bitnr);
+	mask = ~(1 << bitnr);
+	/* Only one revmap bm block is stored. */
+	if (bytenr >= 4096) {
+		panic("revmap bm calculations are wrong!");
+	}
+	page = ctx->revmap_bm;
+	ptr = page_address(page);
+
+	ptr = ptr + bytenr;
+	*ptr = *ptr & mask;
+}
+
+/* 
+ * Returns 1 when block is available
+ */
+int is_revmap_block_available(struct ctx *ctx, u64 pba)
+{
+	char *ptr;
+	int bytenr;
+	int bitnr;
+	int i = 0;
+	char temp;
+	struct page *page;
+
+	//trace_printk("\n %s pba: %llu, sb->revmap_pba: %u", __func__, pba, ctx->sb->revmap_pba);
+	pba = pba - ctx->sb->revmap_pba;
+	pba = pba/NR_SECTORS_IN_BLK;
+	bytenr = pba/BITS_IN_BYTE;
+	bitnr = pba % BITS_IN_BYTE;
+	/* Only one revmap bm block is stored. */
+	if (bytenr >= 4096) {
+		panic("revmap bm calculations are wrong!");
+	}
+	page = ctx->revmap_bm;
+	ptr = page_address(page);
+	ptr = ptr + bytenr;
+	temp = *ptr;
+	//trace_printk("\n %s relative pba: %llu bytenr: %d bitnr: %d temp: %d", __func__, pba, bytenr, bitnr, temp);
+
+	while(i < bitnr) {
+		i++;
+		temp = temp >> 1;
+	}
+	if ((temp & 1) == 1)
+		return 0;
+	
+	/* else bit is 0 and thus block is available */
+	return 1;
+
 }
 
 /* Waits until the value of refcount becomes 1  */
@@ -4453,6 +4524,261 @@ void wait_on_refcount(struct ctx *ctx, refcount_t *ref, spinlock_t *lock)
 	spin_lock(lock);
 	wait_event_lock_irq(ctx->refq, ( 2 >= refcount_read(ref)), *lock);
 	spin_unlock(lock);
+}
+
+void revmap_blk_flushed(struct bio *bio)
+{
+	bio_free_pages(bio);
+	bio_put(bio);
+	nrpages--;
+}
+
+
+
+/*
+ * a) create a bio from the page, associate a endio with it.
+ * b) flush the page
+ * c) make sure the entries are on the disk, before we overwrite.
+ *
+ * TODO: better error handling!
+ *
+ * pba: pba from the lba-pba map! We send this here, because we want
+ *  to identify if this is the last pba of the zone.
+ */
+int flush_revmap_block_disk(struct ctx * ctx, struct page *page, sector_t revmap_pba)
+{
+	struct bio * bio;
+
+	BUG_ON(!page);
+
+	bio = bio_alloc(ctx->dev->bdev, 1, REQ_OP_WRITE, GFP_KERNEL);
+	if (!bio) {
+		return -ENOMEM;
+	}
+	
+	if( PAGE_SIZE > bio_add_page(bio, page, PAGE_SIZE, 0)) {
+		bio_put(bio);
+		return -EFAULT;
+	}
+
+	bio->bi_iter.bi_sector = revmap_pba;
+	//printk(KERN_ERR "%s Flushing revmap blk at pba:%llu ctx->revmap_pba: %llu", __func__, bio->bi_iter.bi_sector, ctx->revmap_pba);
+	bio->bi_end_io = revmap_blk_flushed;
+	bio->bi_opf = REQ_OP_WRITE;
+	//bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+	bio_set_dev(bio, ctx->dev->bdev);
+	BUG_ON(ctx->revmap_pba > ctx->sb->max_pba);
+	submit_bio(bio);
+	mark_revmap_bit(ctx, revmap_pba);
+	//printk(KERN_ERR "\n flushing revmap at pba: %llu page: %p", bio->bi_iter.bi_sector, page_address(page));
+	return 0;
+}
+
+/*
+ *
+ * Revmap entries are not ordered. They are entered as and when the
+ * write completes, which could be in any order (as it depends on
+ * schedule()
+ */
+void shrink_next_entries(struct ctx *ctx, sector_t lba, sector_t pba, unsigned long len, struct page *page)
+{
+	struct lsdm_revmap_entry_sector * ptr = NULL;
+	int i = 0, j = 0;
+	int entry_nr, sector_nr, max_entries;
+	unsigned long diff = 0;
+
+	entry_nr = atomic_read(&ctx->revmap_entry_nr);
+	sector_nr = atomic_read(&ctx->revmap_sector_nr);
+	ptr = (struct lsdm_revmap_entry_sector *)page_address(page);
+
+	for(i=0; i<=sector_nr; i++) {
+		if (i == sector_nr)
+			max_entries = entry_nr;
+		else
+			max_entries = NR_EXT_ENTRIES_PER_SEC;
+		/* SECTOR ENTRIES */
+		for (j=0; j<max_entries; j++) {
+			if((ptr->extents[j].lba >= lba) && (ptr->extents[j].lba < lba + diff)){
+				if (ptr->extents[j].len > diff) {
+					ptr->extents[j].lba = lba + diff;
+					ptr->extents[j].pba = pba + diff;
+					ptr->extents[j].len = len - diff;
+				} else {
+					ptr->extents[j].lba = 0;
+					ptr->extents[j].pba = 0;
+					ptr->extents[j].len = 0;
+					if (ptr->extents[j].len < diff) {
+						lba = lba + ptr->extents[j].len;
+						pba = pba + ptr->extents[j].len;
+						diff = ptr->extents[j].len - diff;
+						shrink_next_entries(ctx, lba, pba, diff, page);
+					}
+
+				}
+				return;
+			}
+		}
+		ptr++;
+	}
+}
+
+
+int merge_rev_entries(struct ctx * ctx, sector_t lba, sector_t pba, unsigned long len, struct page *page)
+{
+
+	struct lsdm_revmap_entry_sector * ptr = NULL;
+	int i = 0, j = 0, found = 0;
+	int entry_nr, sector_nr, max_entries;
+	unsigned long diff = 0;
+
+	entry_nr = atomic_read(&ctx->revmap_entry_nr);
+	sector_nr = atomic_read(&ctx->revmap_sector_nr);
+	ptr = (struct lsdm_revmap_entry_sector *)page_address(page);
+
+	for(i=0; i<=sector_nr; i++) {
+		if (found)
+			break;
+		if (i == sector_nr)
+			max_entries = entry_nr;
+		else
+			max_entries = NR_EXT_ENTRIES_PER_SEC;
+		/* SECTOR ENTRIES */
+		for (j=0; j<max_entries; j++) {
+			if(ptr->extents[j].lba == lba) {
+				if(ptr->extents[j].len <= len) {
+					/* replace pba */
+					ptr->extents[j].pba = pba;
+					if (ptr->extents[j].len < len) {
+						diff = len - ptr->extents[j].len;
+						lba = lba + ptr->extents[j].len;
+						pba = pba + ptr->extents[j].len;
+						shrink_next_entries(ctx, lba, pba, diff, page);
+					}
+					ptr->extents[j].len = len;
+					found = 1;
+					break;
+				} else {
+					/* Shrink the entry to exclude
+					 * what shall be added later
+					 */
+					ptr->extents[j].lba += len;
+					found = 0;
+					return found;
+				}
+			
+			} else if (ptr->extents[j].lba + ptr->extents[j].len == lba) {
+				/* merge if pba allows merging */
+				if (ptr->extents[j].pba + ptr->extents[j].len == pba) {
+					ptr->extents[j].len += len;
+					found = 1;
+					break;
+				}
+			} else if (lba + len == ptr->extents[j].lba) {
+				/* merge if pba allows merging */
+				if (pba + len == ptr->extents[j].pba) {
+					ptr->extents[j].lba = lba;
+					ptr->extents[j].pba = pba;
+					ptr->extents[j].len += len;
+					found = 1;
+					break;
+				}
+			}
+		}
+		ptr++;
+	}
+
+	return found;
+}
+
+
+/* We store only the LBA. We can calculate the PBA from the wf
+ * 
+ * Always called with the lsdm_rb_lock held!
+ */
+static void add_revmap_entry(struct ctx * ctx, __le64 lba, __le64 pba, int nrsectors)
+{
+	struct lsdm_revmap_entry_sector * ptr = NULL;
+	int entry_nr, sector_nr;
+	struct page * page = NULL;
+
+#ifdef LSDM_DEBUG
+	BUG_ON(pba == 0);
+	BUG_ON(pba > ctx->sb->max_pba);
+	BUG_ON(lba > ctx->sb->max_pba);
+	if((pba + nrsectors) > ctx->sb->max_pba) {
+		printk(KERN_ERR "\n %s %d lba: %lld pba: %lld nrsectors: %d max_pba: %lld entry_nr: %d ptr: %p\n" , __func__, __LINE__, lba, pba, nrsectors, ctx->sb->max_pba, entry_nr, ptr);
+		BUG();
+	}
+	if((lba + nrsectors) > ctx->sb->max_pba) {
+		printk(KERN_ERR "\n %s %d lba: %lld pba: %lld nrsectors: %d max_pba: %llu entry_nr: %d ptr: %p\n" , __func__, __LINE__, lba, pba, nrsectors, ctx->sb->max_pba, entry_nr, ptr);
+		BUG();
+	}
+#endif
+	/* Merge entries by increasing the length if there lies a
+	 * matching entry in the revmap page
+	 */
+	entry_nr = atomic_read(&ctx->revmap_entry_nr);
+	sector_nr = atomic_read(&ctx->revmap_sector_nr);
+	BUG_ON(entry_nr > NR_EXT_ENTRIES_PER_SEC);
+	BUG_ON(sector_nr > NR_SECTORS_PER_BLK);
+	if ((0 == entry_nr) && (0 == sector_nr)) {
+		/* we need to make sure the previous block is on the
+		 * disk. We cannot overwrite without that.
+		 */
+		page = alloc_page(__GFP_ZERO|GFP_KERNEL);
+		if (!page) {
+			/* TODO: Do something more. For now panicking!
+			 */
+			panic("Low memory, could not allocate page!");
+		}
+		nrpages++;
+		ctx->revmap_page = page;
+		//printk(KERN_ERR "\n %s revmap page address: %p ", __func__, page_address(page));
+	}
+	/* blk count before incrementing */
+	page = ctx->revmap_page;
+	BUG_ON(page == NULL);
+	ptr = (struct lsdm_revmap_entry_sector *)page_address(page);
+	ptr = ptr + sector_nr;
+	ptr->extents[entry_nr].lba = lba;
+    	ptr->extents[entry_nr].pba = pba;
+	ptr->extents[entry_nr].len = nrsectors;
+	atomic_inc(&ctx->revmap_entry_nr);
+	if (NR_EXT_ENTRIES_PER_SEC == (entry_nr + 1)) {
+		//ptr->crc = calculate_crc(ctx, page);
+		ptr->crc = 0;
+		atomic_set(&ctx->revmap_entry_nr, 0);
+		atomic_inc(&ctx->revmap_sector_nr);
+		if (NR_SECTORS_PER_BLK == (sector_nr + 1)) {
+			atomic_set(&ctx->revmap_sector_nr, 0);
+			/* TODO: do this in parallel, dont wait. Called from the write context */
+			//flush_revmap_block_disk(ctx, page, ctx->revmap_pba);
+			ctx->revmap_page = 0;
+			/* Adjust the revmap_pba for the next block. Addressing is based on 512bytes sector. */
+			ctx->revmap_pba += NR_SECTORS_IN_BLK; 
+			/* if we have the pba of the translation table,
+			* then reset the revmap pba to the original value
+			*/
+			if (ctx->revmap_pba == ctx->sb->tm_pba) {
+				ctx->revmap_pba = ctx->sb->revmap_pba;
+				/* TODO: we need to check if the revmap bit is clear here */
+			}
+		}
+	}
+	//printk(KERN_ERR "\n revmap entry added! ptr: %p entry_nr: %d, sector_nr: %d lba: %llu pba: %llu len: %d \n", ptr, entry_nr, sector_nr, lba, pba, nrsectors);
+	return;
+}
+
+
+static int print_bzr(struct blk_zone *zone, unsigned int num, void *data)
+{
+	int i; 
+
+	printk(KERN_ERR "\n %s num: %d ", __func__ , num);
+	for (i = 0; i < num; i++) {
+		printk(KERN_ERR "\n start: %llu len: %llu  wp : %llu type: %s ", zone->start, zone->len, zone->wp, (zone->type == 0x1) ? "conventional" : "sequential");
+	}
+	return 0;
 }
 
 /* 
@@ -4490,8 +4816,7 @@ void sub_write_done(struct work_struct * w)
 	struct lsdm_bioctx * bioctx;
 	struct ctx *ctx;
 	sector_t lba, pba;
-	sector_t len;
-	uint is_cached_write;
+	unsigned int len;
 
 	subbioctx = container_of(w, struct lsdm_sub_bioctx, work);
 	bioctx = subbioctx->bioctx;
@@ -4501,28 +4826,28 @@ void sub_write_done(struct work_struct * w)
 	pba = subbioctx->extent.pba;
 	len = subbioctx->extent.len;
 	len = (len >> SECTOR_BLK_SHIFT) << SECTOR_BLK_SHIFT;
-	is_cached_write = subbioctx->cache_write;
 
-	//printk(KERN_ERR "\n %s() COMPLETED: lba: %llu, pba: %llu, len: %llu is_cached_write: %d ", __func__, lba, pba, len, is_cached_write);
-
-	/* Now reads will work! so we can complete the bio */
-	/* Do this before the RB tree is updated, as we need to remove the old translation entries and adjust the valid blks corresponding to the zone in cache if any */
-	
+	//BUG_ON(pba == 0);
+	//BUG_ON(pba > ctx->sb->max_pba);
+	//BUG_ON(lba > ctx->sb->max_pba);
+	//BUG_ON(len % 8 != 0);
 	down_write(&ctx->lsdm_rb_lock);
-	find_and_remove_rev_tm(ctx, lba, len);
-	if (!is_cached_write) {
-		//printk(KERN_ERR "\n %s() Seq write!! COMPLETED: lba: %llu, pba: %llu, len: %llu is_cached_write: %d ", __func__, lba, pba, len, is_cached_write);
-		pba = 0;
-	}
+	/**************************************/
 	lsdm_rb_update_range(ctx, lba, pba, len);
+	/**************************************/
 	up_write(&ctx->lsdm_rb_lock);
+	/* Now reads will work! so we can complete the bio */
+
+	//trace_printk("\n %s Entering zonenr: %d lba: %llu, pba: %llu, len: %u kref: %d \n", __func__, get_zone_nr(ctx, pba), lba, pba, len, kref_read(&bioctx->ref));
+	down_write(&ctx->lsdm_rev_lock);
+	/*------------------------------- */
+	add_revmap_entry(ctx, lba, pba, len);
+	/*-------------------------------*/
+	up_write(&ctx->lsdm_rev_lock);
+	add_translation_entry(ctx, lba, pba, len);
+	//printk(KERN_ERR "\n %s Done !! zonenr: %d lba: %llu, pba: %llu, len: %u kref: %d \n", __func__, get_zone_nr(ctx, pba), lba, pba, len, kref_read(&bioctx->ref));
 	kref_put(&bioctx->ref, write_done);
 	kmem_cache_free(ctx->subbio_ctx_cache, subbioctx);
-
-	if (is_cached_write) {
-		//add_czone_info(ctx, lba, pba, len);
-		add_rev_translation_entry(ctx, lba, pba, len);
-	}
 	return;
 }
 
@@ -4533,8 +4858,9 @@ void sub_write_err(struct work_struct * w)
 	struct lsdm_sub_bioctx *subbioctx = NULL;
 	struct lsdm_bioctx * bioctx;
 	struct ctx *ctx;
-	sector_t lba, pba;
+	sector_t lba, pba, zone_begins;
 	unsigned int len;
+	struct gendisk * disk;
 
 	WARN_ONCE(1, "\n %s write error received, future writes will be non sequential! \n", __func__);
 
@@ -4549,10 +4875,17 @@ void sub_write_err(struct work_struct * w)
 	kref_put(&bioctx->ref, write_done);
 	kmem_cache_free(ctx->subbio_ctx_cache, subbioctx);
 
+	BUG_ON(pba == 0);
 	BUG_ON(pba > ctx->sb->max_pba);
 	BUG_ON(lba > ctx->sb->max_pba);
 
 	printk(KERN_ERR "\n Error %s, requesting lba: %llu pba: %llu len: %d ", __func__, pba, lba, len);
+	zone_begins = zone_start(ctx, pba);
+	disk = ctx->dev->bdev->bd_disk;
+	//sd_zbc_report_zones(disk, zone_begins, 1, print_bzr, NULL);
+	if (!blkdev_report_zones(ctx->dev->bdev, zone_begins, 1, print_bzr, NULL)) {
+		printk(KERN_ERR "\n reporting zones failed! \n");
+	}
 	return;
 }
 
@@ -4606,7 +4939,7 @@ int lsdm_write_checks(struct ctx *ctx, struct bio *bio)
 		bio->bi_status = BLK_STS_RESOURCE;
 		goto fail;
 	}
-	if (unlikely(nr_sectors < 0)) {
+	if (unlikely(nr_sectors <= 0)) {
 		goto fail;
 	}
 	if (lba > ctx->sb->max_pba) {
@@ -4616,6 +4949,34 @@ int lsdm_write_checks(struct ctx *ctx, struct bio *bio)
 	if ((lba + nr_sectors) > ctx->sb->max_pba) {
 		printk(KERN_ERR "\n %s Requested write beyond disk space ! lba: %llu ", __func__, lba);
 		goto fail;
+	}
+
+	//printk(KERN_ERR "\n ******* Inside %s, requesting lba: %llu sectors: %d ", __func__, bio->bi_iter.bi_sector, bio_sectors(bio));
+	if (is_disk_full(ctx)) {
+		printk(KERN_ERR "\n %s No more space! ", __func__);
+		bio->bi_status = BLK_STS_NOSPC;
+		goto fail;
+	}
+	if (ctx->nr_freezones <= ctx->higher_watermark) {
+		/* start fg gc but dont wait here unless less than lower_watermark*/
+		/* setting gc_wake=1 and the next wakeup will trigger lsdm_gc(ctx, FG_GC, 0) by waking up a sleeping gc thread */
+		//printk(KERN_ERR "\n 2. ctx->nr_freezones: %d, ctx->higher_watermark: %d. Starting GC.....\n", ctx->nr_freezones, ctx->higher_watermark);
+		ctx->gc_th->gc_wake = 1;
+		wake_up(&ctx->gc_th->lsdm_gc_wait_queue);
+		if (ctx->nr_freezones <= ctx->lower_watermark) {
+			//printk(KERN_ERR "\n 1. ctx->nr_freezones: %d, ctx->lower_watermark: %d. Starting GC.....\n", ctx->nr_freezones, ctx->lower_watermark);
+			DEFINE_WAIT(wait);
+			prepare_to_wait(&ctx->gc_th->fggc_wq, &wait,
+					TASK_UNINTERRUPTIBLE);
+			/* setting gc_wake=1 and the next wakeup will trigger lsdm_gc(ctx, FG_GC, 0) by waking up a sleeping gc thread */
+			io_schedule();
+			finish_wait(&ctx->gc_th->fggc_wq, &wait);
+			//printk(KERN_ERR "\n %s %d woken up lba: %llu, nrsectors: %d ", __func__,  __LINE__, lba, nr_sectors);
+		}
+		if (ctx->nr_freezones < ctx->lower_watermark) {
+			/* either someone stopped the GC thread or GC could not find zones to clean */
+			goto fail;
+		}
 	}
 	//printk(KERN_ERR "\n (%s) bio: lba: %llu nr_sectors: %llu \n", __func__, lba, nr_sectors);
 	return 0;
@@ -4633,26 +4994,23 @@ void fill_bio(struct bio *bio, sector_t pba, sector_t len, struct block_device *
 	bio->bi_end_io = lsdm_clone_endio;
 }
 
-void fill_subbioctx(struct lsdm_sub_bioctx * subbio_ctx, struct lsdm_bioctx *bioctx, sector_t lba, sector_t pba, sector_t len, uint is_cached_write)
+void fill_subbioctx(struct lsdm_sub_bioctx * subbio_ctx, struct lsdm_bioctx *bioctx, sector_t lba, sector_t pba, sector_t len)
 {
 	BUG_ON(!len);
 	subbio_ctx->bioctx = bioctx; /* This is common to all the subdivided bios */
 	subbio_ctx->extent.lba = lba;
 	subbio_ctx->extent.pba = pba;
 	subbio_ctx->extent.len = len;
-	subbio_ctx->cache_write = is_cached_write;
-	//printk(KERN_ERR "\n %s lba: %llu, pba: %llu, len: %llu is_cached_write: %d ", __func__, lba, pba, len, is_cached_write);
 }
 
-int prepare_bio(struct bio * clone, sector_t s8, sector_t wf, unsigned int is_cache_write)
+int prepare_bio(struct bio * clone, sector_t s8, sector_t wf)
 {
 	struct lsdm_sub_bioctx *subbio_ctx;
 	struct lsdm_bioctx * bioctx = clone->bi_private;
 	struct ctx *ctx = bioctx->ctx;
 	sector_t lba = clone->bi_iter.bi_sector;
-	BUG_ON(!ctx);
+	//BUG_ON(lba > ctx->sb->max_pba);
 
-	//printk(KERN_ERR "\n About to write %llu sectors at LBA: %llu, PBA: %llu, is_cache_write: %d", s8, lba, wf, is_cache_write);
 	subbio_ctx = kmem_cache_alloc(ctx->subbio_ctx_cache, GFP_KERNEL);
 	if (!subbio_ctx) {
 		printk(KERN_ERR "\n %s Could not allocate memory to subbio_ctx \n", __func__);
@@ -4662,7 +5020,7 @@ int prepare_bio(struct bio * clone, sector_t s8, sector_t wf, unsigned int is_ca
 
 	/* Next we fetch the LBA that our DM got */
 	kref_get(&bioctx->ref);
-	fill_subbioctx(subbio_ctx, bioctx, lba, wf, s8, is_cache_write);
+	fill_subbioctx(subbio_ctx, bioctx, lba, wf, s8);
 	fill_bio(clone, wf, s8, ctx->dev->bdev, subbio_ctx);
 	return 0;
 }
@@ -4691,14 +5049,14 @@ struct bio * split_submit(struct bio *clone, sector_t s8, sector_t wf)
 	/* we split and we realize that free_sectors_in_wf has reduced further by a parallel i/o
 	 * we need to split again.
 	 */
-	BUG_ON(split->bi_iter.bi_sector != lba);
+	split->bi_iter.bi_sector = lba;
 	/* for the sake of prepare_bio */
 	split->bi_private = bioctx;
-	BUG_ON(!s8);
-	if (prepare_bio(split, s8, wf, 1)) {
+	if (prepare_bio(split, s8, wf)) {
 		printk(KERN_ERR "\n %s 2. FAILED prepare_bio call ", __func__);
 		goto fail;
 	}
+	//printk(KERN_ERR "\n %s 2. zonenr: %d Submitting {lba: %llu, pba: %llu, len: %d},", __func__, get_zone_nr(ctx, wf), lba, wf, s8);
 	submit_bio(split);
 	/* we return the second part */
 	return clone;
@@ -4707,60 +5065,72 @@ fail:
 }
 
 
-int ls_cache_write(struct ctx *ctx, struct bio *clone)
+int submit_bio_write(struct ctx *ctx, struct bio *clone)
 {
 	unsigned nr_sectors = bio_sectors(clone);
 	sector_t s8, lba = clone->bi_iter.bi_sector, wf = 0;
+	int maxlen = (BIO_MAX_PAGES >> 1) << SECTOR_BLK_SHIFT;
 	int dosplit = 0;
 	struct lsdm_bioctx * bioctx = clone->bi_private;
 
-
-	/* Keep the next line - for actually finding out how many zones there are in a cache worth 112 zones
-	 * This will be used to clean the cache entirely in background mode
-	 */
-	nr_sectors = bio_sectors(clone);
-	if (!nr_sectors) {
-		bio_endio(clone);
-	}
-
+	/*
+	BUG_ON(!bioctx);
+	BUG_ON(!bioctx->ctx);
+	BUG_ON(!bioctx->orig);
+	*/
+	clone->bi_status = BLK_STS_OK;
+	kref_init(&bioctx->ref);
 	do {
+		/*
+		BUG_ON(lba != clone->bi_iter.bi_sector);
+		BUG_ON(lba > ctx->sb->max_pba);
+		*/
+		mykref_get(&ctx->ongoing_iocount);
 		nr_sectors = bio_sectors(clone);
-		BUG_ON(!nr_sectors);
+		//BUG_ON(!nr_sectors);
 		s8 = round_up(nr_sectors, NR_SECTORS_IN_BLK);
+		//BUG_ON(s8 != nr_sectors);
 		dosplit = 0;
-		down_write(&ctx->wf_lock);
-		if (s8 > ctx->free_sectors_in_wf){
-			s8 = round_down(ctx->free_sectors_in_wf, NR_SECTORS_IN_BLK);
-			BUG_ON(s8 != ctx->free_sectors_in_wf);
+		if (s8 > maxlen) {
+			s8 = maxlen;
 			dosplit = 1;
 		}
-		BUG_ON(!s8);
+		down_write(&ctx->wf_lock);
+		ctx->nr_app_writes += s8;
+		if (s8 > ctx->free_sectors_in_wf){
+			s8 = round_down(ctx->free_sectors_in_wf, NR_SECTORS_IN_BLK);
+			//BUG_ON(s8 != ctx->free_sectors_in_wf);
+			dosplit = 1;
+		}
+		//BUG_ON(!s8);
 		wf = ctx->hot_wf_pba;
-		if (ctx->verbose)
-			printk(KERN_ERR "\n %s() (RANDOM - Cache-Write): LBA: %llu zonenr: %llu PBA: %llu s8: %llu nr_sectors: %u" , __func__, lba, lba/ctx->nr_lbas_in_zone, wf, s8, nr_sectors);
-		bioctx->ctx = ctx;
 		clone->bi_private = bioctx;
 		if (!dosplit) {
-			if (prepare_bio(clone, s8, wf, 1)) {
-				printk(KERN_ERR "\n %s 1. FAILED prepare_bio call \n", __func__);
+			if (prepare_bio(clone, s8, wf)) {
+				printk(KERN_ERR "\n %s 1. FAILED prepare_bio call ", __func__);
 				goto fail;
 			}
 			submit_bio(clone);
+			/* Move write frontier only after a successful submit */
+			//printk(KERN_ERR "\n %s 1. zonenr: %d Submitting lba: {%llu, pba: %llu, len: %d}", __func__, get_zone_nr(ctx, wf), lba, wf, s8);
 			move_write_frontier(ctx, s8);
 			up_write(&ctx->wf_lock);
 			break;
 		}
+		//dosplit = 1
+		clone->bi_iter.bi_sector = lba;
 		clone = split_submit(clone, s8, wf);
 		if (!clone) {
 			goto fail;
 		}
+		/* Move write frontier only after a successful submit */
 		move_write_frontier(ctx, s8);
 		up_write(&ctx->wf_lock);
 		lba = lba + s8;
-		BUG_ON(clone->bi_iter.bi_sector != lba);
 	} while (1);
 
 	//blk_finish_plug(&plug);
+	kref_put(&bioctx->ref, write_done);
 	return 0; 
 fail:
 	up_write(&ctx->wf_lock);
@@ -4772,11 +5142,24 @@ fail:
 	return -1;
 }
 
-u64 get_free_sectors_in_zone(struct ctx *ctx, unsigned int zonenr)
+
+void lsdm_handle_write(struct ctx *ctx)
 {
-	struct seq_zones_info * szone = &ctx->dzit[zonenr];
-	return (ctx->nr_lbas_in_zone - (szone->wp % ctx->nr_lbas_in_zone));
+	struct bio *bio;
+
+	while ((bio = bio_list_pop(&ctx->bio_list))) {
+		if (ctx->err) {
+			printk(KERN_ERR "\n cannot write further, I/O error encountered! ");
+			break;
+		}
+		//trace_printk("\n %s Processing bio: lba: %llu, len: %d to biolist", __func__, bio->bi_iter.bi_sector, bio_sectors(bio));
+		if (submit_bio_write(ctx, bio)) {
+			printk(KERN_ERR "\n write failed, cannot proceed! ");
+			break;
+		}
+	}
 }
+
 
 /*
  * NOTE: LBA is the address of a sector. We expect the LBAs to be
@@ -4800,17 +5183,12 @@ u64 get_free_sectors_in_zone(struct ctx *ctx, unsigned int zonenr)
  * to read anyway.
  *
 */
-int hybrid_stl_write_io(struct ctx *ctx, struct bio *bio)
+int lsdm_write_io(struct ctx *ctx, struct bio *bio)
 {
-	struct bio * clone, *split;
+	struct bio * clone;
 	struct lsdm_bioctx * bioctx;
 	struct lsdm_ckpt *ckpt;
-	int ret, dosplit, nr_sectors;
-	sector_t lba, wp, end_pba;
-	unsigned int lzonenr, pzonenr, free_sectors_in_zone, s8, maxlen, lba_offset_in_zone, pba_offset;
-	unsigned int zone_is_full = 0;
-
-	maxlen = (BIO_MAX_PAGES * 8);
+	int ret;
 
 	ret = lsdm_write_checks(ctx, bio);
 	if (0 > ret) {
@@ -4822,16 +5200,18 @@ int hybrid_stl_write_io(struct ctx *ctx, struct bio *bio)
 		bio_endio(bio);
 		return DM_MAPIO_SUBMITTED;
 	}
-
+	
 	atomic_set(&ctx->ioidle, 0);
 	/* ckpt must be updated. The state of the filesystem is
 	 * unclean until checkpoint happens!
 	 */
 	ckpt = (struct lsdm_ckpt *)page_address(ctx->ckpt_page);
+	ckpt->clean = 0;
 	clone = bio_alloc_clone(ctx->dev->bdev, bio, GFP_KERNEL, &fs_bio_set);
 	if (!clone) {
 		goto memfail;
 	}
+
 	bioctx = kmem_cache_alloc(ctx->bioctx_cache, GFP_KERNEL);
 	if (!bioctx) {
 		//trace_printk("\n Insufficient memory!");
@@ -4840,108 +5220,17 @@ int hybrid_stl_write_io(struct ctx *ctx, struct bio *bio)
 	}
 	bioctx->orig = bio;
 	bioctx->ctx = ctx;
+	/* TODO: Initialize refcount in bioctx and increment it every
+	 * time bio is split or padded */
+	clone->bi_private = bioctx;
 	bio->bi_status = BLK_STS_OK;
-	kref_init(&bioctx->ref);
-	do {
-		mykref_get(&ctx->ongoing_iocount);
-		clone->bi_private = bioctx;
-		clone->bi_status = BLK_STS_OK;
-		dosplit = 0;
-		nr_sectors = bio_sectors(clone);
-		s8 = round_up(nr_sectors, NR_SECTORS_IN_BLK);
-		if (s8 > maxlen) {
-			s8 = maxlen;
-			dosplit = 1;
-		}
-		lba = bio->bi_iter.bi_sector;
-		lba_offset_in_zone = lba % ctx->nr_lbas_in_zone;
-		wp = 0;
-		zone_is_full = 0;
-		lzonenr = lba / ctx->nr_lbas_in_zone;
-		get_zone_lock(ctx, lzonenr);
-		pzonenr = ctx->dzit[lzonenr].pzonenr;
-		free_sectors_in_zone = ctx->nr_lbas_in_zone;
-		if (pzonenr < ctx->sb->zone_count) {
-			wp = ctx->dzit[lzonenr].wp;
-			free_sectors_in_zone = get_free_sectors_in_zone(ctx, lzonenr);
-			sector_t first_pba = get_first_pba_for_dzone(ctx, pzonenr);
-			BUG_ON(wp < first_pba);
-			end_pba = get_first_pba_for_dzone(ctx, pzonenr) + ctx->nr_lbas_in_zone;
-			BUG_ON(wp > end_pba);
-			/* end_pba is past this zone. A full zone cannot get sequential writes */
-			if (wp == end_pba) {
-				zone_is_full = 1;
-			}
-		}
-		pba_offset = wp % ctx->nr_lbas_in_zone;
-		if (s8 > free_sectors_in_zone) {
-			s8 = free_sectors_in_zone;
-			dosplit = 1;
-		}
-		split = clone;
-		if (dosplit) {
-			split = bio_split(clone, s8, GFP_NOIO, &fs_bio_set);
-			if (!split) {
-				/* TODO: call lsdm_clone_endio with an error */
-				panic("\n bio_split() failed! \n");
-			}
-			split->bi_private = bioctx;
-		}
-		/* LBA starts from 0, but PBA starts after the cache */
-		if ((!zone_is_full) && (pba_offset  == lba_offset_in_zone)) {
-			/* writing in place in the data zone */
-			if (pzonenr > ctx->sb->zone_count) {
-				pzonenr = get_new_data_zone(ctx);
-				if (pzonenr < 0) {
-					panic("\n Cannot accept write, no free zone? ");
-					return -1;
-				}
-				//printk(KERN_ERR "\n %s Allocated a new pzonenr: %u", __func__,  pzonenr);
-				ctx->dzit[lzonenr].pzonenr = pzonenr;
-				ctx->dzit[lzonenr].lzonenr = lzonenr;
-				ctx->dzit[lzonenr].wp = get_first_pba_for_dzone(ctx, pzonenr);
-				/* lock should be initialized in read_dzone_info() */
-				wp = ctx->dzit[lzonenr].wp;
-			}
-			BUG_ON(!s8);
-			prepare_bio(split, s8, wp, 0);
-			submit_bio(split);
-			/* Update the wp with the zone lock held. */
-			ctx->dzit[lzonenr].wp += s8;
-			if (ctx->verbose)
-				printk(KERN_ERR "\n %s() (SEQ Write):: LBA: %llu zonenr: %llu PBA: %llu s8: %llu nr_sectors: %u", __func__, lba, lba/ctx->nr_lbas_in_zone,  wp, s8, nr_sectors);
-			end_pba = get_first_pba_for_dzone(ctx, pzonenr) + ctx->nr_lbas_in_zone;
-			if (ctx->dzit[lzonenr].wp > end_pba) {
-				printk(KERN_ERR "\n %s ctx->dzit[lzonenr].wp: %llu pzonenr: %d s8: %d lzonenr: %d end_pba: %llu", __func__, ctx->dzit[lzonenr].wp, pzonenr, s8, lzonenr, end_pba);
-				BUG_ON(ctx->dzit[lzonenr].wp > end_pba);
-			}
-			free_zone_lock(ctx, lzonenr);
-		} else {
-			free_zone_lock(ctx, lzonenr);
-			if (ctx->nr_free_cache_zones <= ctx->middle_watermark) {
-				ctx->gc_th->gc_wake = 1;
-				wake_up(&ctx->gc_th->lsdm_gc_wait_queue);
-				DEFINE_WAIT(wait);
-				prepare_to_wait(&ctx->gc_th->fggc_wq, &wait,
-						TASK_UNINTERRUPTIBLE);
-				/* setting gc_wake=1 and the next wakeup will trigger lsdm_gc(ctx, FG_GC, 0) by waking up a sleeping gc thread */
-				io_schedule();
-				finish_wait(&ctx->gc_th->fggc_wq, &wait);
-				//printk(KERN_ERR "\n %s %d woken up lba: %llu, nrsectors: %d ", __func__,  __LINE__, lba, nr_sectors);
-			}
-			ls_cache_write(ctx, split);
-		}
-		ctx->nr_app_writes += s8;
-		if (!dosplit)
-			break;
-		lba = lba + s8;
-	} while(split != clone);
+	//printk(KERN_ERR "\n %s Write bio: lba: %llu, len: %d ", __func__, bio->bi_iter.bi_sector, bio_sectors(bio));
+	submit_bio_write(ctx, clone);
 	/*
 	bio_list_add(&ctx->bio_list, clone);
 	wake_up_all(&ctx->write_th->write_waitq);
 	*/
 	//flush_workqueue(ctx->writes_wq);
-	kref_put(&bioctx->ref, write_done);
 	return DM_MAPIO_SUBMITTED;
 memfail:
 	bio->bi_status = BLK_STS_RESOURCE;
@@ -4957,6 +5246,15 @@ memfail:
    argv[3] = max pba
    */
 #define BS_NR_POOL_PAGES 65536
+
+/* TODO: IMPLEMENT */
+void put_free_zone(struct ctx *ctx, u64 pba)
+{
+	/*
+	unsigned long flags;
+	unsigned long zonenr = get_zone_nr(ctx, pba);
+	*/
+}
 
 /* This pba is got from the superblock; it is the address of the
  * sector and not a 4096 block. So, we can directly read from this
@@ -4980,7 +5278,7 @@ struct lsdm_ckpt * read_checkpoint(struct ctx *ctx, unsigned long pba)
 		return NULL;
 	}
 	ctx->ckpt_page = page;
-	/* Do not set ctx->nr_free_cache_zones; its calculated while reading segment info table
+	/* Do not set ctx->nr_freezones; its calculated while reading segment info table
 	 * and then verified against what is recorded in ckpt
 	 */
 	return ckpt;
@@ -5005,6 +5303,7 @@ void do_checkpoint(struct ctx *ctx)
 	//printk(KERN_ERR "\n sit pages flushed! nr_sit_pages: %llu sit_flush_count: %llu", atomic_read(&ctx->nr_sit_pages), atomic_read(&ctx->sit_flush_count));
 	/*--------------------------------------------*/
 
+	flush_revmap_bitmap(ctx);
 	update_checkpoint(ctx);
 	flush_checkpoint(ctx);
 
@@ -5017,6 +5316,31 @@ void do_checkpoint(struct ctx *ctx)
 	ctx->flag_ckpt = 0;
 	spin_unlock(&ctx->ckpt_lock);
 }
+
+/* How do you know that recovery is necessary?
+ * Go through the existing translation table
+ * and check if the records mentioned in the 
+ * ckpt match with that in the extent map
+ * So read the extent map before this step
+ *
+ * recovery is necessary is ckpt->clean is 0
+ *
+ * if recovery is necessary  do the following:
+ *
+ * ctx->elapsed_time = highest mtime of all segentries.
+ *
+ */
+int do_recovery(struct ctx *ctx)
+{
+	/* Once necessary steps are taken for recovery (if needed),
+	 * then we can reset the checkpoint and prepare it for the 
+	 * next round
+	reset_ckpt(ckpt);
+	 */
+	return 0;
+}
+
+
 
 /* we write the checkpoints alternately.
  * Only one of them is more recent than
@@ -5078,14 +5402,15 @@ struct lsdm_ckpt * get_cur_checkpoint(struct ctx *ctx)
  * 1 indicates the zone is free 
  */
 
-int mark_zone_occupied(struct ctx *ctx , int zonenr, char *bitmap, uint bitmap_bytes, uint bitmap_bit, uint *nrfreezones)
+int mark_zone_occupied(struct ctx *ctx , int zonenr)
 {
+	char *bitmap = ctx->freezone_bitmap;
 	int bytenr = zonenr / BITS_IN_BYTE;
 	int bitnr = zonenr % BITS_IN_BYTE;
 	//char str[9];
 
-	if (bytenr > bitmap_bytes) {
-		panic("\n Trying to set an invalid bit in the free zone bitmap. bytenr > czone_bitmap_bytes");
+	if (bytenr > ctx->bitmap_bytes) {
+		panic("\n Trying to set an invalid bit in the free zone bitmap. bytenr > bitmap_bytes");
 	}
 
 	//get_byte_string(bitmap[bytenr], str);
@@ -5105,8 +5430,8 @@ int mark_zone_occupied(struct ctx *ctx , int zonenr, char *bitmap, uint bitmap_b
 	/* This bit is set and the zone is free. We want to unset it
 	 */
 	bitmap[bytenr] = bitmap[bytenr] ^ (1 << bitnr);
-	*nrfreezones = *nrfreezones - 1;
-	//printk(KERN_ERR "\n %s ctx->nr_free_cache_zones (2) : %u", __func__, ctx->nr_free_cache_zones);
+	ctx->nr_freezones = ctx->nr_freezones - 1;
+	//printk(KERN_ERR "\n %s ctx->nr_freezones (2) : %u", __func__, ctx->nr_freezones);
 	return 0;
 }
 
@@ -5115,10 +5440,10 @@ int mark_zone_occupied(struct ctx *ctx , int zonenr, char *bitmap, uint bitmap_b
  * lba: starting lba corresponding to the pba recorded in this block
  *
  */
-int read_extents_from_block(struct ctx * ctx, struct rev_tm_entry *entry, u64 pba)
+int read_extents_from_block(struct ctx * ctx, struct rev_tm_entry *entry, u64 lba)
 {
 	int i = 0;
-	int nr_extents = REV_TM_ENTRIES_BLK;
+	int nr_extents = TM_ENTRIES_BLK;
 	int ret = 0;
 
 	while (i < nr_extents) {
@@ -5126,18 +5451,19 @@ int read_extents_from_block(struct ctx * ctx, struct rev_tm_entry *entry, u64 pb
 		/* If there are no more recorded entries on disk, then
 		 * dont add an entries further
 		 */
-		if (entry->lba > ctx->sb->max_pba) {
+		if (entry->pba == 0) {
 			entry = entry + 1;
-			pba = pba + NR_SECTORS_IN_BLK;
 			continue;
 			
 		}
 		//printk(KERN_ERR "\n %s i: %d entry->lba: %llu entry->pba: %llu", __func__, i, lba, entry->pba);
+		BUG_ON(entry->pba > ctx->sb->max_pba);
 		/* TODO: right now everything should be zeroed out */
+		//panic("Why are there any already mapped extents?");
 		down_write(&ctx->lsdm_rb_lock);
-		lsdm_rb_update_range(ctx, entry->lba, pba, NR_SECTORS_IN_BLK);
+		lsdm_rb_update_range(ctx, lba, entry->pba, NR_SECTORS_IN_BLK);
 		up_write(&ctx->lsdm_rb_lock);
-		pba = pba + NR_SECTORS_IN_BLK; /* Every 512 bytes sector has an LBA in a SMR drive */
+		lba = lba + NR_SECTORS_IN_BLK; /* Every 512 bytes sector has an LBA in a SMR drive */
 		entry = entry + 1;
 		ret = 1;
 	}
@@ -5146,13 +5472,13 @@ int read_extents_from_block(struct ctx * ctx, struct rev_tm_entry *entry, u64 pb
 
 int add_tm_page_kv_store_by_blknr(struct ctx *ctx, struct page *page, int blknr)
 {
-	struct rb_root *root = &ctx->rev_tm_rb_root;
+	struct rb_root *root = &ctx->tm_rb_root;
 	struct rb_node *parent = NULL, **link = &root->rb_node;
 	struct rb_node *node = NULL;
 	struct tm_page *node_ent;
 	struct tm_page *new_tmpage, *parent_ent;
 
-	BUG_ON(blknr > ctx->sb->blk_count_rtm);
+	BUG_ON(blknr > ctx->sb->blk_count_tm);
 
 	parent = NULL;
 	node = root->rb_node;
@@ -5188,7 +5514,7 @@ int add_tm_page_kv_store_by_blknr(struct ctx *ctx, struct page *page, int blknr)
 		return -ENOMEM;
 	}
 	RB_CLEAR_NODE(&new_tmpage->rb);
-	//printk("\n %s lba: %llu blknr: %d tm_pba: %llu \n", __func__, lba, blknr, ctx->sb->rtm_pba);
+	//printk("\n %s lba: %llu blknr: %d tm_pba: %llu \n", __func__, lba, blknr, ctx->sb->tm_pba);
 	new_tmpage->page = page;
 	new_tmpage->blknr = blknr;
 	/* Add this page to a RB tree based KV store.
@@ -5211,36 +5537,41 @@ int add_tm_page_kv_store_by_blknr(struct ctx *ctx, struct page *page, int blknr)
  * NOT a sector!!
  * TODO
  */
-int read_rev_translation_map(struct ctx *ctx)
+int read_translation_map(struct ctx *ctx)
 {
 	unsigned long blknr, sectornr;
-	/* blk_count_rtm is 4096 bytes aligned number */
-	unsigned long nrblks = ctx->sb->blk_count_rtm;
+	/* blk_count_tm is 4096 bytes aligned number */
+	unsigned long nrblks = ctx->sb->blk_count_tm;
 	struct page *page;
 	int i = 0, ret = 0;
-	struct rev_tm_entry * rev_tm_entry = NULL;
-	u64 pba = ctx->sb->czone0_pba;
+	struct tm_entry * tm_entry = NULL;
+	u64 lba = 0;
 
-	printk(KERN_ERR "\n %s Reading TM entries from: %llu, nrblks: %ld", __func__, ctx->sb->rtm_pba, nrblks);
+	printk(KERN_ERR "\n %s Reading TM entries from: %llu, nrblks: %ld", __func__, ctx->sb->tm_pba, nrblks);
 	
 	ctx->n_extents = 0;
 	sectornr = 0;
 	while(i < nrblks) {
-		//printk(KERN_ERR "\n reading block: %llu, sector: %llu", ctx->sb->rtm_pba, sectornr);
-		page = read_block(ctx, ctx->sb->rtm_pba, sectornr);
+		//printk(KERN_ERR "\n reading block: %llu, sector: %llu", ctx->sb->tm_pba, sectornr);
+		page = read_block(ctx, ctx->sb->tm_pba, sectornr);
 		if (!page)
 			return -1;
 		/* We read the extents in the entire block. the
 		 * redundant extents should be unpopulated and so
 		 * we should find 0 and break out */
 		//trace_printk("\n pba: %llu", pba);
-		rev_tm_entry = (struct rev_tm_entry *) page_address(page);
-		ret = read_extents_from_block(ctx, rev_tm_entry, pba);
-		add_tm_page_kv_store_by_blknr(ctx, page, sectornr/NR_SECTORS_IN_BLK);
+		tm_entry = (struct tm_entry *) page_address(page);
+		ret = read_extents_from_block(ctx, tm_entry, lba);
+		if (!ret) {
+			__free_pages(page, 0);
+			nrpages--;
+		} else {
+			add_tm_page_kv_store_by_blknr(ctx, page, sectornr/NR_SECTORS_IN_BLK);
+		}
 		/* Every 512 byte sector has a LBA in SMR drives, the translation map is recorded for every block
 		 * instead. So every translation entry covers 8 sectors or 8 lbas.
 		 */
-		pba = pba + (REV_TM_ENTRIES_BLK * 8);
+		lba = lba + (TM_ENTRIES_BLK * 8);
 		i = i + 1;
 		//printk(KERN_ERR "\n %s nrpages: %llu", __func__, nrpages);
 		// sectornr = sectornr + (ctx->q->limits.physical_block_size/ctx->q->limits.logical_block_size);
@@ -5251,6 +5582,127 @@ int read_rev_translation_map(struct ctx *ctx)
 	return 0;
 }
 
+int read_revmap_bitmap(struct ctx *ctx)
+{
+	unsigned long nrblks = ctx->sb->blk_count_revmap_bm;
+
+	printk(KERN_ERR "\n %s nrblks: %lu \n", __func__, nrblks);
+	if (nrblks != 1) {
+		panic("\n Wrong revmap bitmap calculations!");
+	}
+	
+	ctx->revmap_bm = read_block(ctx, ctx->sb->revmap_bm_pba, 0);
+	if (!ctx->revmap_bm) {
+		/* free the successful bh till now */
+		return -1;
+	}
+	return 0;
+
+}
+
+
+void process_revmap_entries_on_boot(struct ctx *ctx, struct page *page)
+{
+	struct lsdm_revmap_extent *extent;
+	struct lsdm_revmap_entry_sector *entry_sector;
+	int i = 0, j;
+
+	//trace_printk("\n Inside process revmap_entries_on_boot!" );
+
+	add_block_based_translation(ctx,  page, __func__);
+	//trace_printk("\n Added block based translations!, will add memory based extent maps now.... \n");
+	entry_sector = (struct lsdm_revmap_entry_sector *) page_address(page);
+	while (i < NR_SECTORS_IN_BLK) {
+		extent = entry_sector->extents;
+		for (j=0; j < NR_EXT_ENTRIES_PER_SEC; j++) {
+			if (extent[j].pba == 0)
+				continue;
+			//down_write(&ctx->lsdm_rb_lock);
+			lsdm_rb_update_range(ctx, extent[j].lba, extent[j].pba, extent[j].len);
+			//up_write(&ctx->lsdm_rb_lock);
+		}
+		entry_sector = entry_sector + 1;
+		i++;
+	}
+}
+
+/*
+ * Read a blk only if the bitmap says its not available.
+ */
+int read_revmap(struct ctx *ctx)
+{
+	int i = 0, byte = 0;
+	struct page *page;
+	char *ptr;
+	struct block_device *bdev = NULL;
+	char flush_needed = 0;
+	struct page * revmap_page;
+	unsigned int nr_revmap_blks = ctx->sb->blk_count_revmap;
+	int bits = 0;
+	unsigned int blknr, sectornr;
+
+	bdev = ctx->dev->bdev;
+	/* We read the revmap bitmap first. If a bit is set,
+	 * then the corresponding revmap blk is read
+	 */
+	page = ctx->revmap_bm;
+	if (!page)
+		return -1;
+	ptr = (char *) page_address(page);
+	//trace_printk("\n page_address(ctx->revmap_bm): %p", ptr);
+	blknr = 0;
+	sectornr = ctx->revmap_pba;
+	for (i = 0; i < BLK_SZ; i++) {
+		byte = *ptr;
+		if (!byte) {
+			bits = 8;
+			blknr = blknr + bits; /* BITS_IN_BYTE */
+		}
+
+		while(byte) {
+			if (byte & 1) {
+				//trace_printk("\n WHY IS THIS BYTE SET??");
+				flush_needed = 1;
+				//trace_printk("\n read revmap blk: %lu", pba);
+				revmap_page = read_block(ctx, sectornr, blknr);
+				if (!revmap_page) {
+					return -1;
+				}
+				process_revmap_entries_on_boot(ctx, revmap_page);
+				__free_pages(revmap_page, 0);
+				nrpages--;
+				//printk(KERN_ERR "\n %s nrpages: %llu", __func__, nrpages);
+				if (blknr >= nr_revmap_blks)
+					break;
+				//sectornr = sectornr + (ctx->q->limits.physical_block_size/ctx->q->limits.logical_block_size);
+				sectornr = sectornr + NR_SECTORS_IN_BLK;
+			}
+			byte = byte >> 1;
+			bits = bits + 1;
+			blknr = blknr + 1;
+		}
+		if (bits != 7) {
+			blknr = blknr + (7 - bits);
+		}
+		if (blknr >= nr_revmap_blks)
+			break;
+		ptr = ptr + 1;
+	}
+	printk("\n %s flush_needed: %d", __func__, flush_needed);
+	if (flush_needed) {
+		//printk(KERN_ERR "\n Why do we need to flush!!");
+		//flush_translation_blocks(ctx);
+	}
+	return 0;
+}
+
+
+sector_t get_zone_pba(struct lsdm_sb * sb, unsigned int segnr)
+{
+	return (segnr * (1 << (sb->log_zone_size - sb->log_sector_size)));
+}
+
+
 /* 
  * Returns the pba of the last sector in the zone
  */
@@ -5260,14 +5712,18 @@ sector_t get_zone_end(struct lsdm_sb *sb, sector_t pba_start)
 }
 
 
-char * allocate_freebitmap(struct ctx *ctx, unsigned int bitmap_bytes)
+int allocate_freebitmap(struct ctx *ctx)
 {
 	char *free_bitmap;
-	free_bitmap = (char *)kzalloc(bitmap_bytes, GFP_KERNEL);
+	if (!ctx)
+		return -1;
+	printk(KERN_INFO "\n ctx->bitmap_bytes: %d ", ctx->bitmap_bytes);
+	free_bitmap = (char *)kzalloc(ctx->bitmap_bytes, GFP_KERNEL);
 	if (!free_bitmap)
-		return NULL;
+		return -1;
 
-	return free_bitmap;
+	ctx->freezone_bitmap = free_bitmap;
+	return 0;
 }
 
 unsigned int get_cb_cost(struct ctx *ctx , u32 nrblks, u64 mtime)
@@ -5287,40 +5743,16 @@ unsigned int get_cb_cost(struct ctx *ctx , u32 nrblks, u64 mtime)
 	return ((100 * (100 - u) * age)/ (100 + u));
 }
 
-unsigned int get_lzones(struct ctx *ctx, u32 czonenr)
+
+unsigned int get_cost(struct ctx *ctx, u32 nrblks, u64 age, char gc_mode)
 {
-	struct lsdm_seg_entry *ptr;
-	struct sit_page *sit_page;
-	int index;
-	sector_t pba;
-
-	pba = get_first_pba_for_czone(ctx, czonenr);
-	sit_page = add_sit_page_kv_store(ctx, pba, __func__);
-	if (!sit_page) {
-		/* TODO: do something, low memory */
-		print_memory_usage(ctx, "During sit_ent_vblocks_incr");
-		BUG_ON(1);
-		//panic("Low memory, could not allocate sit_entry");
-	}
-
-	index = czonenr % SIT_ENTRIES_BLK; 
-	ptr = (struct lsdm_seg_entry *) page_address(sit_page->page);
-	ptr = ptr + index;
-	return ptr->lzones;
-}
-
-
-unsigned int get_cost(struct ctx *ctx, u32 zonenr, u32 nrblks, u64 age, char gc_mode)
-{
-	u32 nrzones = get_lzones(ctx, zonenr);
-
-	BUG_ON(nrzones > nrblks);
-
 	if (gc_mode == GC_GREEDY) {
-		return nrzones;
+		return nrblks;
 	}
-	return get_cb_cost(ctx, nrzones, age);
+	return get_cb_cost(ctx, nrblks, age);
 }
+
+int remove_zone_from_cost_node(struct ctx *ctx, struct gc_cost_node *cost_node, unsigned int zonenr);
 
 int remove_zone_from_gc_tree(struct ctx *ctx, unsigned int zonenr)
 {
@@ -5328,7 +5760,7 @@ int remove_zone_from_gc_tree(struct ctx *ctx, unsigned int zonenr)
 	struct gc_zone_node *znode = NULL;
 	struct gc_cost_node *cost_node = NULL;
 	struct rb_node *link = root->rb_node;
-	//int temp;
+	int temp;
 
 	while (link) {
 		znode = container_of(link, struct gc_zone_node, rb);
@@ -5338,10 +5770,11 @@ int remove_zone_from_gc_tree(struct ctx *ctx, unsigned int zonenr)
 			remove_zone_from_cost_node(ctx, cost_node, zonenr);
 			rb_erase(&znode->rb, root);
 			kmem_cache_free(ctx->gc_zone_node_cache, znode);
+			/*
 			if (zonenr == select_zone_to_clean(ctx, BG_GC, __func__)) {
 				printk(KERN_ERR "\n %s zonenr selected next time: %d is same as removed!! \n", __func__, zonenr);
 				BUG_ON(1);
-			}
+			} */
 			return (0);
 		}
 		if (znode->zonenr < zonenr) {
@@ -5351,8 +5784,8 @@ int remove_zone_from_gc_tree(struct ctx *ctx, unsigned int zonenr)
 		}
 	}
 	/* did not find the zone in rb tree */
-	//temp = select_zone_to_clean(ctx, BG_GC, __func__);
-	//printk("\n %s could not find zone: %d in the zone tree! zone selected for next round: %d \n", __func__, zonenr, temp);
+	temp = select_zone_to_clean(ctx, BG_GC, __func__);
+	printk("\n %s could not find zone: %d in the zone tree! zone selected for next round: %d \n", __func__, zonenr, temp);
 	return (-1);
 }
 
@@ -5390,7 +5823,7 @@ struct gc_zone_node * add_zonenr_gc_zone_tree(struct ctx *ctx, unsigned int zone
 	 */
 	rb_link_node(&znew->rb, parent, link);
 	rb_insert_color(&znew->rb, root);
-	//printk(KERN_ERR "\n %s Added zone: %d nrblks: %d to gc tree!znode: %p  znode->list: %p \n", __func__, zonenr, nrblks, znew, (void *) znew->list);
+	//printk(KERN_ERR "\n %s Added zone: %d nrblks: %d to gc tree!znode: %p  znode->list: %p \n", __func__, zonenr, nrblks, znew, znew->list);
 	return znew;
 }
 
@@ -5426,7 +5859,7 @@ int remove_zone_from_cost_node(struct ctx *ctx, struct gc_cost_node *cost_node, 
 		if (zcount >= 1 && flag == 1)
 			break;
 	}
-	if (!zcount && flag) {
+	if (!zcount) {
 		//printk(KERN_ERR "\n %s Zone: %d was the only one on the cost node. Deleting the cost_node %p now! \n", __func__, zonenr, cost_node);
 		rb_erase(&cost_node->rb, &ctx->gc_cost_root);
 		kmem_cache_free(ctx->gc_cost_node_cache, cost_node);
@@ -5454,7 +5887,7 @@ int update_gc_tree(struct ctx *ctx, unsigned int zonenr, u32 nrblks, u64 mtime, 
 		return 0;
 	}
 	//cost = get_cost(ctx, nrblks, mtime, GC_CB);
-	cost = get_cost(ctx, zonenr, nrblks, mtime, GC_GREEDY);
+	cost = get_cost(ctx, nrblks, mtime, GC_GREEDY);
 	znode = add_zonenr_gc_zone_tree(ctx, zonenr, nrblks);
 	if (!znode) {
 		printk(KERN_ERR "\n %s gc data structure allocation failed!! \n", __func__);
@@ -5476,7 +5909,6 @@ int update_gc_tree(struct ctx *ctx, unsigned int zonenr, u32 nrblks, u64 mtime, 
 	}
 
 	znode->vblks = nrblks;
-	INIT_LIST_HEAD(&znode->list);
 		
 	/* Go to the bottom of the tree */
 	while (*link) {
@@ -5602,15 +6034,15 @@ int read_seg_entries_from_block(struct ctx *ctx, struct lsdm_seg_entry *entry, u
 	int i = 0;
 	struct lsdm_sb *sb;
 	unsigned int nr_blks_in_zone;
-	unsigned hot_frontier = get_czone_nr(ctx, ctx->ckpt->hot_frontier_pba);
        
 	sb = ctx->sb;
 	nr_blks_in_zone = (1 << (sb->log_zone_size - sb->log_block_size));
-	printk("\n Number of seg entries: %u, hot_frontier: %d, zonenr: %d", nr_seg_entries, hot_frontier, *zonenr);
+	//printk("\n Number of seg entries: %u", nr_seg_entries);
 
 	while (i < nr_seg_entries) {
 		/* 0th zonenr is the zone that holds all the metadata */
-		if (*zonenr == hot_frontier) {
+		if ((*zonenr == get_zone_nr(ctx, ctx->ckpt->hot_frontier_pba)) ||
+		    (*zonenr == get_zone_nr(ctx, ctx->ckpt->warm_gc_frontier_pba))) {
 			/* 1 indicates zone is free, 0 is the default bit because of kzalloc */
 			printk(KERN_ERR "\n zonenr: %d vblocks: %u is our cur_frontier! not marking it free!", *zonenr, entry->vblocks);
 			entry = entry + 1;
@@ -5619,13 +6051,15 @@ int read_seg_entries_from_block(struct ctx *ctx, struct lsdm_seg_entry *entry, u
 			continue;
 		}
 		else if (entry->vblocks == 0) {
-    			//printk(KERN_ERR "\n FREE *segnr: %u", *zonenr);
-			mark_zone_free(ctx, *zonenr, ctx->free_czone_bitmap, ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit, &ctx->nr_free_cache_zones, 0);
+    			//printk(KERN_ERR "\n *segnr: %u", *zonenr);
+			mark_zone_free(ctx , *zonenr, 1);
 		}
-		else {
-			printk(KERN_ERR "\n *segnr: %u entry->vblocks: %u entry->mtime: %lu", *zonenr, entry->vblocks, entry->mtime);
+		else if (entry->vblocks < nr_blks_in_zone) {
+			//printk(KERN_ERR "\n *segnr: %u entry->vblocks: %llu entry->mtime: %llu", *zonenr, entry->vblocks, entry->mtime);
 			if (!update_gc_tree(ctx, *zonenr, entry->vblocks, entry->mtime, __func__))
 				panic("Memory error, write a memory shrinker!");
+		} else {
+			//printk(KERN_ERR "\n %s segnr: %llu, vblocks: %llu, mtime: %llu ", __func__, *zonenr, entry->vblocks, entry->mtime);
 		}
 		if (ctx->min_mtime > entry->mtime)
 			ctx->min_mtime = entry->mtime;
@@ -5649,68 +6083,70 @@ int read_seg_entries_from_block(struct ctx *ctx, struct lsdm_seg_entry *entry, u
  */
 int read_seg_info_table(struct ctx *ctx)
 {
-	unsigned int sectornr = 0;
+	unsigned int nrblks = 0, sectornr = 0;
+	struct block_device *bdev;
 	int nr_seg_entries_blk = BLK_SZ / sizeof(struct lsdm_seg_entry);
 	int ret=0;
 	struct lsdm_seg_entry *entry0;
 	unsigned int zonenr = 0;
 	struct lsdm_sb *sb;
-	unsigned long nr_cache_zones;
+	unsigned long nr_data_zones;
 	unsigned long nr_seg_entries_read;
 	struct page * sit_page;
 	
 	if (NULL == ctx)
 		return -1;
 
+	bdev = ctx->dev->bdev;
 	sb = ctx->sb;
-	nr_cache_zones = sb->zone_count_cache; /* these are the number of segment entries to read */
+
+	nr_data_zones = sb->zone_count_main; /* these are the number of segment entries to read */
 	nr_seg_entries_read = 0;
 	
-	printk(KERN_ERR "\n nr_cache_zones: %lu", nr_cache_zones);
-	ctx->free_czone_bitmap = allocate_freebitmap(ctx, ctx->czone_bitmap_bytes);
-	printk(KERN_INFO "\n Allocated free cache bitmap, ret: %d", ret);
-	if (!ctx->free_czone_bitmap)
-		return -1;
-	ctx->free_dzone_bitmap = allocate_freebitmap(ctx, ctx->dzone_bitmap_bytes);
-	memset(ctx->free_dzone_bitmap, (char) ~0, ctx->dzone_bitmap_bytes);
-	printk(KERN_INFO "\n Allocated free datazone bitmap, ret: %d", ret);
+	printk(KERN_ERR "\n nr_data_zones: %lu", nr_data_zones);
+	ret = allocate_freebitmap(ctx);
+	printk(KERN_INFO "\n Allocated free bitmap, ret: %d", ret);
+	if (0 > ret)
+		return ret;
 
 
 	ctx->min_mtime = ULLONG_MAX;
 	ctx->max_mtime = get_elapsed_time(ctx);
+	nrblks = sb->blk_count_sit;
 	sectornr = 0;
 	printk(KERN_ERR "\n ctx->ckpt->hot_frontier_pba: %llu", ctx->ckpt->hot_frontier_pba);
-	printk(KERN_ERR "\n get_czone_nr(ctx, ctx->ckpt->hot_frontier_pba): %u", get_czone_nr(ctx, ctx->ckpt->hot_frontier_pba));
-	printk(KERN_ERR "\n %s Read seginfo from pba: %llu sectornr: %d zone0_pba: %llu \n", __func__, sb->sit_pba, sectornr, ctx->sb->czone0_pba);
-	printk("\n ctx->hot_frontier_pba: %llu, ckpt->frontier zone: %u", ctx->ckpt->hot_frontier_pba, get_czone_nr(ctx, ctx->ckpt->hot_frontier_pba));
-	while (nr_cache_zones > 0) {
+	printk(KERN_ERR "\n ctx->ckpt->warm_gc_frontier_pba: %llu", ctx->ckpt->warm_gc_frontier_pba);
+	printk(KERN_ERR "\n get_zone_nr(ctx, ctx->ckpt->hot_frontier_pba): %u", get_zone_nr(ctx, ctx->ckpt->hot_frontier_pba));
+	printk(KERN_ERR "\n %s Read seginfo from pba: %llu sectornr: %d zone0_pba: %llu \n", __func__, sb->sit_pba, sectornr, ctx->sb->zone0_pba);
+	printk("\n ctx->hot_frontier_pba: %llu, ckpt->frontier zone: %u", ctx->ckpt->hot_frontier_pba, get_zone_nr(ctx, ctx->ckpt->hot_frontier_pba));
+	while (nr_data_zones > 0) {
 		//trace_printk("\n zonenr: %u", zonenr);
-		if ((sectornr + sb->sit_pba) > ctx->sb->czone0_pba) {
+		if ((sectornr + sb->sit_pba) > ctx->sb->zone0_pba) {
 			printk(KERN_ERR "\n Seg entry blknr cannot be bigger than the data blknr");
 			return -1;
 		}
 		sit_page = read_block(ctx, sb->sit_pba, sectornr);
 		if (!sit_page) {
 			printk(KERN_ERR "\n %s Could not read sit pba: %lld ", __func__, sb->sit_pba);
-			kfree(ctx->free_czone_bitmap);
+			kfree(ctx->freezone_bitmap);
 			return -1;
 		}
 		entry0 = (struct lsdm_seg_entry *) page_address(sit_page);
-		if (nr_cache_zones > nr_seg_entries_blk) {
+		if (nr_data_zones > nr_seg_entries_blk) {
 			nr_seg_entries_read = nr_seg_entries_blk;
 		}
 		else {
-			nr_seg_entries_read = nr_cache_zones;
-			printk(KERN_ERR "\n Usual segentries: %d, (now) last blk has: %lu \n", nr_seg_entries_blk, nr_cache_zones);
+			nr_seg_entries_read = nr_data_zones;
+			printk(KERN_ERR "\n Usual segentries: %d, (now) last blk has: %lu \n", nr_seg_entries_blk, nr_data_zones);
 		}
-		nr_cache_zones = nr_cache_zones - nr_seg_entries_read;
+		nr_data_zones = nr_data_zones - nr_seg_entries_read;
 		ret = read_seg_entries_from_block(ctx, entry0, nr_seg_entries_read, &zonenr);
-		//add_sit_page_kv_store_by_blknr(ctx, sit_page, sectornr);
+		add_sit_page_kv_store_by_blknr(ctx, sit_page, sectornr);
 		//printk(KERN_ERR "\n %s nrpages: %llu", __func__, nrpages);
 		//sectornr = sectornr + (ctx->q->limits.physical_block_size/ctx->q->limits.logical_block_size);
 		sectornr = sectornr + NR_SECTORS_IN_BLK;
 	}
-	printk(KERN_ERR "\n %s ctx->nr_free_cache_zones (2) : %u zonenr: %u", __func__, ctx->nr_free_cache_zones, zonenr);
+	printk(KERN_ERR "\n %s ctx->nr_freezones (2) : %u zonenr: %u", __func__, ctx->nr_freezones, zonenr);
 	return 0;
 }
 
@@ -5748,114 +6184,6 @@ struct lsdm_sb * read_superblock(struct ctx *ctx, unsigned long pba)
 	printk(KERN_INFO "\n sb->max_pba: %llu", sb->max_pba);
 	ctx->sb_page = page;
 	return sb;
-}
-
-int read_dzone_info_table(struct ctx * ctx)
-{
-	unsigned int nr_dzit_entries_in_blk = BLK_SZ/ sizeof(struct stl_dzones_info);
-	unsigned int entries = 0;
-	unsigned int nr_remaining_entries = 0;
-	struct seq_zones_info *szi = ctx->dzit;
-	struct stl_dzones_info * dzi_entry;
-	struct page *page;
-	int i=0, j=0;
-	sector_t pba = ctx->sb->dzit_pba;
-	int nr_valid_blks = 0, pzonenr;
-
-	nr_remaining_entries = ctx->sb->zone_count_data;
-	entries = nr_dzit_entries_in_blk;
-
-	printk(KERN_ERR "\n %s nr_remaining_entries: %d entries: %d nr_dzit_entries_in_blk: %d dzit_pba: %llu \n", __func__, nr_remaining_entries, entries, nr_dzit_entries_in_blk, pba);
-	while(nr_remaining_entries > 0) {
-		if (nr_remaining_entries < nr_dzit_entries_in_blk) {
-			entries = nr_remaining_entries;
-		}
-		page = read_block(ctx, 0, pba);
-		if (!page) {
-			printk(KERN_ERR "\n Could not read sequential data zone information table block from disk \n");
-			return -ENOMEM;
-		}
-		dzi_entry = (struct stl_dzones_info *) page_address(page);
-		for(j=0; j<entries; j++, i++) {
-			pzonenr = dzi_entry->pzonenr;
-			szi[i].pzonenr = pzonenr;
-			szi[i].wp = dzi_entry->wp;
-			szi[i].lzonenr = i;
-			mutex_init(&szi[i].zone_lock);
-			if (pzonenr < ctx->sb->zone_count) {
-				mark_zone_occupied(ctx, pzonenr, ctx->free_dzone_bitmap, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit, &ctx->nr_free_data_zones);
-				nr_valid_blks = (szi[i].wp - get_first_pba_for_dzone(ctx, i)) / NR_SECTORS_IN_BLK;
-				printk(KERN_ERR "\n %s pzonenr: %d nr_valid_blks: %d ", __func__, szi[i].pzonenr, nr_valid_blks);
-			}
-			dzi_entry = dzi_entry + 1;
-		}
-		__free_pages(page, 0);
-		pba = pba + NR_SECTORS_IN_BLK;
-		nr_remaining_entries = nr_remaining_entries - entries;
-	}
-	BUG_ON(i != ctx->sb->zone_count_data);
-	return 0;
-}
-
-void write_dzone_info_table(struct ctx * ctx)
-{
-	unsigned int nr_dzit_entries_in_blk = BLK_SZ/ sizeof(struct stl_dzones_info);
-	unsigned int entries = 0;
-	unsigned int nr_remaining_entries = 0;
-	struct seq_zones_info *szi = ctx->dzit;
-	struct stl_dzones_info * dzi_entry;
-	unsigned int nrblks = ctx->sb->blk_count_dzit;
-	int i=0, j=0;
-	struct bio *bio;
-	sector_t pba = ctx->sb->dzit_pba;
-	struct page *page;
-
-	bio = bio_alloc(ctx->dev->bdev, 1, REQ_OP_READ, GFP_KERNEL);
-	if (!bio) {
-		printk(KERN_ERR "\n %s nrpages: %ld", __func__, nrpages);
-		return;
-	}
-	entries = nr_dzit_entries_in_blk;
-	nr_remaining_entries = ctx->sb->zone_count_data;
-	while(nrblks > 0) {
-		if (nr_remaining_entries < nr_dzit_entries_in_blk) {
-			entries = nr_remaining_entries;
-		}
-		page = alloc_page(__GFP_ZERO|GFP_KERNEL);
-		if (!page) {
-		}
-		dzi_entry = (struct stl_dzones_info *) page_address(page);
-		for(j=0; j<entries; j++, i++) {
-			dzi_entry->pzonenr = szi[i].pzonenr;
-			dzi_entry->wp = szi[i].wp;
-			dzi_entry = dzi_entry + 1;
-		}
-		//printk(KERN_ERR "\n %s nrpages: %ld", __func__, nrpages);
-		if( PAGE_SIZE > bio_add_page(bio, page, PAGE_SIZE, 0)) {
-			__free_pages(page, 0);
-			bio_free_pages(bio);
-			bio_put(bio);
-			nrpages--;
-			printk(KERN_ERR "\n %s nrpages: %ld", __func__, nrpages);
-			return;
-		}
-		nr_remaining_entries = nr_remaining_entries - entries;
-		nrblks = nrblks - 1;
-	}
-	bio->bi_opf = REQ_OP_WRITE;
-	//bio_set_op_attrs(bio, REQ_OP_READ, 0);
-	bio->bi_iter.bi_sector = pba;
-	bio_set_dev(bio, ctx->dev->bdev);
-	submit_bio_wait(bio);
-	bio_free_pages(bio);
-	//printk(KERN_ERR "\n read a block from pba: %llu", pba);
-	if (bio->bi_status != BLK_STS_OK) {
-		printk(KERN_ERR "\n %s Could not read the block, status: %d ", __func__, bio->bi_status);
-		bio_put(bio);
-		return;
-	}
-	/* bio_alloc() hence bio_put() */
-	bio_put(bio);
 }
 
 /*
@@ -5897,6 +6225,8 @@ int read_metadata(struct ctx * ctx)
 	ctx->max_pba = ctx->sb->max_pba;
 	ctx->nr_lbas_in_zone = (1 << (ctx->sb->log_zone_size - ctx->sb->log_sector_size));
 	printk(KERN_ERR "\n nr_lbas_in_zone: %llu", ctx->nr_lbas_in_zone);
+	ctx->revmap_pba = ctx->sb->revmap_pba;
+	printk(KERN_ERR "\n ** ctx->revmap_pba (first revmap bm block pba) : %llu", ctx->revmap_pba);
 
 	ckpt = get_cur_checkpoint(ctx);
 	if (NULL == ckpt) {
@@ -5906,6 +6236,16 @@ int read_metadata(struct ctx * ctx)
 		return -1;
 	}	
 	ctx->ckpt = ckpt;
+	printk(KERN_INFO "\n checkpoint read!, ckpt->clean: %d", ckpt->clean);
+	/*
+	if (!ckpt->clean) {
+		printk("\n Scrubbing metadata after an unclean shutdown...");
+		ret = do_recovery(ctx);
+		return ret;
+	} */
+	//printk(KERN_ERR "\n sb->blk_count_revmap_bm: %d", ctx->sb->blk_count_revmap_bm);
+	//printk(KERN_ERR "\n nr of revmap blks: %u", ctx->sb->blk_count_revmap);
+
 	ctx->hot_wf_pba = ctx->ckpt->hot_frontier_pba;
 	printk(KERN_ERR "\n %s %d ctx->hot_wf_pba: %llu\n", __func__, __LINE__, ctx->hot_wf_pba);
 	ctx->hot_wf_end = zone_end(ctx, ctx->hot_wf_pba);
@@ -5913,36 +6253,47 @@ int read_metadata(struct ctx * ctx)
 	printk(KERN_ERR "\n max_pba = %llu", ctx->max_pba);
 	ctx->free_sectors_in_wf = ctx->hot_wf_end - ctx->hot_wf_pba + 1;
 	printk(KERN_ERR "\n ctx->free_sectors_in_wf: %lld", ctx->free_sectors_in_wf);
+	
+	ctx->warm_gc_wf_pba = ctx->ckpt->warm_gc_frontier_pba;
 	printk(KERN_ERR "\n %s %d ctx->hot_wf_pba: %llu\n", __func__, __LINE__, ctx->hot_wf_pba);
+	ctx->warm_gc_wf_end = zone_end(ctx, ctx->warm_gc_wf_pba);
 	printk(KERN_ERR "\n %s %d kernel wf end: %llu\n", __func__, __LINE__, ctx->hot_wf_end);
 	printk(KERN_ERR "\n max_pba = %llu", ctx->max_pba);
-	ret = read_rev_translation_map(ctx);
+	ctx->free_sectors_in_gc_wf = ctx->warm_gc_wf_end - ctx->warm_gc_wf_pba + 1;
+
+	ret = read_revmap_bitmap(ctx);
+	if (ret) {
+		__free_pages(ctx->sb_page, 0);
+		nrpages--;
+		__free_pages(ctx->ckpt_page, 0);
+		nrpages--;
+		printk(KERN_ERR "\n %s nrpages: %ld ", __func__, nrpages);
+		return -1;
+	}
+	printk(KERN_ERR "\n before: PBA for first revmap blk: %llu", ctx->sb->revmap_pba/NR_SECTORS_IN_BLK);
+	read_revmap(ctx);
+	printk(KERN_INFO "\n Reverse map Read!");
+	ret = read_translation_map(ctx);
 	if (0 > ret) {
 		__free_pages(ctx->sb_page, 0);
 		__free_pages(ctx->ckpt_page, 0);
+		__free_pages(ctx->revmap_bm, 0);
 		printk(KERN_ERR "\n read_extent_map failed! cannot read the metadata ");
 		return ret;
 	}
 	printk(KERN_INFO "\n %s extent_map read!", __func__);
-	ctx->nr_free_cache_zones = 0;
-
-	ctx->czone_bitmap_bytes = sb2->zone_count_cache/BITS_IN_BYTE;
-	if (sb2->zone_count_cache % BITS_IN_BYTE) {
-		ctx->czone_bitmap_bytes = ctx->czone_bitmap_bytes + 1;
-		ctx->czone_bitmap_bit = (sb2->zone_count_cache % BITS_IN_BYTE);
+	ctx->nr_freezones = 0;
+	ctx->bitmap_bytes = sb2->zone_count_main /BITS_IN_BYTE;
+	if (sb2->zone_count_main % BITS_IN_BYTE) {
+		ctx->bitmap_bytes = ctx->bitmap_bytes + 1;
+		ctx->bitmap_bit = (sb2->zone_count_main % BITS_IN_BYTE);
 	}
-	printk(KERN_ERR "\n %s Nr of zones in main are: %llu, czone_bitmap_bytes: %d, czone_bitmap_bit: %d ", __func__, sb2->zone_count_cache , ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit);
-
-	ctx->dzone_bitmap_bytes = sb2->zone_count_data/BITS_IN_BYTE;
-	if (sb2->zone_count_data % BITS_IN_BYTE) {
-		ctx->dzone_bitmap_bytes = ctx->dzone_bitmap_bytes + 1;
-		ctx->dzone_bitmap_bit = (sb2->zone_count_data % BITS_IN_BYTE);
-	}
-	printk(KERN_ERR "\n %s Nr of zones in main are: %llu, dzone_bitmap_bytes: %d, dzone_bitmap_bit: %d ", __func__, sb2->zone_count_data, ctx->dzone_bitmap_bytes, ctx->dzone_bitmap_bit);
-
+	printk(KERN_ERR "\n %s Nr of zones in main are: %llu, bitmap_bytes: %d, bitmap_bit: %d ", __func__, sb2->zone_count_main, ctx->bitmap_bytes, ctx->bitmap_bit);
+	if (sb2->zone_count_main % BITS_IN_BYTE > 0)
+		ctx->bitmap_bytes += 1;
 	read_seg_info_table(ctx);
-	printk(KERN_INFO "\n %s ctx->nr_free_cache_zones: %u, ckpt->nr_free_cache_zones:%u", __func__, ctx->nr_free_cache_zones, ckpt->nr_free_cache_zones);
-	if (ctx->nr_free_cache_zones != ckpt->nr_free_cache_zones) { 
+	printk(KERN_INFO "\n %s ctx->nr_freezones: %u, ckpt->nr_free_zones:%u", __func__, ctx->nr_freezones, ckpt->nr_free_zones);
+	if (ctx->nr_freezones != ckpt->nr_free_zones) { 
 		/* TODO: Do some recovery here.
 		 * We do not wait for confirmation of SIT pages on the
 		 * disk. we match the SIT entries to that by the
@@ -5950,35 +6301,61 @@ int read_metadata(struct ctx * ctx)
 		 * entries are based on the translation map
 		 */
 		printk(KERN_ERR "\n SIT and checkpoint does not match!");
-		ckpt->nr_free_cache_zones = ctx->nr_free_cache_zones;
-		//do_recovery(ctx);
-		goto err;
+		ckpt->nr_free_zones = ctx->nr_freezones;
+		/*
+		//goto out;
+		do_recovery(ctx);
+		__free_pages(ctx->sb_page, 0);
+		nrpages--;
+		__free_pages(ctx->ckpt_page, 0);
+		nrpages--;
+		__free_pages(ctx->revmap_bm, 0);
+		nrpages--;
+		//printk(KERN_ERR "\n %s nrpages: %llu", __func__, nrpages);
+		return -1;
+		*/
 	}
-	ctx->dzit = kmalloc(sizeof(struct seq_zones_info) * ctx->sb->zone_count_data, GFP_KERNEL | __GFP_ZERO);
-	if (!ctx->dzit) {
-		printk(KERN_ERR "\n Could not allocate memory for sequential zone information ");
-		goto err;
-	}
-	if (read_dzone_info_table(ctx)) {
-		goto err;
-	}
-	ctx->cache_offset = sb2->dzone0_pba;
 //out:
 	printk(KERN_ERR "\n Metadata read! \n");
 	return 0;
-err:
-	__free_pages(ctx->sb_page, 0);
-	nrpages--;
-	__free_pages(ctx->ckpt_page, 0);
-	nrpages--;
-	//printk(KERN_ERR "\n %s nrpages: %llu", __func__, nrpages);
-	return -1;
 }
 
-void destroy_caches(struct ctx *ctx)
+/*
+
+unsigned long lsdm_pages_to_free_count(struct shrinker *shrinker, struct shrink_control *sc)
 {
-	kmem_cache_destroy(ctx->czinfo_cache);
-	kmem_cache_destroy(ctx->zones_in_cseg_cache);
+
+	int flag = 0;
+	count = flush_count_tm_blocks(ctx, false, &flag);
+	count += flush_count_sit_blocks(ctx, false, &flag);
+}
+
+
+unsigned long lsdm_free_pages()
+{
+	int nr_to_scan = sc->nr_to_scan;
+	gfp_t gfp_mask = sc->gfp_mask;
+
+	if((gfp_mask  & __GFP_IO) != __GFP_IO)
+		return SHRINK_STOP;
+
+	count = flush_count_tm_blocks(ctx, true, nr_to_scan);
+	if (count < nr_to_scan) {
+		flush_count_sit_blocks(ctx, true, nr_to_scan - count);
+	}
+}
+
+
+
+static struct lsdm_shrinker {
+	.count_objects = lsdm_pages_to_free_count;
+	.scan_objects = lsdm_free_pages;
+	.seeks = DEFAULT_SEEKS;
+};
+*/
+
+static void destroy_caches(struct ctx *ctx)
+{
 	kmem_cache_destroy(ctx->bio_cache);
 	kmem_cache_destroy(ctx->extent_cache);
 	kmem_cache_destroy(ctx->rev_extent_cache);
@@ -5989,19 +6366,24 @@ void destroy_caches(struct ctx *ctx)
 	kmem_cache_destroy(ctx->gc_cost_node_cache);
 	kmem_cache_destroy(ctx->gc_zone_node_cache);
 	kmem_cache_destroy(ctx->sit_page_cache);
+	kmem_cache_destroy(ctx->revmap_bioctx_cache);
 	kmem_cache_destroy(ctx->bioctx_cache);
 }
 
 
-int create_caches(struct ctx *ctx)
+static int create_caches(struct ctx *ctx)
 {
 	ctx->bioctx_cache = kmem_cache_create("bioctx_cache", sizeof(struct lsdm_bioctx), 0, SLAB_RED_ZONE|SLAB_ACCOUNT, NULL);
 	if (!ctx->bioctx_cache) {
 		return -1;
 	}
+	ctx->revmap_bioctx_cache = kmem_cache_create("revmap_bioctx_cache", sizeof(struct revmap_bioctx), 0, SLAB_RED_ZONE|SLAB_ACCOUNT, NULL);
+	if (!ctx->revmap_bioctx_cache) {
+		goto destroy_cache_bioctx;
+	}
 	ctx->sit_page_cache = kmem_cache_create("sit_page_cache", sizeof(struct sit_page), 0, SLAB_RED_ZONE|SLAB_ACCOUNT, NULL);
 	if (!ctx->sit_page_cache) {
-		goto destroy_cache_bioctx;
+		goto destroy_revmap_bioctx_cache;
 	}
 	ctx->tm_page_cache = kmem_cache_create("tm_page_cache", sizeof(struct tm_page), 0, SLAB_RED_ZONE|SLAB_ACCOUNT, NULL);
 	if (!ctx->tm_page_cache) {
@@ -6041,20 +6423,9 @@ int create_caches(struct ctx *ctx)
 	if (!ctx->bio_cache) {
 		goto destroy_rev_extent_cache;
 	}
-	ctx->zones_in_cseg_cache = kmem_cache_create("zones_in_cseg_cache", sizeof(struct cseg_zone_node), 0, SLAB_RED_ZONE|SLAB_ACCOUNT, NULL);
-	if (!ctx->zones_in_cseg_cache) {
-		goto destroy_bio_cache;
-	}
-	ctx->czinfo_cache  = kmem_cache_create("czinfo_cache", sizeof(struct czone_info), 0, SLAB_RED_ZONE|SLAB_ACCOUNT, NULL);
-	if (!ctx->czinfo_cache) {
-		goto destroy_zones_in_cseg_cache;
-	}
+
 	return 0;
 /* failed case */
-destroy_zones_in_cseg_cache:
-	kmem_cache_destroy(ctx->zones_in_cseg_cache);
-destroy_bio_cache:
-	kmem_cache_destroy(ctx->bio_cache);
 destroy_rev_extent_cache:
 	kmem_cache_destroy(ctx->rev_extent_cache);
 destroy_extent_cache:
@@ -6073,62 +6444,14 @@ destroy_tm_page_cache:
 	kmem_cache_destroy(ctx->tm_page_cache);
 destroy_sit_page_cache:
 	kmem_cache_destroy(ctx->sit_page_cache);
+destroy_revmap_bioctx_cache:
+	kmem_cache_destroy(ctx->revmap_bioctx_cache);
 destroy_cache_bioctx:
 	kmem_cache_destroy(ctx->bioctx_cache);
 	return -1;
 }
 
-/* Helper macro for standard sysfs show functions */
-#define DM_ATTR_SHOW(_name, _var) \
-static ssize_t _name##_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) \
-{ \
-	struct ctx * ctx = container_of(kobj, struct ctx, kobj); \
-	return scnprintf(buf, PAGE_SIZE, "%d\n", ctx->_var); \
-}
-#define DM_ATTR_STORE(_name, _var) \
-static ssize_t _name##_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t size) \
-{ \
-	struct ctx * ctx = container_of(kobj, struct ctx, kobj); \
-	int ret = kstrtoint(buf, 10, &ctx->_var); \
-	if (ret < 0) \
-		return ret; \
-	printk(KERN_ERR "\n Set ctx->verbose: %d ", ctx->_var); \
-	return size; \
-}
-/*Define the functions for the sysfs attributes*/
-DM_ATTR_SHOW(lower_watermark, lower_watermark);
-DM_ATTR_SHOW(middle_watermark, middle_watermark);
-DM_ATTR_SHOW(nr_free_cache_zones, nr_free_cache_zones);
-DM_ATTR_STORE(verbose, verbose);
-/* Define the sysfs attributes*/
-static struct kobj_attribute lower_wm_attr =  __ATTR_RO(lower_watermark);
-static struct kobj_attribute middle_wm_attr = __ATTR_RO(middle_watermark);
-static struct kobj_attribute nrfreezones_attr = __ATTR_RO(nr_free_cache_zones);
-
-
-static struct attribute * hybrid_attrs[] = {
-	&lower_wm_attr.attr,
-	&middle_wm_attr.attr,
-	&nrfreezones_attr.attr,
-	NULL,
-};
-
-static struct attribute_group hybrid_attr_group = {
-	.attrs = hybrid_attrs,
-};
-
-static void hybrid_ctr_release(struct kobject *kobj) {
-	struct ctx * ctx = container_of(kobj, struct ctx, kobj);
-	kfree(ctx);
-}
-
-static struct kobj_type hybrid_ktype = {
-	.release = hybrid_ctr_release,
-	.sysfs_ops = &kobj_sysfs_ops,	/* Use the standard show/store logic */
-};
-
-
-static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **argv)
+static int lsdm_ctr(struct dm_target *target, unsigned int argc, char **argv)
 {
 	int ret = -ENOMEM;
 	struct ctx *ctx;
@@ -6153,23 +6476,13 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
 	}
 
 	target->private = ctx;
+	/* 13 comes from 9 + 3, where 2^9 is the number of bytes in a sector
+	 * and 2^3 is the number of sectors in a block.
+	 */
+	target->max_io_len = BIO_MAX_PAGES >> 1;
 	target->flush_supported = true;
 	target->discards_supported = true;
 	/* target->per_io_data_size - set this to get per_io_data_size allocated before every standard structure that holds a bio. */
-
-	ret = kobject_init_and_add(&ctx->kobj, &hybrid_ktype, kernel_kobj, "hybrid_stats");
-	if (ret) {
-		printk(KERN_ERR "\n Could not add kobject \n");
-		goto free_ctx2;
-	}
-
-	printk(KERN_ERR "\n Added kobject \n");
-	ret = sysfs_create_group(&ctx->kobj, &hybrid_attr_group);
-	if (ret) {
-		printk(KERN_ERR "\n Could not create sysfs group! ret: %d \n", ret);
-		goto free_ctx1;
-	}
-	printk(KERN_ERR "\n Added sysfs group\n");
 
 	ret = dm_get_device(target, argv[0], dm_table_get_mode(target->table), &ctx->dev);
     	if (ret) {
@@ -6182,6 +6495,11 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
                 ret = -EINVAL;
                 goto free_ctx;
         }
+	ret = blkdev_report_zones(ctx->dev->bdev, 1572864, 1, print_bzr, NULL);
+	if (!ret) {
+		printk(KERN_ERR "\n reporting zones failed! \n");
+	}
+
 	q = bdev_get_queue(ctx->dev->bdev);
 	printk(KERN_ERR "\n number of sectors in a zone: %llu", bdev_zone_sectors(ctx->dev->bdev));
 	printk(KERN_ERR "\n number of zones in device: %u", bdev_nr_zones(ctx->dev->bdev));
@@ -6219,6 +6537,8 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
 	atomic_set(&ctx->pages_alloced, 0);
 	ctx->nr_app_writes = 0;
 	atomic_set(&ctx->nr_failed_writes, 0);
+	atomic_set(&ctx->revmap_entry_nr, 0);
+	atomic_set(&ctx->revmap_sector_nr, 0);
 	atomic_set(&ctx->sit_ref, 0);
 	atomic_set(&ctx->tm_flush_count, 0);
 	atomic_set(&ctx->sit_flush_count, 0);
@@ -6237,7 +6557,7 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
 	init_rwsem(&ctx->lsdm_rb_lock);
 	init_rwsem(&ctx->lsdm_rev_lock);
 
-	ctx->rev_tm_rb_root = RB_ROOT;
+	ctx->tm_rb_root = RB_ROOT;
 	ctx->sit_rb_root = RB_ROOT;
 	ctx->gc_cost_root = RB_ROOT;
 	ctx->gc_zone_root = RB_ROOT;
@@ -6262,7 +6582,6 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
 	if (0 > ret) {
 		goto uninit_bioset;
 	}
-	printk(KERN_ERR "\n cache created! ");
 	//trace_printk("\n caches created!");
 	ctx->s_chksum_driver = crypto_alloc_shash("crc32c", 0, 0);
 	if (IS_ERR(ctx->s_chksum_driver)) {
@@ -6295,22 +6614,26 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
 		goto destroy_gc_page_pool;
 	}
 
-	ctx->middle_watermark = 4;
-	ctx->lower_watermark = 1;
-	printk(KERN_ERR "\n middle_watermark: %d, lower_watermark: %d ", ctx->middle_watermark, ctx->lower_watermark);
+	/* lower watermark is at 5 %, watermark represents nrfreezones */
+	//ctx->lower_watermark = ctx->sb->zone_count / 20; 
+	//ctx->higher_watermark = ctx->lower_watermark + 20;
+	ctx->lower_watermark = 3;
+	ctx->middle_watermark = 6;
+	ctx->higher_watermark = 10;
+	printk(KERN_ERR "\n zone_count: %lld lower_watermark: %d middle_watermark: %d higher_watermark: %d ", ctx->sb->zone_count, ctx->lower_watermark, ctx->middle_watermark, ctx->higher_watermark);
+	//ctx->higher_watermark = ctx->lower_watermark >> 2; 
+	/*
+	if (ctx->sb->zone_count > SMALL_NR_ZONES) {
+		ctx->higher_watermark = ctx->lower_watermark >> 4;
+	}
+	*/
 	printk(KERN_ERR "\n Initializing gc_extents list, ctx->gc_extents_cache: %p ", ctx->gc_extents_cache);
 	ctx->gc_extents = kmem_cache_alloc(ctx->gc_extents_cache, GFP_KERNEL);
 	if (!ctx->gc_extents) {
 		printk(KERN_ERR "\n Could not allocate gc_extent and hence could not initialized \n");
-		goto destroy_gc_page_pool;
+		goto free_metadata_pages;
 	}
 	gcextent_init(ctx->gc_extents, 0, 0 , 0);
-	ctx->cseg_znodes = kmem_cache_alloc(ctx->zones_in_cseg_cache, GFP_KERNEL);
-	if (!ctx->cseg_znodes) {
-		printk(KERN_ERR "\n Could not allocate gc_extent and hence could not initialized \n");
-		goto free_gc_extents;
-	}
-	ctx->cseg_znodes->lzonenr = 0;
 	//trace_printk("\n Extent allocated....! ctx->gc_extents: %p", ctx->gc_extents);
 	/*
 	 * Will work with timer based invocation later
@@ -6324,20 +6647,26 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
 	if (ret) {
 		goto stop_gc_thread;
 	}
-	//debugfs_create_u32("freezones", 0444, debug_dir, &ctx->ckpt->nr_free_cache_zones);
+	/*
+	if (register_shrinker(lsdm_shrinker))
+		goto stop_gc_thread;
+	*/
+	debugfs_create_u32("freezones", 0444, debug_dir, &ctx->ckpt->nr_free_zones);
 	printk(KERN_ERR "\n ctr() done!!");
 	return 0;
 /* failed case */
 stop_gc_thread:
 	lsdm_flush_thread_stop(ctx);
 	lsdm_gc_thread_stop(ctx);
-free_gc_extents:
-	kmem_cache_free(ctx->gc_extents_cache, ctx->gc_extents);
 destroy_gc_page_pool:
 	if (ctx->gc_page_pool)
 		mempool_destroy(ctx->gc_page_pool);
 free_metadata_pages:
 	printk(KERN_ERR "\n freeing metadata pages!");
+	if (ctx->revmap_bm) {
+		__free_pages(ctx->revmap_bm, 0);
+		nrpages--;
+	}
 	if (ctx->sb_page) {
 		__free_pages(ctx->sb_page, 0);
 		nrpages--;
@@ -6357,22 +6686,18 @@ free_bioset:
 put_dev:
 	dm_put_device(target, ctx->dev);
 free_ctx:
-	sysfs_remove_group(&ctx->kobj, &hybrid_attr_group);
-free_ctx1:
-	kobject_put(&ctx->kobj);
-free_ctx2:
 	kfree(ctx);
 	printk(KERN_ERR "\n %s nrpages: %lu", __func__, nrpages);
 	return ret;
 }
 
 /* For individual device removal */
-static void hybrid_stl_dtr(struct dm_target *dm_target)
+static void lsdm_dtr(struct dm_target *dm_target)
 {
 	struct ctx *ctx = dm_target->private;
 
-	lsdm_gc_thread_stop(ctx);
 	lsdm_flush_thread_stop(ctx);
+	lsdm_gc_thread_stop(ctx);
 	flush_workqueue(ctx->writes_wq);
 	flush_workqueue(ctx->tm_wq);
 	printk(KERN_ERR "\n nr_app_writes: %llu", ctx->nr_app_writes);
@@ -6382,11 +6707,18 @@ static void hybrid_stl_dtr(struct dm_target *dm_target)
 	 * and flushed as well.
 	 */
 	sync_blockdev(ctx->dev->bdev);
+	/* flush the last partial revmap page if any */
+	complete_revmap_blk_flush(ctx, ctx->revmap_page);
+	printk(KERN_ERR "\n %s flush_revmap_entries done!", __func__);
+	//clear_revmap_bit(ctx, revmap_bio_ctx->revmap_pba);
 	/* Wait for the ALL the translation pages to be flushed to the
 	 * disk. The removal work is queued.
 	 */
 	printk(KERN_ERR "\n translation blocks flushed! ");
 	do_checkpoint(ctx);
+	void * ptr = page_address(ctx->revmap_bm);
+	memset(ptr, 0, 4096);
+	flush_revmap_bitmap(ctx);
 	//trace_printk("\n checkpoint done!");
 	/* If we are here, then there was no crash while writing out
 	 * the disk metadata
@@ -6396,7 +6728,6 @@ static void hybrid_stl_dtr(struct dm_target *dm_target)
 	destroy_workqueue(ctx->writes_wq);
 	lsdm_free_rb_tree(ctx);
 	remove_gc_nodes(ctx);
-	kmem_cache_free(ctx->zones_in_cseg_cache, ctx->cseg_znodes);
 	kmem_cache_free(ctx->gc_extents_cache, ctx->gc_extents);
 	printk(KERN_ERR "\n RB mappings freed! ");
 	/* TODO : free extent page
@@ -6409,6 +6740,7 @@ static void hybrid_stl_dtr(struct dm_target *dm_target)
 		__free_pages(ctx->ckpt_page, 0);
 		nrpages--;
 	}
+	__free_pages(ctx->revmap_bm, 0);
 	//printk(KERN_ERR "\n %s nrpages: %lu", __func__, nrpages);
 
 	//trace_printk("\n metadata pages freed! \n");
@@ -6438,7 +6770,7 @@ static void hybrid_stl_dtr(struct dm_target *dm_target)
 }
 
 
-static int hybrid_stl_map_io(struct dm_target *dm_target, struct bio *bio)
+int lsdm_map_io(struct dm_target *dm_target, struct bio *bio)
 {
 	struct ctx *ctx;
 	int ret = 0;
@@ -6450,11 +6782,6 @@ static int hybrid_stl_map_io(struct dm_target *dm_target, struct bio *bio)
 
 	ctx = dm_target->private;
 
-	if (!ctx) {
-		dump_stack();
-		return 0;
-	}
-
 	if(unlikely(bio == NULL)) {
 		printk(KERN_ERR "\n %s bio is null \n", __func__);
 		dump_stack();
@@ -6465,10 +6792,10 @@ static int hybrid_stl_map_io(struct dm_target *dm_target, struct bio *bio)
 
 	switch (bio_op(bio)) {
 		case REQ_OP_READ:
-			ret = hybrid_stl_read_io(ctx, bio);
+			ret = lsdm_read_io(ctx, bio);
 			break;
 		case REQ_OP_WRITE:
-			ret = hybrid_stl_write_io(ctx, bio);
+			ret = lsdm_write_io(ctx, bio);
 			break;
 		default:
 			printk(KERN_ERR "\n %s Received bio, op: %d ! doing nothing with it", __func__, bio_op(bio));
@@ -6482,7 +6809,7 @@ static int hybrid_stl_map_io(struct dm_target *dm_target, struct bio *bio)
 /*
  * Setup target request queue limits.
  */
-void stl_io_hints(struct dm_target *ti, struct queue_limits *limits)
+static void lsdm_io_hints(struct dm_target *ti, struct queue_limits *limits)
 {
         struct ctx *ctx = ti->private;
 	struct lsdm_sb *sb = ctx->sb;
@@ -6510,41 +6837,43 @@ void stl_io_hints(struct dm_target *ti, struct queue_limits *limits)
 
 
 
-static struct target_type stl_target = {
-	.name            = "hybrid-stl",
+static struct target_type lsdm_target = {
+	.name            = "lsdm",
 	.version         = {1, 0, 0},
 	.module          = THIS_MODULE,
-	.ctr             = hybrid_stl_ctr,
-	.dtr             = hybrid_stl_dtr,
-	.map             = hybrid_stl_map_io,
-	.status          = 0,
-	.prepare_ioctl   = 0,
-	.message         = 0,
-	.iterate_devices = 0,
-	.io_hints	 = stl_io_hints,
+	.ctr             = lsdm_ctr,
+	.dtr             = lsdm_dtr,
+	.map             = lsdm_map_io,
+	.status          = 0 /*lsdm_status*/,
+	.prepare_ioctl   = 0 /*lsdm_prepare_ioctl*/,
+	.message         = 0 /*lsdm_message*/,
+	.iterate_devices = 0 /*lsdm_iterate_devices*/,
+	.io_hints	 = lsdm_io_hints,
 };
 
 /* Called on module entry (insmod) */
-int __init hybrid_stl_init(void)
+int __init ls_dm_init(void)
 {
-	debug_dir = debugfs_create_dir("hybrid-stl", NULL);
+	debug_dir = debugfs_create_dir("lsdm", NULL);
 	if (!debug_dir) {
 		printk(KERN_ERR "\n Could not create directory in debugfs ");
 		return -1;
 	}
 	
-	return dm_register_target(&stl_target);
+	return dm_register_target(&lsdm_target);
 }
 
 /* Called on module exit (rmmod) */
-void __exit hybrid_stl_exit(void)
+void __exit ls_dm_exit(void)
 {
 	debugfs_remove_recursive(debug_dir);
-	dm_unregister_target(&stl_target);
+	dm_unregister_target(&lsdm_target);
 }
-module_init(hybrid_stl_init);
-module_exit(hybrid_stl_exit);
 
-MODULE_DESCRIPTION(DM_NAME "Hybrid Cache architecture based SMR Translation Layer");
+
+module_init(ls_dm_init);
+module_exit(ls_dm_exit);
+
+MODULE_DESCRIPTION(DM_NAME " Log Structured SMR Translation Layer");
 MODULE_AUTHOR("Surbhi Palande <csurbhi@gmail.com>");
 MODULE_LICENSE("GPL");
