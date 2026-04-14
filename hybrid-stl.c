@@ -5931,7 +5931,7 @@ int read_metadata(struct ctx * ctx)
 		ctx->czone_bitmap_bytes = ctx->czone_bitmap_bytes + 1;
 		ctx->czone_bitmap_bit = (sb2->zone_count_cache % BITS_IN_BYTE);
 	}
-	printk(KERN_ERR "\n %s Nr of zones in main are: %llu, czone_bitmap_bytes: %d, czone_bitmap_bit: %d ", __func__, sb2->zone_count_cache , ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit);
+	printk(KERN_ERR "\n %s Nr of zones in cache are: %llu, czone_bitmap_bytes: %d, czone_bitmap_bit: %d ", __func__, sb2->zone_count_cache , ctx->czone_bitmap_bytes, ctx->czone_bitmap_bit);
 
 	ctx->dzone_bitmap_bytes = sb2->zone_count_data/BITS_IN_BYTE;
 	if (sb2->zone_count_data % BITS_IN_BYTE) {
@@ -6099,17 +6099,20 @@ static ssize_t _name##_store(struct kobject *kobj, struct kobj_attribute *attr, 
 DM_ATTR_SHOW(lower_watermark, lower_watermark);
 DM_ATTR_SHOW(middle_watermark, middle_watermark);
 DM_ATTR_SHOW(nr_free_cache_zones, nr_free_cache_zones);
+DM_ATTR_SHOW(verbose, verbose);
 DM_ATTR_STORE(verbose, verbose);
 /* Define the sysfs attributes*/
 static struct kobj_attribute lower_wm_attr =  __ATTR_RO(lower_watermark);
 static struct kobj_attribute middle_wm_attr = __ATTR_RO(middle_watermark);
 static struct kobj_attribute nrfreezones_attr = __ATTR_RO(nr_free_cache_zones);
+static struct kobj_attribute verbose = __ATTR_RW(verbose);
 
 
 static struct attribute * hybrid_attrs[] = {
 	&lower_wm_attr.attr,
 	&middle_wm_attr.attr,
 	&nrfreezones_attr.attr,
+	&verbose.attr,
 	NULL,
 };
 
@@ -6431,7 +6434,8 @@ static void hybrid_stl_dtr(struct dm_target *dm_target)
 	printk(KERN_ERR "\n gc total time spent cleaning: %llu", ctx->gc_total);
 	destroy_caches(ctx);
 	dm_put_device(dm_target, ctx->dev);
-	kfree(ctx);
+	sysfs_remove_group(&ctx->kobj, &hybrid_attr_group);
+	kobject_put(&ctx->kobj);
 	//trace_printk("\n ctx memory freed!\n");
 	printk(KERN_ERR "\n Goodbye World!\n");
 	return;
