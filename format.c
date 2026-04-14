@@ -122,6 +122,7 @@ __le32 get_zone_count(int fd)
 	 * Doing this manually for now for a 20GB 
 	 * harddisk and 256MB zone size.
 	 */
+	return (6000  + NR_CACHE_ZONES + 1);
 	if (zone_count >= (capacity/zonesz)) {
 		printf("\n Number of zones: %d ", zone_count);
 		printf("\n capacity/ZONE_SZ: %d ", capacity/zonesz);
@@ -130,7 +131,7 @@ __le32 get_zone_count(int fd)
 	printf("\n Actual zone count calculated: %d ", (capacity/zonesz));
 	//return 16500;
 	//return 28200;
-	return zone_count;
+	//return zone_count;
 	//return 4500;
 	//return 9000;
 	//return 10000;
