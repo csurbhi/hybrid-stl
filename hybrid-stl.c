@@ -299,12 +299,10 @@ static sector_t get_first_pba_for_dzone(struct ctx *ctx, unsigned int zonenr)
 {
 	return (ctx->sb->dzone0_pba + (zonenr * ctx->nr_lbas_in_zone));
 }
-/*
 static sector_t get_last_pba_for_dzone(struct ctx *ctx, unsigned int zonenr)
 {
 	return ((ctx->sb->dzone0_pba + (zonenr * ctx->nr_lbas_in_zone) + ctx->nr_lbas_in_zone) - 1);
 }
-*/
 
 /************** Extent map management *****************/
 
@@ -2242,7 +2240,7 @@ int gc_thread_fn(void * data)
 		//print_extents(ctx);
 		 /* give it a try one time */
                 if (gc_th->gc_wake) {
-				mode = FG_GC;
+			mode = FG_GC;
 		}
 		else if(mode == BG_GC) {
 			if (!is_lsdm_ioidle(ctx)) {
@@ -2605,6 +2603,23 @@ int read_from_zone(struct ctx *ctx, struct bio * clone)
 		wp = ctx->dzit[lzonenr].wp;
 		BUG_ON(wp == 0);
 		BUG_ON(pba > ctx->sb->max_pba);
+		/* TODO: this should be split - for this zone.
+		 * repeat the same stuff for any additional zones
+		 */
+		validSectors = get_last_pba_for_dzone(ctx, pzonenr) -  pba + 1;
+		nr_sectors = bio_sectors(clone);
+		//printk(KERN_ERR "\n %s origlba: %llu pba: %llu wp: %llu validSectors: %d, nr_sectors: %d", __func__, lba, pba, wp, validSectors, nr_sectors);
+		if (validSectors < nr_sectors) {
+			if (!(split = bio_split(clone, validSectors, GFP_NOIO, &fs_bio_set))){
+				printk("\n %s failed at bio_split! ", __func__);
+				return -1;
+			}
+			bio_chain(split, clone);
+			read_from_zone(ctx, split);
+			/* split will be taken care of by this time */
+			continue;
+		}
+		/* at this point we are assured that the read is only for this zone and does not span multiple zones */
 		if (wp <= pba) {
 			zero_fill_clone(clone);
 			break;
