@@ -74,11 +74,14 @@ __u8 valid_map[VBLK_MAP_SIZE];
  */
 
 //#define NR_CACHE_ZONES 64
-//# define NR_CACHE_ZONES 118 /* for 1 MB -> 112 + 1(metadata) + 4 for GC */
-# define NR_CACHE_ZONES 2000 /* 500 GB of cache */
+# define NR_CACHE_ZONES 117 /* for 1 MB -> 112 + 1(metadata) + 4 for GC */
+//# define NR_CACHE_ZONES 4000 /* 1TB of cache */
 //# define NR_CACHE_ZONES 148 /* for 1 MB -> 144 + 1(metadata) + 3 for GC */
 //#define NR_CACHE_ZONES 16 /* for 4K size is 7, but with 90/10 its 11 + 4 */
 //#define NR_CACHE_ZONES 14 /* for 4K size is 7, but with 90/10 its 11 + 4 */
+//
+#define NR_METADATA_ZONES 1
+#define NR_GC_ZONES 4 /* To ensure that there exists a free zone to transfer contents to */
 
 #define SIT_ENTRIES_BLK 	(BLK_SIZE/sizeof(struct lsdm_seg_entry))
 #define REV_TM_ENTRIES_BLK 		(BLK_SIZE/sizeof(struct rev_tm_entry))

@@ -34,8 +34,11 @@
  * TODO: Add the nr of zones in cache as a command line argument.
  */
 
-int get_total_cache_zones()
+int get_total_cache_zones(int nrcachezones)
 {
+	if (nrcachezones) {
+		return (nrcachezones + NR_METADATA_ZONES + NR_GC_ZONES);
+	}
 	return NR_CACHE_ZONES;
 }
 
@@ -88,7 +91,7 @@ int write_to_disk(int fd, char *buf, unsigned long sectornr)
 
 
 
-__le32 get_zone_count(int fd)
+__le32 get_zone_count(int fd, int nrzones, int nrcachezones)
 {
 	__le32 zone_count = 0, zonesz;
 	char str[400];
@@ -115,6 +118,15 @@ __le32 get_zone_count(int fd)
 		sprintf(str, "Get nr of zones ioctl failed %d (%s)\n", errno, strerror(errno));
 		perror(str);
 		exit(errno);
+	}
+	if (nrzones) {
+		if ((nrzones + NR_CACHE_ZONES + 1 )< zone_count) {
+			if (nrcachezones) {
+				return nrzones + nrcachezones + NR_METADATA_ZONES + NR_GC_ZONES + 1;
+			}
+			return nrzones + NR_CACHE_ZONES + 1;
+		}
+
 	}
 
 	printf("\n Nr of zones reported by disk :%llu", zone_count);
@@ -202,11 +214,11 @@ __le32 get_nr_cache_zones(struct lsdm_sb *sb)
 	return sb->zone_count_cache;
 }
 
-__le32 get_sit_blk_count(struct lsdm_sb *sb)
+__le32 get_sit_blk_count(struct lsdm_sb *sb, int nrcachezones)
 {
 	unsigned int one_sit_sz = 80; /* in bytes */
 	unsigned int nr_sits_in_blk = BLK_SZ / one_sit_sz;
-	__le32 nr_sits = get_total_cache_zones();
+	__le32 nr_sits = get_total_cache_zones(nrcachezones);
 	unsigned int blks_for_sit = nr_sits / nr_sits_in_blk;
 	if (nr_sits % nr_sits_in_blk > 0)
 		blks_for_sit = blks_for_sit + 1;
@@ -215,9 +227,9 @@ __le32 get_sit_blk_count(struct lsdm_sb *sb)
 }
 
 
-__le32 get_seqz_blk_count(struct lsdm_sb *sb)
+__le32 get_seqz_blk_count(struct lsdm_sb *sb, int nrcachezones)
 {
-	unsigned int nr_seq_zns = sb->zone_count - get_total_cache_zones();
+	unsigned int nr_seq_zns = sb->zone_count - get_total_cache_zones(nrcachezones);
 	unsigned int one_seqz_sz = sizeof(struct stl_dzones_info);
 	unsigned int nr_seqz_in_blk = BLK_SZ/one_seqz_sz;
 	unsigned int blks_for_dzit = nr_seq_zns / nr_seqz_in_blk;
@@ -259,10 +271,10 @@ __le32 get_data_zone_count(struct lsdm_sb *sb)
 	return data_zone_count;
 }
 
-__le32 get_cache_zone_count(struct lsdm_sb *sb)
+__le32 get_cache_zone_count(struct lsdm_sb *sb, int nrcachezones)
 {
 	__le32 cache_zone_count = 0;
-	cache_zone_count = get_total_cache_zones() - sb->zone_count_metadata;
+	cache_zone_count = get_total_cache_zones(nrcachezones) - sb->zone_count_metadata;
 	return cache_zone_count;
 }
 
@@ -463,13 +475,13 @@ unsigned long get_data_zone_pba(struct lsdm_sb *sb)
 	return dzone_pba;
 }
 
-struct lsdm_sb * write_sb(int fd, unsigned long sb_pba, unsigned long cmr)
+struct lsdm_sb * write_sb(int fd, unsigned long sb_pba, unsigned long cmr, int nrzones, int nrcachezones)
 {
 	struct lsdm_sb *sb;
 	int ret = 0;
 	unsigned int zonesz, logzonesz, zone_count;
 	char str[SECTOR_SIZE];
-	int total_cache_zones = get_total_cache_zones();
+	int total_cache_zones = get_total_cache_zones(nrcachezones);
 
 	sb = (struct lsdm_sb *)malloc(BLK_SZ);
 	if (!sb)
@@ -512,7 +524,7 @@ struct lsdm_sb * write_sb(int fd, unsigned long sb_pba, unsigned long cmr)
 	sb->log_block_size = 12;
 	sb->log_zone_size = logzonesz;
 	sb->checksum_offset = offsetof(struct lsdm_sb, crc);
-	sb->zone_count = get_zone_count(fd);
+	sb->zone_count = get_zone_count(fd, nrzones, nrcachezones);
 	/* For now we are shunting the 7TB disk to a size of 4TB */
 	printf("\n sb->zone_count: %d", sb->zone_count);
 	sb->max_pba = get_max_pba(sb);
@@ -522,9 +534,9 @@ struct lsdm_sb * write_sb(int fd, unsigned long sb_pba, unsigned long cmr)
 	printf("\n sb->blk_count_rtm: %d", sb->blk_count_rtm);
 	sb->blk_count_ckpt = NR_CKPT_COPIES;
 	printf("\n sb->blk_count_ckpt: %d", sb->blk_count_ckpt);
-	sb->blk_count_sit = get_sit_blk_count(sb);
+	sb->blk_count_sit = get_sit_blk_count(sb, nrcachezones);
 	printf("\n sb->blk_count_sit: %d", sb->blk_count_sit);
-	sb->blk_count_dzit = get_seqz_blk_count(sb);
+	sb->blk_count_dzit = get_seqz_blk_count(sb, nrcachezones);
 	printf("\n sb->blk_count_dzit: %d", sb->blk_count_dzit);
 	sb->ckpt1_pba = get_ckpt1_pba(sb);
 	printf("\n sb->ckpt1_pba: %u", sb->ckpt1_pba);
@@ -542,7 +554,7 @@ struct lsdm_sb * write_sb(int fd, unsigned long sb_pba, unsigned long cmr)
 	printf("\n sb->nr_cmr_zones: %llu", sb->nr_cmr_zones);
 	sb->zone_count_metadata = get_metadata_zone_count(sb);
 	printf("\n sb->zone_count_metadata: %d ", sb->zone_count_metadata);
-	sb->zone_count_cache = get_cache_zone_count(sb);
+	sb->zone_count_cache = get_cache_zone_count(sb, nrcachezones);
 	printf("\n sb->zone_count_cache: %d", sb->zone_count_cache);
 	sb->zone_count_data = get_data_zone_count(sb);
 	printf("\n sb->zone_count_data: %d", sb->zone_count_data);
@@ -853,7 +865,7 @@ void report_zone(unsigned int fd, unsigned long zonenr, struct blk_zone * bzone)
 	return;	
 }
 
-long reset_shingled_zones(int fd)
+long reset_shingled_zones(int fd, int nrzones, int nrcachezones)
 {
 	int ret;
 	long i = 0;
@@ -863,7 +875,7 @@ long reset_shingled_zones(int fd)
 	long cmr = 0;
 
 
-	zone_count = get_zone_count(fd);
+	zone_count = get_zone_count(fd, nrzones, nrcachezones);
 
 	printf("\n Nr of zones: %d ", zone_count);
 
@@ -927,18 +939,25 @@ int main(int argc, char * argv[])
 	long cmr;
 	char * blkdev;
 	int fd, nr_free_blks = 0;
+	int nrzones = 0, nrcachezones = 0;
 
 	printf("\n %s argc: %d \n ", __func__, argc);
-	if (argc != 3) {
-		fprintf(stderr, "\n Usage: %s device-name nr_free_blks\n", argv[0]);
+	if ((argc < 2) || (argc > 5)) {
+		fprintf(stderr, "\n Usage: %s device-name nr_free_blks [nrzones] [nrcachezones] \n", argv[0]);
 		exit(EXIT_FAILURE);
 	}
 	blkdev = argv[1];
 	nr_free_blks = atoi(argv[2]);
+	if (argc >= 4) {
+		nrzones = atoi(argv[3]);
+        }
+        if (argc >= 5) {
+		nrcachezones = atoi(argv[4]);
+        }
 	fd = open_disk(blkdev);
-	cmr = reset_shingled_zones(fd);
+	cmr = reset_shingled_zones(fd, nrzones, nrcachezones);
 	printf("\n Number of cmr zones: %d ", cmr);
-	sb1 = write_sb(fd, 0, cmr);
+	sb1 = write_sb(fd, 0, cmr, nrzones, nrcachezones);
 	printf("\n Superblock written at pba: %d", pba);
 	printf("\n sizeof sb: %ld", sizeof(struct lsdm_sb));
 	read_sb(fd, 0);
