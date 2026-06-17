@@ -121,6 +121,7 @@ __le32 get_zone_count(int fd, int nrzones, int nrcachezones)
 	}
 	
 	if (nrzones) {
+		printf("\n nrzones: %d nrcachezones: %d ", nrzones, nrcachezones);
 		if ((nrzones + NR_CACHE_ZONES + 1 )< zone_count) {
 			if (nrcachezones) {
 				//printf("\n ******************************* nrzones: %d ", nrzones);
@@ -137,19 +138,19 @@ __le32 get_zone_count(int fd, int nrzones, int nrcachezones)
 	 * 28GB cache (114 zones)
 	 * Config for the YCSB test with 15GB worth records
 	 */
-	return (160 + NR_CACHE_ZONES + 1);
-	return (280  + NR_CACHE_ZONES + 1);
+	//return (160 + NR_CACHE_ZONES + 1);
+	//return (280  + NR_CACHE_ZONES + 1);
 	/* Use zone queries and find this eventually
 	 * Doing this manually for now for a 40GB 
 	 * harddisk and 256MB zone size.
 	 */
-	return (160  + NR_CACHE_ZONES + 1);
+	// return (160  + NR_CACHE_ZONES + 1);
+	printf("\n Actual zone count calculated: %d ", (capacity/zonesz));
 	if (zone_count >= (capacity/zonesz)) {
 		printf("\n Number of zones: %d ", zone_count);
 		printf("\n capacity/ZONE_SZ: %d ", capacity/zonesz);
 		return capacity/zonesz;
 	}
-	printf("\n Actual zone count calculated: %d ", (capacity/zonesz));
 	//return 16500;
 	//return 28200;
 	//return zone_count;
