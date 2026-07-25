@@ -253,6 +253,7 @@ struct ctx {
 	struct dm_dev    *dev;
 
 	atomic_t          io_count;
+	atomic_t          sync_count;
 
 	u64		  nr_reads;
 	sector_t          target;	/* in our case now points to the segment getting GCed */
@@ -360,6 +361,7 @@ struct ctx {
 	unsigned int err;
 	struct kobject kobj;
 	unsigned int verbose;
+	struct dentry *debugfs_dentry;
 };
 
 struct extent {

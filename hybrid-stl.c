@@ -176,6 +176,7 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
 static void hybrid_stl_dtr(struct dm_target *dm_target);
 int get_new_data_zone(struct ctx *ctx);
 //int remove_czone_info(struct ctx *ctx, sector_t lba, sector_t pba, size_t len);
+int hybrid_create_debugfs(struct ctx *ctx);
 
 long nrpages;
 struct dentry * debug_dir;
@@ -1144,6 +1145,13 @@ static int flush_thread_fn(void * data)
 		if (try_to_freeze()) {
                         continue;
                 }
+		/*
+		* Clear the explicit wake request before checkpointing.
+		* The next loop iteration will start a fresh timeout.
+		*/
+		if (READ_ONCE(flush_th->wake)) {
+			WRITE_ONCE(flush_th->wake, 0);
+		}
 		do_checkpoint(ctx);
 	} while(!kthread_should_stop());
 	return 0;
@@ -2142,6 +2150,7 @@ again:
 		wake_up_nr(&ctx->gc_th->fggc_wq, cacheblks);
 		list_del(&zone_nodep->list);
 		kmem_cache_free(ctx->zones_in_cseg_cache, zone_nodep);
+		request_checkpoint(ctx);
 	}
 	//up_write(&ctx->wf_lock);
 	free_data_zone_list(ctx);
@@ -5033,6 +5042,13 @@ void do_checkpoint(struct ctx *ctx)
 	spin_unlock(&ctx->ckpt_lock);
 }
 
+static void request_checkpoint(struct ctx *ctx)
+{
+	struct lsdm_flush_thread *flush_th = ctx->flush_th;
+	WRITE_ONCE(flush_th->wake, 1);
+	wake_up_interruptible(&flush_th->flush_waitq);
+}
+
 /* we write the checkpoints alternately.
  * Only one of them is more recent than
  * the other
@@ -6342,7 +6358,8 @@ static int hybrid_stl_ctr(struct dm_target *target, unsigned int argc, char **ar
 	if (ret) {
 		goto stop_gc_thread;
 	}
-	//debugfs_create_u32("freezones", 0444, debug_dir, &ctx->ckpt->nr_free_cache_zones);
+	hybrid_create_debugfs(ctx);
+	debugfs_create_atomic_t("sync_stats", 0444, ctx->debugfs_dentry, &ctx->sync_count);
 	printk(KERN_ERR "\n ctr() done!!");
 	return 0;
 /* failed case */
@@ -6427,6 +6444,7 @@ static void hybrid_stl_dtr(struct dm_target *dm_target)
 		__free_pages(ctx->ckpt_page, 0);
 		nrpages--;
 	}
+	debugfs_remove_recursive(ctx->debugfs_dentry);
 	//printk(KERN_ERR "\n %s nrpages: %lu", __func__, nrpages);
 
 	//trace_printk("\n metadata pages freed! \n");
@@ -6489,6 +6507,11 @@ static int hybrid_stl_map_io(struct dm_target *dm_target, struct bio *bio)
 		case REQ_OP_WRITE:
 			ret = hybrid_stl_write_io(ctx, bio);
 			break;
+		case REQ_OP_FLUSH:
+			atomic_inc(&ctx->sync_count);
+			request_checkpoint(ctx);
+			bio_endio(bio);
+			break;
 		default:
 			printk(KERN_ERR "\n %s Received bio, op: %d ! doing nothing with it", __func__, bio_op(bio));
 			bio_endio(bio);
@@ -6543,22 +6566,35 @@ static struct target_type stl_target = {
 	.io_hints	 = stl_io_hints,
 };
 
-/* Called on module entry (insmod) */
-int __init hybrid_stl_init(void)
+int hybrid_create_debugfs(struct ctx *ctx)
 {
-	debug_dir = debugfs_create_dir("hybrid-stl", NULL);
-	if (!debug_dir) {
+	struct dentry *dent;
+	char *dir_name = "host-ls";
+	if (!debugfs_initialized())
+		return -1;
+	if (!ctx->sb)
+		return -1;
+	ctx->debugfs_dentry = debugfs_create_dir(dir_name, NULL);
+	if (!ctx->debugfs_dentry) {
 		printk(KERN_ERR "\n Could not create directory in debugfs ");
 		return -1;
 	}
-	
+	atomic_set(&ctx->sync_count, 0);
+	debugfs_create_atomic_t("sync_stats", 0444, ctx->debugfs_dentry, &ctx->sync_count);
+	//debugfs_create_u32("freezones", 0444, debug_dir, &ctx->ckpt->nr_free_cache_zones);
+	return 0;
+}
+
+/* Called on module entry (insmod) */
+int __init hybrid_stl_init(void)
+{
 	return dm_register_target(&stl_target);
 }
 
 /* Called on module exit (rmmod) */
 void __exit hybrid_stl_exit(void)
 {
-	debugfs_remove_recursive(debug_dir);
+	//debugfs_remove_recursive(debug_dir);
 	dm_unregister_target(&stl_target);
 }
 module_init(hybrid_stl_init);
